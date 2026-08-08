@@ -1,0 +1,123 @@
+.mic {
+  display: grid;
+  place-items: center;
+  transform: none;
+  font-size: 0;
+}
+
+.mic svg {
+  width: 27px;
+  height: 27px;
+}
+
+.voice-tip {
+  min-height: 40px;
+  max-width: 360px;
+  margin: 0 auto 10px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 20px;
+  text-align: center;
+}
+
+.voice-tip.live {
+  color: var(--primary);
+  font-weight: 700;
+}
+
+.record {
+  display: grid;
+  place-items: center;
+  transform: none;
+  font-size: 0;
+}
+
+.record svg {
+  width: 37px;
+  height: 37px;
+}
+
+.record-label {
+  margin: 0 0 16px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+.task.ai-pending {
+  border-color: rgba(99, 91, 255, 0.22);
+}
+
+.task.ai-pending > i {
+  color: var(--primary);
+  background: rgba(99, 91, 255, 0.1);
+  animation: voice-task-pulse 1.2s ease-in-out infinite;
+}
+
+.task.ai-failed > i,
+.ai-task-error {
+  color: #d85656;
+}
+
+.ai-task-state {
+  color: var(--primary);
+}
+
+@keyframes voice-task-pulse {
+  50% { opacity: 0.45; }
+}
+
+.task > i.task-status {
+  border-radius: 50%;
+  background: transparent;
+  color: transparent;
+}
+
+.task > i.task-status.doing {
+  border-color: var(--primary);
+  background: var(--primary);
+  box-shadow: 0 0 0 3px rgba(82, 102, 197, 0.11);
+}
+
+.task > i.task-status.done {
+  border-color: var(--primary);
+  background: var(--primary);
+  color: #fff;
+  font-weight: 800;
+}
+
+.task.ai-pending > i.task-status {
+  border-color: rgba(82, 102, 197, 0.42);
+  background: rgba(82, 102, 197, 0.1);
+  color: var(--primary);
+}
+
+.task.ai-failed > i.task-status {
+  border-color: rgba(216, 86, 86, 0.55);
+  background: rgba(216, 86, 86, 0.08);
+  color: #d85656;
+}
+
+.task-time {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  margin-top: 9px;
+  color: #8a8fa0;
+  font-size: 10px;
+}
+
+.task-time span {
+  position: relative;
+}
+
+.task-time span + span::before {
+  content: "";
+  position: absolute;
+  left: -7px;
+  top: 50%;
+  width: 2px;
+  height: 2px;
+  border-radius: 50%;
+  background: #b9bdc9;
+}

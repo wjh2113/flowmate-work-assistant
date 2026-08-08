@@ -1,0 +1,15 @@
+{
+  "name": "FlowMate 工作助手",
+  "short_name": "FlowMate",
+  "description": "支持语音创建、分派和跟进任务的工作助手",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f8f8fc",
+  "theme_color": "#635bff",
+  "orientation": "portrait-primary",
+  "lang": "zh-CN",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

@@ -1,0 +1,12 @@
+node_modules/
+.expo/
+dist/
+android/
+*.jks
+*.keystore
+.env
+data/voice-jobs/
+.vite-preview*.log
+server.out.log
+server.err.log
+*.log

@@ -1,0 +1,53 @@
+/* Backdrop filters establish a containing block for fixed descendants in Chromium. */
+.app{
+  -webkit-backdrop-filter:none;
+  backdrop-filter:none;
+}
+
+.quick-create{
+  bottom:calc(80px + env(safe-area-inset-bottom));
+}
+
+@media(min-width:800px){
+  .quick-create{bottom:104px}
+}
+
+.activity-empty{
+  margin-top:0;
+  padding:24px;
+  border:1px solid rgba(255,255,255,.92);
+  border-radius:16px;
+  background:rgba(255,255,255,.58);
+  font-size:12px;
+}
+
+.task-wrap{
+  position:relative;
+  margin-bottom:10px;
+}
+
+.task-wrap>.task{
+  margin-bottom:0;
+  padding-right:58px;
+}
+
+.task-delete{
+  position:absolute;
+  right:12px;
+  top:50%;
+  width:36px;
+  height:36px;
+  display:grid;
+  place-items:center;
+  transform:translateY(-50%);
+  border-radius:11px;
+  background:rgba(244,245,248,.88);
+  color:#9298a8;
+}
+
+.task-delete svg{width:17px;height:17px}
+.task-delete:active{background:#fff0ed;color:#c85d4a;transform:translateY(-50%) scale(.94)}
+
+@media(hover:hover){
+  .task-delete:hover{background:#fff0ed;color:#c85d4a}
+}
