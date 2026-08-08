@@ -29,7 +29,25 @@ AI 语音流程：浏览器录音 → 服务端发送 Base64 音频给 `qwen3-as
 
 AI 工作复盘每天自动生成一次并缓存在本机，也可以手动重新生成；建议的明日事项可一键加入任务列表。
 
-## 配置云端存储
+## 京东云 SQLite 文件存储（默认）
+
+未配置 Supabase 时，应用默认把任务和日报保存到服务器 SQLite 文件：
+
+```env
+SQLITE_PATH=data/flowmate.db
+```
+
+数据库使用 WAL 模式，默认文件为 `data/flowmate.db`。手机、iPhone 和电脑只要访问同一个京东云地址，就会读写同一份数据；页面每 5 秒检查其他设备产生的变化。
+
+部署要求 Node.js 22.13 或更高版本，推荐 Node.js 24。升级、重启或重新发布时必须保留整个 `data/` 目录。备份时建议同时备份 `flowmate.db`、`flowmate.db-wal` 和 `flowmate.db-shm`，或者先停止服务再复制 `flowmate.db`。
+
+如果使用 Docker，请把数据目录挂载到持久卷，例如：`-v /opt/flowmate-data:/app/data`。不要把 SQLite 文件提交到 Git，项目已默认忽略这些文件。
+
+SQLite 模式适合一台京东云服务器运行一个 Node 进程。若以后采用多实例负载均衡，再切换到 Supabase/PostgreSQL。
+
+SQLite 模式是共享工作区，不自带账号隔离。正式暴露到公网时，请在京东云安全组和 Nginx 中启用 HTTPS 与访问认证；不要直接把 Node 端口开放给整个互联网。
+
+## 可选：Supabase 云端存储
 
 项目使用 Supabase PostgreSQL、Auth 和 Realtime。配置步骤：
 

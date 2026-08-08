@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Session } from '@supabase/supabase-js';
 import { cloudConfigured, deleteTask, getSession, getWorkspace, listTasks, loadDailyReport, saveDailyReport, sendMagicLink, supabase, updateTask, upsertTask, type CloudTask } from './cloud';
+import { deleteFileTask, listFileTasks, loadFileDailyReport, patchFileTask, saveFileDailyReport, saveFileTask } from './localStore';
 import GuidePage from './GuidePage';
 import { toSimplified } from './chinese';
 
@@ -18,15 +19,11 @@ const defaultEstimate=(priority:Priority)=>priority==='高'?120:priority==='低'
 const normalizeTask=(task:Task):Task=>({...task,estimatedMinutes:Number(task.estimatedMinutes)>0?Number(task.estimatedMinutes):defaultEstimate(task.priority),startedAt:task.startedAt||((task.status==='doing'||task.status==='done')?task.createdAt:undefined)});
 const transitionTaskStatus=(task:Task,status:Status):Task=>{if(task.status===status)return task;const now=new Date().toISOString();if(status==='doing')return{...task,status,progress:task.progress>0&&task.progress<100?task.progress:50,startedAt:task.startedAt||now,completedAt:undefined};if(status==='done')return{...task,status,progress:100,startedAt:task.startedAt||now,completedAt:now};return{...task,status,progress:0,startedAt:undefined,completedAt:undefined}};
 
-const seed:Task[]=[];
-const dataResetVersion='2026-08-08-test-data-cleanup-v1';
-const clearedLegacyTestData=(()=>{try{if(localStorage.getItem('flowmate.dataResetVersion')===dataResetVersion)return false;Object.keys(localStorage).filter(key=>key==='flowmate.tasks'||key==='flowmate.voiceJobs'||key.startsWith('flowmate.report.')).forEach(key=>localStorage.removeItem(key));localStorage.setItem('flowmate.dataResetVersion',dataResetVersion);return true}catch{return false}})();
-
 export default function App(){
   const loginDemo=new URLSearchParams(window.location.search).has('login-demo');
   const showGuide=new URLSearchParams(window.location.search).has('guide');
   const [tab,setTab]=useState<Tab>('home');
-  const [tasks,setTasks]=useState<Task[]>(()=>{try{return toSimplified<Task[]>((JSON.parse(localStorage.getItem('flowmate.tasks')||'null')||seed).map(normalizeTask))}catch{return seed}});
+  const [tasks,setTasks]=useState<Task[]>([]);
   const [modal,setModal]=useState<'voice'|'add'|'settings'|'cloud'|null>(null);
   const [title,setTitle]=useState(''); const [assignee,setAssignee]=useState('我'); const [estimate,setEstimate]=useState(60);
   const [transcript,setTranscript]=useState(''); const [recording,setRecording]=useState(false); const [processing,setProcessing]=useState(false);
@@ -35,7 +32,7 @@ export default function App(){
   const [report,setReport]=useState<DailyReport|null>(null); const [reportLoading,setReportLoading]=useState(false); const [reportError,setReportError]=useState('');
   const [toast,setToast]=useState('');
   const [session,setSession]=useState<Session|null>(null); const [authLoading,setAuthLoading]=useState(cloudConfigured);
-  const [teamId,setTeamId]=useState(''); const [teamName,setTeamName]=useState('本地工作区'); const [syncing,setSyncing]=useState(false);
+  const [teamId,setTeamId]=useState(''); const [teamName,setTeamName]=useState('京东云工作区'); const [syncing,setSyncing]=useState(false);
   const [clock,setClock]=useState(()=>Date.now());
   const recorder=useRef<MediaRecorder|null>(null); const stream=useRef<MediaStream|null>(null); const chunks=useRef<Blob[]>([]);
   const browserRecognition=useRef<SpeechRecognition|null>(null); const localTranscript=useRef(''); const autoReport=useRef(false);
@@ -46,12 +43,18 @@ export default function App(){
   const displayName=String(session?.user.user_metadata?.name||session?.user.email?.split('@')[0]||'我');
   const avatarText=displayName.slice(0,1).toUpperCase();
 
-  useEffect(()=>{if(clearedLegacyTestData){setTasks([]);setReport(null)}},[]);
-  useEffect(()=>{tasksRef.current=tasks;localStorage.setItem('flowmate.tasks',JSON.stringify(tasks))},[tasks]);
+  useEffect(()=>{tasksRef.current=tasks},[tasks]);
   useEffect(()=>{const timer=window.setInterval(()=>setClock(Date.now()),30_000);return()=>window.clearInterval(timer)},[]);
   useEffect(()=>{cloudContext.current={session,teamId}},[session,teamId]);
   useEffect(()=>{const h=(e:Event)=>{e.preventDefault();setInstallEvent(e)};window.addEventListener('beforeinstallprompt',h);return()=>window.removeEventListener('beforeinstallprompt',h)},[]);
-  useEffect(()=>{fetch('/api/health').then(r=>r.json()).then(data=>setAiReady(Boolean(data.ai))).catch(()=>setAiReady(false));const cached=localStorage.getItem(`flowmate.report.${dateKey}`);if(cached)try{setReport(toSimplified(JSON.parse(cached)))}catch{}},[dateKey]);
+  useEffect(()=>{fetch('/api/health').then(r=>r.json()).then(data=>setAiReady(Boolean(data.ai))).catch(()=>setAiReady(false))},[]);
+  useEffect(()=>{
+    if(cloudConfigured)return;
+    let active=true;let first=true;
+    const refresh=async()=>{try{if(first)setSyncing(true);const [storedTasks,storedReport]=await Promise.all([listFileTasks(),loadFileDailyReport<DailyReport>(dateKey)]);if(active){setTasks(toSimplified(storedTasks).map(normalizeTask));setReport(storedReport?toSimplified(storedReport):null)}}catch(error){if(active)setReportError(error instanceof Error?`SQLite 读取失败：${error.message}`:'SQLite 读取失败')}finally{if(active&&first){first=false;setSyncing(false)}}};
+    void refresh();const timer=window.setInterval(refresh,5000);
+    return()=>{active=false;window.clearInterval(timer)};
+  },[dateKey]);
   useEffect(()=>{
     if(!supabase){setAuthLoading(false);return}
     getSession().then(setSession).finally(()=>setAuthLoading(false));
@@ -80,7 +83,7 @@ export default function App(){
   const rememberVoiceJob=(id:string)=>localStorage.setItem('flowmate.voiceJobs',JSON.stringify([...new Set([...pendingVoiceIds(),id])]));
   const forgetVoiceJob=(id:string)=>localStorage.setItem('flowmate.voiceJobs',JSON.stringify(pendingVoiceIds().filter(item=>item!==id)));
   const finishVoicePolling=(id:string)=>{const timer=voicePollTimers.current.get(id);if(timer)window.clearTimeout(timer);voicePollTimers.current.delete(id);voicePolling.current.delete(id);forgetVoiceJob(id)};
-  const syncVoiceTask=(task:Task)=>{const current=cloudContext.current;if(current.session&&current.teamId)upsertTask(toCloud(task,current.teamId,current.session.user.id)).catch(error=>notify(`语音任务云端同步失败：${error.message}`))};
+  const syncVoiceTask=(task:Task)=>{const current=cloudContext.current;if(current.session&&current.teamId)upsertTask(toCloud(task,current.teamId,current.session.user.id)).catch(error=>notify(`语音任务云端同步失败：${error.message}`));else saveFileTask(task).catch(error=>notify(`SQLite 保存失败：${error.message}`))};
   const completeVoiceJob=(job:VoiceJob)=>{
     const command=toSimplified(job.command);
     if(command?.action==='update'){
@@ -98,6 +101,7 @@ export default function App(){
     syncVoiceTask(task);setAiReady(true);finishVoicePolling(job.id);notify('语音任务已创建');
   };
   const failVoiceJob=(job:VoiceJob)=>{
+    const current=tasksRef.current.find(item=>item.id===job.id);if(current)saveFileTask({...current,aiStatus:'failed',due:'识别失败'}).catch(()=>{});
     setTasks(items=>items.map(item=>item.id===job.id?{...item,aiStatus:'failed',due:'识别失败'}:item));
     finishVoicePolling(job.id);notify(job.error||'语音识别失败，点击任务可重试');
   };
@@ -127,7 +131,7 @@ export default function App(){
   const addTask=(text=title,parsed?:ParsedTask|null)=>{
     if(!text.trim())return;const p=parsed||null;const priority=p?.priority||'中';const task:Task=toSimplified({id:crypto.randomUUID(),title:p?.title||text.trim(),assignee:p?.assignee||assignee,due:p?.due||'今天',status:'todo',priority,progress:0,estimatedMinutes:p?.estimatedMinutes||estimate||defaultEstimate(priority),createdAt:new Date().toISOString()});
     setTasks(v=>[task,...v]);setTitle('');setEstimate(60);setTranscript('');setParsedTask(null);setModal(null);notify('任务已创建');
-    if(session&&teamId){setSyncing(true);upsertTask(toCloud(task,teamId,session.user.id)).catch(error=>alert(`云端保存失败：${error.message}`)).finally(()=>setSyncing(false))}
+    setSyncing(true);(session&&teamId?upsertTask(toCloud(task,teamId,session.user.id)):saveFileTask(task)).catch(error=>alert(`任务保存失败：${error.message}`)).finally(()=>setSyncing(false));
   };
   const cycle=(id:string)=>{
     const current=tasks.find(t=>t.id===id);if(!current)return;const next:Status=current.status==='todo'?'doing':current.status==='doing'?'done':'todo';const now=new Date().toISOString();const changes={status:next,progress:next==='doing'?50:next==='done'?100:0,startedAt:next==='doing'?(current.startedAt||now):next==='todo'?undefined:current.startedAt,completedAt:next==='done'?now:undefined};
@@ -135,12 +139,12 @@ export default function App(){
     if(current.aiStatus==='failed'){void retryVoiceJob(id);return}
     setTasks(v=>v.map(t=>t.id===id?{...t,...changes}:t));
     notify(next==='done'?'任务已完成':next==='doing'?'已开始处理':'已移回待办');
-    if(session&&teamId)updateTask(id,{status:changes.status,progress:changes.progress,started_at:changes.startedAt||null,completed_at:changes.completedAt||null}).catch(error=>alert(`云端更新失败：${error.message}`));
+    if(session&&teamId)updateTask(id,{status:changes.status,progress:changes.progress,started_at:changes.startedAt||null,completed_at:changes.completedAt||null}).catch(error=>alert(`云端更新失败：${error.message}`));else patchFileTask(id,{status:changes.status,progress:changes.progress,startedAt:changes.startedAt||null,completedAt:changes.completedAt||null}).catch(error=>alert(`SQLite 更新失败：${error.message}`));
   };
   const removeTask=(id:string,title:string)=>{
     const current=tasks.find(task=>task.id===id);if(!current||!window.confirm(`确定删除“${title}”吗？\n删除后无法撤销。`))return;
     setTasks(items=>items.filter(task=>task.id!==id));finishVoicePolling(id);if(current.aiStatus)fetch(`/api/voice-jobs/${id}`,{method:'DELETE'}).catch(()=>{});notify('任务已删除');
-    if(session&&teamId)deleteTask(id).catch(error=>{setTasks(items=>items.some(task=>task.id===id)?items:[current,...items]);alert(`云端删除失败，任务已恢复：${error.message}`)});
+    (session&&teamId?deleteTask(id):deleteFileTask(id)).catch(error=>{setTasks(items=>items.some(task=>task.id===id)?items:[current,...items]);alert(`删除失败，任务已恢复：${error.message}`)});
   };
 
   const beginRecording=async()=>{
@@ -166,7 +170,7 @@ export default function App(){
       const res=await fetch('/api/voice-jobs',{method:'POST',body:form});const job=await res.json() as VoiceJob&{message?:string};
       if(!res.ok)throw new Error(job.message||'录音保存失败');
       const browserText=toSimplified(localTranscript.current.trim());const placeholder:Task={id:job.id,title:browserText||'语音任务识别中…',assignee:'我',due:'AI后台处理中',status:'todo',priority:'中',progress:0,estimatedMinutes:60,createdAt:new Date().toISOString(),aiStatus:'pending'};
-      setTasks(items=>[placeholder,...items.filter(item=>item.id!==job.id)]);rememberVoiceJob(job.id);pollVoiceJob(job.id);
+      setTasks(items=>[placeholder,...items.filter(item=>item.id!==job.id)]);if(!session)saveFileTask(placeholder).catch(()=>{});rememberVoiceJob(job.id);pollVoiceJob(job.id);
       setTranscript('');setParsedTask(null);setModal(null);notify('录音已保存，AI 将在后台整理');
     }catch(error){
       if(localTranscript.current){setTranscript(localTranscript.current);setVoiceTip(`录音上传失败，已保留浏览器识别结果：${error instanceof Error?error.message:'未知错误'}`)}
@@ -176,11 +180,11 @@ export default function App(){
 
   const generateReport=async()=>{
     setReportLoading(true);setReportError('');
-    try{const res=await fetch('/api/daily-plan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tasks,date:dateKey,user:displayName})});const raw=await res.json();if(!res.ok)throw new Error(raw.message||'生成失败');const data=toSimplified<DailyReport>(raw);setReport(data);localStorage.setItem(`flowmate.report.${dateKey}`,JSON.stringify(data));if(session&&teamId)await saveDailyReport(teamId,session.user.id,dateKey,data);setAiReady(true)}
+    try{const res=await fetch('/api/daily-plan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tasks,date:dateKey,user:displayName})});const raw=await res.json();if(!res.ok)throw new Error(raw.message||'生成失败');const data=toSimplified<DailyReport>(raw);setReport(data);if(session&&teamId)await saveDailyReport(teamId,session.user.id,dateKey,data);else await saveFileDailyReport(dateKey,data);setAiReady(true)}
     catch(error){setReportError(error instanceof Error?error.message:'AI 日报生成失败')}
     finally{setReportLoading(false)}
   };
-  const addTomorrow=()=>{if(!report)return;const planned:Task[]=report.tomorrow.map(x=>({id:crypto.randomUUID(),title:x.title,assignee:'我',due:`明天 ${x.suggestedTime}`,status:'todo',priority:x.priority,progress:0,estimatedMinutes:defaultEstimate(x.priority),createdAt:new Date().toISOString()}));setTasks(v=>[...planned,...v]);if(session&&teamId)Promise.all(planned.map(t=>upsertTask(toCloud(t,teamId,session.user.id)))).catch(error=>alert(`部分计划未同步：${error.message}`));alert('已将明日计划加入“我的任务”')};
+  const addTomorrow=()=>{if(!report)return;const planned:Task[]=report.tomorrow.map(x=>({id:crypto.randomUUID(),title:x.title,assignee:'我',due:`明天 ${x.suggestedTime}`,status:'todo',priority:x.priority,progress:0,estimatedMinutes:defaultEstimate(x.priority),createdAt:new Date().toISOString()}));setTasks(v=>[...planned,...v]);Promise.all(planned.map(t=>session&&teamId?upsertTask(toCloud(t,teamId,session.user.id)):saveFileTask(t))).catch(error=>alert(`部分计划未保存：${error.message}`));alert('已将明日计划加入“我的任务”')};
   const install=async()=>{if(installEvent){installEvent.prompt();await installEvent.userChoice;setInstallEvent(null)}else alert('iPhone：Safari 分享 → 添加到主屏幕。\nAndroid：浏览器菜单 → 安装应用。')};
 
   if(showGuide)return <GuidePage/>;
@@ -190,7 +194,7 @@ export default function App(){
 
   return <div className="viewport"><main className="app">
     {tab==='home'&&<div className="page home-page">
-      <header><div><h1>{displayName==='我'?'你好':`你好，${displayName}`}</h1><p>{teamName} · <span className={session?'cloud-online':'cloud-local'}>{syncing?'正在同步…':session?'云端已同步':'本地体验模式'}</span></p></div><div className="header-actions"><a className="help-button" href="/?guide=1" aria-label="打开使用指南">?</a><button className="avatar" onClick={()=>goTab('mine')} aria-label="打开我的页面">{avatarText}<i/></button></div></header>
+      <header><div><h1>{displayName==='我'?'你好':`你好，${displayName}`}</h1><p>{teamName} · <span className={session?'cloud-online':'cloud-local'}>{syncing?'正在同步…':session?'云端已同步':'SQLite 文件存储'}</span></p></div><div className="header-actions"><a className="help-button" href="/?guide=1" aria-label="打开使用指南">?</a><button className="avatar" onClick={()=>goTab('mine')} aria-label="打开我的页面">{avatarText}<i/></button></div></header>
       <Title text="今日概览" action={new Intl.DateTimeFormat('zh-CN',{month:'long',day:'numeric',weekday:'short'}).format(new Date())}/>
       <div className="stats"><Stat n={stats.mine} label="我的任务" tone="purple" emoji="✓" onClick={()=>goTab('tasks')}/><Stat n={stats.done} label="今日完成" tone="green" emoji="✦" onClick={()=>goTab('tasks')}/><Stat n={stats.follow} label="待我跟进" tone="orange" emoji="♟" onClick={()=>goTab('team')}/></div>
       <Title text="今日复盘" action={report?'更新':'自动整理'} onClick={generateReport}/>
@@ -228,7 +232,7 @@ function taskElapsed(task:Task,now:number){if(!task.startedAt)return 0;const sta
 function TrashIcon(){return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m-9 0 1 13h10l1-13M10 11v5m4-5v5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/></svg>}
 function TaskItem({task,cycle,remove,now}:{task:Task;cycle:(id:string)=>void;remove:(id:string,title:string)=>void;now:number}){const elapsed=taskElapsed(task,now);return <div className={'task-wrap '+(task.aiStatus?`ai-${task.aiStatus}`:'')}><button className={'task '+(task.aiStatus?`ai-${task.aiStatus}`:'')} onClick={()=>cycle(task.id)}><i className={`task-status ${task.status}`}>{task.aiStatus==='pending'?'…':task.aiStatus==='failed'?'!':task.status==='done'?'✓':''}</i><div><strong className={task.status==='done'?'done':''}>{task.title}</strong><p>{task.aiStatus==='pending'?<b className="ai-task-state">AI 后台识别中</b>:task.aiStatus==='failed'?<b className="ai-task-error">识别失败 · 点击重试</b>:<><b className={task.priority==='高'?'high':''}>{task.priority}优先级</b> · {task.due} · {task.assignee}</>}</p><div className="task-time"><span>预计 {formatDuration(task.estimatedMinutes)}</span><span>已进行 {formatDuration(elapsed)}</span></div>{task.assignee!=='我'&&task.status!=='done'&&<span className="progress"><em style={{width:`${task.progress}%`}}/></span>}</div></button><button className="task-delete" type="button" onClick={()=>remove(task.id,task.title)} aria-label={`删除任务：${task.title}`}><TrashIcon/></button></div>}
 function ListPage({title,tasks,cycle,remove,now}:{title:string;tasks:Task[];cycle:(id:string)=>void;remove:(id:string,title:string)=>void;now:number}){const [filter,setFilter]=useState('全部');const list=tasks.filter(t=>filter==='全部'||(filter==='已完成'?t.status==='done':t.status!=='done'));return <div className="page"><h1 className="page-title">{title}</h1><p className="page-sub">轻点任务切换状态，右侧按钮可删除任务</p><div className="filters">{['全部','进行中','已完成'].map(f=><button key={f} className={f===filter?'active':''} onClick={()=>setFilter(f)}>{f}</button>)}</div>{list.map(t=><TaskItem key={t.id} task={t} cycle={cycle} remove={remove} now={now}/>)}{!list.length&&<div className="empty">这里暂时没有任务 🎉</div>}</div>}
-function Profile({name,avatar,tasks,install,aiReady,cloudOnline,syncing,signOut,goTeam,notify,openSettings,openCloudSettings}:{name:string;avatar:string;tasks:Task[];install:()=>void;aiReady:boolean|null;cloudOnline:boolean;syncing:boolean;signOut:()=>void;goTeam:()=>void;notify:(message:string)=>void;openSettings:()=>void;openCloudSettings:()=>void}){const rate=Math.round(tasks.filter(t=>t.status==='done').length/Math.max(tasks.length,1)*100);const requestNotice=async()=>{if(!('Notification'in window)){notify('当前浏览器不支持系统通知');return}const result=await Notification.requestPermission();notify(result==='granted'?'通知已开启':'通知权限未开启')};const menus=[{i:'♢',t:'通知与提醒',action:requestNotice},{i:'♟',t:'成员管理',action:goTeam},{i:'☁',t:'数据与同步',action:openCloudSettings},{i:'⚙',t:'设置',action:openSettings}];return <div className="page"><h1 className="page-title">我的</h1><section className="profile"><div className="big-avatar">{avatar}</div><h2>{name}</h2><p>{cloudOnline?'云端工作区':'个人工作区'}</p><span className={'ai-status '+(aiReady?'online':'')}>● {aiReady?'智能助手已连接':'智能助手待配置'}</span><span className={'ai-status '+(cloudOnline?'online':'')}>● {cloudOnline?(syncing?'云端同步中':'云端数据已同步'):'云存储待配置'}</span></section><section className="week"><h2>本周效率</h2><strong>{rate}%</strong><p>任务完成率</p><span><i style={{width:`${rate}%`}}/></span></section>{menus.map(item=><button className="menu" key={item.t} onClick={item.action}><i>{item.i}</i><span>{item.t}</span><b>›</b></button>)}<button className="install" onClick={install}>▣ 添加到手机主屏幕</button>{cloudOnline&&<button className="sign-out" onClick={signOut}>退出当前账号</button>}</div>}
+function Profile({name,avatar,tasks,install,aiReady,cloudOnline,syncing,signOut,goTeam,notify,openSettings,openCloudSettings}:{name:string;avatar:string;tasks:Task[];install:()=>void;aiReady:boolean|null;cloudOnline:boolean;syncing:boolean;signOut:()=>void;goTeam:()=>void;notify:(message:string)=>void;openSettings:()=>void;openCloudSettings:()=>void}){const rate=Math.round(tasks.filter(t=>t.status==='done').length/Math.max(tasks.length,1)*100);const requestNotice=async()=>{if(!('Notification'in window)){notify('当前浏览器不支持系统通知');return}const result=await Notification.requestPermission();notify(result==='granted'?'通知已开启':'通知权限未开启')};const menus=[{i:'♢',t:'通知与提醒',action:requestNotice},{i:'♟',t:'成员管理',action:goTeam},{i:'☁',t:'数据与同步',action:openCloudSettings},{i:'⚙',t:'设置',action:openSettings}];return <div className="page"><h1 className="page-title">我的</h1><section className="profile"><div className="big-avatar">{avatar}</div><h2>{name}</h2><p>{cloudOnline?'云端工作区':'京东云工作区'}</p><span className={'ai-status '+(aiReady?'online':'')}>● {aiReady?'智能助手已连接':'智能助手待配置'}</span><span className="ai-status online">● {cloudOnline?(syncing?'云端同步中':'云端数据已同步'):'SQLite 文件存储'}</span></section><section className="week"><h2>本周效率</h2><strong>{rate}%</strong><p>任务完成率</p><span><i style={{width:`${rate}%`}}/></span></section>{menus.map(item=><button className="menu" key={item.t} onClick={item.action}><i>{item.i}</i><span>{item.t}</span><b>›</b></button>)}<button className="install" onClick={install}>▣ 添加到手机主屏幕</button>{cloudOnline&&<button className="sign-out" onClick={signOut}>退出当前账号</button>}</div>}
 
 function CloudSettings({onClose}:{onClose:()=>void}){
   const [loading,setLoading]=useState(true);const [saving,setSaving]=useState(false);const [testing,setTesting]=useState(false);const [removing,setRemoving]=useState(false);
@@ -238,7 +242,7 @@ function CloudSettings({onClose}:{onClose:()=>void}){
   const request=async(path:string,options:RequestInit)=>{const response=await fetch(path,{...options,headers:await headers()});const data=await response.json();if(!response.ok)throw new Error(data.message||'操作失败');return data};
   const test=async()=>{setTesting(true);setError('');setSuccess('');try{const data=await request('/api/settings/cloud/test',{method:'POST',body:JSON.stringify({url,anonKey})});setSuccess(data.message||'连接成功')}catch(e){setError(e instanceof Error?e.message:'连接测试失败')}finally{setTesting(false)}};
   const save=async()=>{setSaving(true);setError('');setSuccess('');try{const data=await request('/api/settings/cloud',{method:'PUT',body:JSON.stringify({url,anonKey})});setConfigured(true);setMasked(data.maskedKey||'');setAnonKey('');setSuccess('保存成功，正在进入云端登录…');window.setTimeout(()=>window.location.reload(),700)}catch(e){setError(e instanceof Error?e.message:'保存失败')}finally{setSaving(false)}};
-  const remove=async()=>{if(!window.confirm('移除后将切换为本地体验模式，云端已有数据不会被删除。确定继续吗？'))return;setRemoving(true);setError('');try{await request('/api/settings/cloud',{method:'DELETE'});window.location.reload()}catch(e){setError(e instanceof Error?e.message:'移除失败');setRemoving(false)}};
+  const remove=async()=>{if(!window.confirm('移除后将切换到京东云服务器上的 SQLite 文件存储，Supabase 中已有数据不会被删除。确定继续吗？'))return;setRemoving(true);setError('');try{await request('/api/settings/cloud',{method:'DELETE'});window.location.reload()}catch(e){setError(e instanceof Error?e.message:'移除失败');setRemoving(false)}};
   const missingNewConfig=!url.trim()||(!configured&&!anonKey.trim());
   return <div className="model-settings cloud-settings"><div className="settings-head"><div><small>数据与同步</small><h2>云存储设置</h2></div><button type="button" onClick={onClose} aria-label="关闭">×</button></div>{loading?<div className="settings-loading">正在读取服务端配置…</div>:<><div className={'settings-status '+(configured?'ready':'')}><i>{configured?'✓':'☁'}</i><div><b>{configured?'云存储已配置':'尚未连接云存储'}</b><span>{configured?`当前公开密钥 ${masked}`:'连接后，任务、日报和团队进度可在所有设备同步'}</span></div></div><div className="cloud-provider"><i>S</i><div><b>Supabase</b><span>PostgreSQL 数据库 · 登录认证 · 实时同步</span></div></div><label>Supabase 项目地址</label><input className="input" type="url" value={url} onChange={e=>setUrl(e.target.value)} placeholder="https://xxxx.supabase.co" autoCapitalize="off" autoCorrect="off"/><p className="field-help">在 Supabase 控制台的 Project Settings → API 中复制 Project URL。</p><label>公开密钥（Anon / Publishable Key）</label><div className="key-field"><input className="input" type={showKey?'text':'password'} value={anonKey} onChange={e=>setAnonKey(e.target.value)} placeholder={configured?`已配置 ${masked}，留空则不修改`:'粘贴 anon 或 sb_publishable_ 开头的密钥'} autoCapitalize="off" autoCorrect="off"/><button type="button" onClick={()=>setShowKey(v=>!v)}>{showKey?'隐藏':'显示'}</button></div><p className="field-help">只能填写可公开的 anon / publishable key。请勿填写 service_role 或 secret key。</p>{success&&<div className="settings-success">✓ {success}</div>}{error&&<div className="settings-error">{error}</div>}<div className="settings-actions cloud-actions"><button type="button" disabled={testing||saving||missingNewConfig} onClick={test}>{testing?'正在测试…':'测试连接'}</button><button type="button" disabled={saving||testing||missingNewConfig} onClick={save}>{saving?'正在保存…':'保存并启用'}</button></div>{configured&&<button className="remove-cloud" type="button" disabled={removing} onClick={remove}>{removing?'正在移除…':'移除云存储配置'}</button>}<p className="cloud-note">配置保存在这台服务器的环境文件中，同一服务器上的 Android、iPhone 和电脑浏览器会自动使用它。</p></>}</div>;
 }

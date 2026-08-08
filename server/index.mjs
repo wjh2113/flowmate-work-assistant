@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { mkdir, readFile, readdir, unlink, writeFile } from 'node:fs/promises';
 import { Converter } from 'opencc-js/t2cn';
+import { closeSqlite, deleteSqliteReport, deleteSqliteTask, getSqliteTask, listSqliteTasks, loadSqliteReport, patchSqliteTask, saveSqliteReport, saveSqliteTask, sqliteDisplayPath } from './sqlite-store.mjs';
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -274,7 +275,44 @@ async function recoverVoiceJobs() {
   }
 }
 
-app.get('/api/health', (_req, res) => res.json({ ai: Boolean(apiKey), provider: '阿里云百炼', textModel, transcriptionModel: asrModel }));
+app.get('/api/health', (_req, res) => res.json({ ai: Boolean(apiKey), provider: '阿里云百炼', textModel, transcriptionModel: asrModel, storage: { mode: 'sqlite', file: sqliteDisplayPath } }));
+
+app.get('/api/sqlite/tasks', (_req, res) => res.json(listSqliteTasks()));
+
+app.get('/api/sqlite/tasks/:id', (req, res) => {
+  const task=getSqliteTask(req.params.id);
+  if(!task)return res.status(404).json({message:'任务不存在'});
+  res.json(task);
+});
+
+app.put('/api/sqlite/tasks/:id', (req, res) => {
+  try{res.json(saveSqliteTask({...req.body,id:req.params.id}))}
+  catch(error){res.status(400).json({message:error?.message||'任务保存失败'})}
+});
+
+app.patch('/api/sqlite/tasks/:id', (req, res) => {
+  try{const task=patchSqliteTask(req.params.id,req.body||{});if(!task)return res.status(404).json({message:'任务不存在'});res.json(task)}
+  catch(error){res.status(400).json({message:error?.message||'任务更新失败'})}
+});
+
+app.delete('/api/sqlite/tasks/:id', (req, res) => {
+  deleteSqliteTask(req.params.id);res.status(204).end();
+});
+
+app.get('/api/sqlite/reports/:date', (req, res) => {
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(req.params.date))return res.status(400).json({message:'日期格式不正确'});
+  res.json(loadSqliteReport(req.params.date));
+});
+
+app.put('/api/sqlite/reports/:date', (req, res) => {
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(req.params.date))return res.status(400).json({message:'日期格式不正确'});
+  if(!req.body?.report||typeof req.body.report!=='object')return res.status(400).json({message:'日报内容不能为空'});
+  res.json(saveSqliteReport(req.params.date,req.body.report));
+});
+
+app.delete('/api/sqlite/reports/:date', (req, res) => {
+  deleteSqliteReport(req.params.date);res.status(204).end();
+});
 
 app.get('/api/settings/cloud', (_req, res) => {
   res.set('Cache-Control', 'no-store');
@@ -438,6 +476,11 @@ app.post('/api/daily-plan', requireQwen, async (req, res) => {
 const dist = path.resolve(__dirname, '../dist');
 app.use(express.static(dist));
 app.get('/{*splat}', (_req, res) => res.sendFile(path.join(dist, 'index.html')));
+let sqliteClosed=false;
+const closeDatabase=()=>{if(sqliteClosed)return;sqliteClosed=true;closeSqlite()};
+process.once('SIGINT',()=>{closeDatabase();process.exit(0)});
+process.once('SIGTERM',()=>{closeDatabase();process.exit(0)});
+process.once('exit',closeDatabase);
 recoverVoiceJobs()
   .then(() => app.listen(port, '0.0.0.0', () => console.log(`FlowMate Qwen server: http://localhost:${port}`)))
   .catch(error => {

@@ -1,6 +1,9 @@
 {
   "name": "flowmate-work-assistant",
   "version": "1.0.0",
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "scripts": {
     "dev": "concurrently -k \"vite --host 0.0.0.0\" \"node --watch server/index.mjs\"",
     "start": "node server/index.mjs",
