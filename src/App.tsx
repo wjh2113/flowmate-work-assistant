@@ -11,9 +11,10 @@ type Priority = '高' | '中' | '低';
 type Task = { id:string; title:string; assignee:string; due:string; status:Status; priority:Priority; progress:number; estimatedMinutes:number; createdAt?:string; startedAt?:string; completedAt?:string; aiStatus?:'pending'|'failed' };
 type ParsedTask = { title:string; assignee:string; due:string; priority:Priority; confidence:number; estimatedMinutes?:number };
 type VoiceTaskChanges = Partial<Pick<Task,'title'|'assignee'|'due'|'priority'|'status'|'estimatedMinutes'>>;
-type VoiceCommand = { action:'create'|'update'|'clarify'; targetTaskId:string|null; changes:VoiceTaskChanges; tasks?:ParsedTask[]; task?:ParsedTask; message?:string; confidence:number };
+type VoiceUpdate={targetTaskId:string;changes:VoiceTaskChanges};
+type VoiceCommand = { action:'create'|'update'|'clarify'; updates?:VoiceUpdate[]; targetTaskId:string|null; changes:VoiceTaskChanges; tasks?:ParsedTask[]; task?:ParsedTask; message?:string; confidence:number };
 type DailyReport = { headline:string; summary:string; completed:string[]; risks:string[]; tomorrow:{title:string;reason:string;priority:Priority;suggestedTime:string}[] };
-type VoiceJob = { id:string; status:'queued'|'processing'|'completed'|'failed'; transcript?:string; tasks?:ParsedTask[]; task?:ParsedTask|null; command?:VoiceCommand|null; error?:string };
+type VoiceJob = { id:string; status:'queued'|'processing'|'completed'|'failed'; stage?:'queued'|'transcribing'|'understanding'|'saving'|'completed'|'failed'; createdAt?:string; transcript?:string; tasks?:ParsedTask[]; task?:ParsedTask|null; command?:VoiceCommand|null; error?:string };
 
 const defaultEstimate=(priority:Priority)=>priority==='高'?120:priority==='低'?30:60;
 const normalizeTask=(task:Task):Task=>({...task,estimatedMinutes:Number(task.estimatedMinutes)>0?Number(task.estimatedMinutes):defaultEstimate(task.priority),startedAt:task.startedAt||((task.status==='doing'||task.status==='done')?task.createdAt:undefined)});
@@ -87,13 +88,12 @@ export default function App(){
   const completeVoiceJob=(job:VoiceJob)=>{
     const command=toSimplified(job.command);
     if(command?.action==='update'){
-      const target=tasksRef.current.find(item=>item.id===command.targetTaskId);
-      if(!target){setTasks(items=>items.filter(item=>item.id!==job.id));finishVoicePolling(job.id);notify('没有找到要修改的任务，请说出完整任务名称');return}
-      const {status,...fields}=command.changes||{};let updated:Task={...target,...fields};if(status)updated=transitionTaskStatus(updated,status);
-      setTasks(items=>items.filter(item=>item.id!==job.id).map(item=>item.id===updated.id?updated:item));syncVoiceTask(updated);setAiReady(true);finishVoicePolling(job.id);notify(command.message||`已修改“${updated.title}”`);return
+      const requested=command.updates?.length?command.updates:[{targetTaskId:command.targetTaskId||'',changes:command.changes||{}}];const updatedTasks:Task[]=[];
+      for(const request of requested){const target=tasksRef.current.find(item=>item.id===request.targetTaskId);if(!target)continue;const {status,...fields}=request.changes||{};let updated:Task={...target,...fields};if(status)updated=transitionTaskStatus(updated,status);updatedTasks.push(updated)}
+      setTasks(items=>items.filter(item=>item.id!==job.id).map(item=>updatedTasks.find(updated=>updated.id===item.id)||item));updatedTasks.forEach(syncVoiceTask);if(!session)deleteFileTask(job.id).catch(()=>{});setAiReady(true);finishVoicePolling(job.id);notify(updatedTasks.length>1?`已更新 ${updatedTasks.length} 项任务`:command.message||'任务已更新');return
     }
     if(command?.action==='clarify'){
-      setTasks(items=>items.filter(item=>item.id!==job.id));finishVoicePolling(job.id);notify(command.message||'请说出要修改的任务名称和内容');return
+      setTasks(items=>items.filter(item=>item.id!==job.id));if(!session)deleteFileTask(job.id).catch(()=>{});finishVoicePolling(job.id);notify(command.message||'请说出要修改的任务名称和内容');return
     }
     const rawTasks=job.tasks?.length?job.tasks:command?.tasks?.length?command.tasks:job.task||command?.task?[job.task||command?.task as ParsedTask]:[];
     const parsedTasks=toSimplified(rawTasks).filter((item):item is ParsedTask=>Boolean(item?.title));if(!parsedTasks.length){setTasks(items=>items.filter(item=>item.id!==job.id));finishVoicePolling(job.id);notify('没有识别到可执行的任务指令');return}
@@ -114,6 +114,7 @@ export default function App(){
         if(!response.ok)throw new Error(job.message||'查询识别进度失败');
         if(job.status==='completed'){completeVoiceJob(job);return}
         if(job.status==='failed'){failVoiceJob(job);return}
+        const stageText:Record<string,string>={queued:'等待AI处理',transcribing:'正在转写语音',understanding:'正在理解并拆解',saving:'正在写入SQLite',completed:'处理完成',failed:'识别失败'};const elapsed=Math.max(0,Math.round((Date.now()-new Date(job.createdAt||Date.now()).getTime())/1000));const due=`${stageText[job.stage||'queued']||'AI后台处理中'} · ${elapsed}秒`;setTasks(items=>items.map(item=>item.id===id?{...item,due}:item));
         const timer=window.setTimeout(check,1200);voicePollTimers.current.set(id,timer);
       }catch{const timer=window.setTimeout(check,3000);voicePollTimers.current.set(id,timer)}
     };

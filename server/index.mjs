@@ -109,14 +109,18 @@ async function testCloudConnection(url, anonKey) {
 }
 
 async function qwenChat({ model = textModel, messages, responseFormat, extra = {} }) {
-  const response = await fetch(`${baseURL}/chat/completions`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model, messages, ...(responseFormat ? { response_format: responseFormat } : {}), ...extra })
-  });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data?.error?.message || data?.message || `千问接口请求失败 (${response.status})`);
-  return data;
+  const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),90_000);
+  try{
+    const response = await fetch(`${baseURL}/chat/completions`, {
+      method: 'POST',signal:controller.signal,
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, messages, ...(responseFormat ? { response_format: responseFormat } : {}), ...extra })
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data?.error?.message || data?.message || `千问接口请求失败 (${response.status})`);
+    return data;
+  }catch(error){if(error?.name==='AbortError')throw new Error('千问处理超过90秒，已停止本次请求，请点击任务重试');throw error}
+  finally{clearTimeout(timer)}
 }
 
 function messageText(data) {
@@ -167,23 +171,26 @@ async function parseVoiceCommand(transcript, availableTasks = []) {
   })).filter(task => task.id && task.title);
   const data = await qwenChat({
     messages: [
-      { role: 'system', content: '你是中文工作任务语音指令助手。判断用户是在新建任务，还是修改已有任务。修改包括：更改标题、负责人、截止时间、优先级、预估时长，或把状态设为未开始(todo)、进行中(doing)、已完成(done)。修改时只能使用候选任务中真实存在的 id，并根据任务名称语义匹配最可能的唯一目标；目标不明确、存在多个相似候选或没有提供具体修改内容时必须返回 clarify，绝不能猜测。新建时，如果一句话包含多个并列目标、不同交付物或先后事项，必须拆成多个独立任务，但不要过度拆分同一目标的普通步骤，最多10项。只输出合法 JSON，不要 Markdown。JSON结构：action为create/update/clarify；targetTaskId为字符串或null；changes为对象，仅包含用户明确要求修改的title、assignee、due、priority、status、estimatedMinutes；tasks为新建任务数组，每项包含title、assignee、due、priority、estimatedMinutes、confidence；message为简短中文说明；confidence为0到1数字。' },
+      { role: 'system', content: '你是中文工作任务语音指令助手。判断用户是在新建任务，还是修改已有任务。修改包括：更改标题、负责人、截止时间、优先级、预估时长，或把状态设为未开始(todo)、进行中(doing)、已完成(done)。一句话可以同时修改多条已有任务，每条明确指令都必须保留在updates数组中。修改时只能使用候选任务中真实存在的 id，并根据任务名称语义匹配唯一目标；目标不明确时必须返回clarify，绝不能猜测。新建时，如果一句话包含多个并列目标、不同交付物或先后事项，必须拆成多个独立任务，但不要过度拆分同一目标的普通步骤，最多10项。只输出合法JSON，不要Markdown。JSON结构：action为create/update/clarify；updates为修改数组，每项包含targetTaskId和changes，changes仅包含用户明确要求修改的title、assignee、due、priority、status、estimatedMinutes；为兼容单项修改也可给targetTaskId和changes；tasks为新建任务数组，每项包含title、assignee、due、priority、estimatedMinutes、confidence；message为简短完整中文说明；confidence为0到1数字。' },
       { role: 'user', content: `当前日期：${new Date().toLocaleDateString('zh-CN')}\n当前用户：我\n候选任务：${JSON.stringify(tasks)}\n语音指令：${transcript}` }
     ],
     responseFormat: { type: 'json_object' }
   });
   const parsed = parseJSON(messageText(data));
   if (parsed.action === 'update') {
-    const target = tasks.find(task => task.id === String(parsed.targetTaskId || ''));
-    const source = parsed.changes && typeof parsed.changes === 'object' ? parsed.changes : {};
-    const changes = {};
-    if (typeof source.title === 'string' && source.title.trim()) changes.title = source.title.trim().slice(0, 500);
-    if (typeof source.assignee === 'string' && source.assignee.trim()) changes.assignee = source.assignee.trim().slice(0, 80);
-    if (typeof source.due === 'string' && source.due.trim()) changes.due = source.due.trim().slice(0, 80);
-    if (['高','中','低'].includes(source.priority)) changes.priority = source.priority;
-    if (['todo','doing','done'].includes(source.status)) changes.status = source.status;
-    if (Number(source.estimatedMinutes) > 0) changes.estimatedMinutes = Math.max(1, Math.min(1440, Math.round(Number(source.estimatedMinutes))));
-    if (target && Object.keys(changes).length) return simplify({ action: 'update', targetTaskId: target.id, changes, message: String(parsed.message || `修改“${target.title}”`), confidence: Math.max(0, Math.min(1, Number(parsed.confidence) || 0.8)) });
+    const requested=Array.isArray(parsed.updates)&&parsed.updates.length?parsed.updates:[{targetTaskId:parsed.targetTaskId,changes:parsed.changes}];
+    const updates=[];
+    for(const entry of requested.slice(0,10)){
+      const target=tasks.find(task=>task.id===String(entry?.targetTaskId||''));const source=entry?.changes&&typeof entry.changes==='object'?entry.changes:{};const changes={};
+      if(typeof source.title==='string'&&source.title.trim())changes.title=source.title.trim().slice(0,500);
+      if(typeof source.assignee==='string'&&source.assignee.trim())changes.assignee=source.assignee.trim().slice(0,80);
+      if(typeof source.due==='string'&&source.due.trim())changes.due=source.due.trim().slice(0,80);
+      if(['高','中','低'].includes(source.priority))changes.priority=source.priority;
+      if(['todo','doing','done'].includes(source.status))changes.status=source.status;
+      if(Number(source.estimatedMinutes)>0)changes.estimatedMinutes=Math.max(1,Math.min(1440,Math.round(Number(source.estimatedMinutes))));
+      if(target&&Object.keys(changes).length&&!updates.some(item=>item.targetTaskId===target.id))updates.push({targetTaskId:target.id,changes});
+    }
+    if(updates.length)return simplify({action:'update',updates,targetTaskId:updates[0].targetTaskId,changes:updates[0].changes,message:String(parsed.message||`已修改${updates.length}项任务`),confidence:Math.max(0,Math.min(1,Number(parsed.confidence)||0.8))});
     return { action: 'clarify', targetTaskId: null, changes: {}, message: '没有找到唯一的目标任务，请说出更完整的任务名称和修改内容', confidence: 0 };
   }
   if (parsed.action === 'clarify') return simplify({ action: 'clarify', targetTaskId: null, changes: {}, message: String(parsed.message || '请说出要修改的任务名称和修改内容'), confidence: Math.max(0, Math.min(1, Number(parsed.confidence) || 0)) });
@@ -191,7 +198,8 @@ async function parseVoiceCommand(transcript, availableTasks = []) {
   return { action: 'create', targetTaskId: null, changes: {}, tasks: createdTasks, task: createdTasks[0], message: String(parsed.message || `创建${createdTasks.length}项任务`), confidence: Math.max(0, Math.min(1, Number(parsed.confidence) || Number(createdTasks[0]?.confidence) || 0.8)) };
 }
 
-async function transcribeAudio(buffer, mime = 'audio/webm', availableTasks = []) {
+async function transcribeAudio(buffer, mime = 'audio/webm', availableTasks = [], onStage = async()=>{}) {
+  await onStage('transcribing');
   const audio = `data:${mime};base64,${buffer.toString('base64')}`;
   const data = await qwenChat({
     model: asrModel,
@@ -202,6 +210,7 @@ async function transcribeAudio(buffer, mime = 'audio/webm', availableTasks = [])
   });
   const transcript = convertToSimplified(messageText(data).trim());
   if (!transcript) throw new Error('千问语音模型没有返回转写内容');
+  await onStage('understanding',{transcript});
   if (!availableTasks.length) { const tasks=await parseTasks(transcript);return { transcript, tasks, task: tasks[0], command: null }; }
   const command = await parseVoiceCommand(transcript, availableTasks);
   return { transcript, command, tasks: command.action === 'create' ? command.tasks : [], task: command.action === 'create' ? command.task : null };
@@ -240,14 +249,15 @@ function persistVoiceResultToSqlite(job,result){
   if(supabaseUrl)return [];
   const command=result.command;
   if(command?.action==='update'){
-    const current=getSqliteTask(command.targetTaskId);if(!current)return [];
-    const changes={...(command.changes||{})};const now=new Date().toISOString();
-    if(changes.status==='doing'){changes.progress=current.progress>0&&current.progress<100?current.progress:50;changes.startedAt=current.startedAt||now;changes.completedAt=null}
-    if(changes.status==='done'){changes.progress=100;changes.startedAt=current.startedAt||now;changes.completedAt=now}
-    if(changes.status==='todo'){changes.progress=0;changes.startedAt=null;changes.completedAt=null}
-    patchSqliteTask(current.id,changes);return [current.id];
+    deleteSqliteTask(job.id);const requested=command.updates?.length?command.updates:[{targetTaskId:command.targetTaskId,changes:command.changes}];const ids=[];
+    for(const entry of requested){const current=getSqliteTask(entry.targetTaskId);if(!current)continue;const changes={...(entry.changes||{})};const now=new Date().toISOString();
+      if(changes.status==='doing'){changes.progress=current.progress>0&&current.progress<100?current.progress:50;changes.startedAt=current.startedAt||now;changes.completedAt=null}
+      if(changes.status==='done'){changes.progress=100;changes.startedAt=current.startedAt||now;changes.completedAt=now}
+      if(changes.status==='todo'){changes.progress=0;changes.startedAt=null;changes.completedAt=null}
+      patchSqliteTask(current.id,changes);ids.push(current.id)}
+    return ids;
   }
-  if(command?.action==='clarify')return [];
+  if(command?.action==='clarify'){deleteSqliteTask(job.id);return []}
   const parsedTasks=(result.tasks?.length?result.tasks:command?.tasks?.length?command.tasks:result.task?[result.task]:[]).slice(0,10);
   return parsedTasks.map((parsed,index)=>{
     const id=index===0?job.id:`${job.id}-${index+1}`;
@@ -262,23 +272,28 @@ async function processVoiceJob(id) {
   runningVoiceJobs.add(id);
   try {
     job.status = 'processing';
+    job.stage = 'transcribing';
     job.error = '';
     await persistVoiceJob(job);
     const buffer = await readFile(path.join(voiceJobsDir, job.audioFile));
-    const result = await transcribeAudio(buffer, job.mime, job.availableTasks || []);
+    const result = await transcribeAudio(buffer, job.mime, job.availableTasks || [],async(stage,details={})=>{job.stage=stage;if(details.transcript)job.transcript=details.transcript;await persistVoiceJob(job)});
     if (job.cancelled) return;
-    job.status = 'completed';
+    job.stage = 'saving';
     job.transcript = result.transcript;
     job.tasks = result.tasks || [];
     job.task = result.task;
     job.command = result.command;
+    await persistVoiceJob(job);
     try{job.persistedTaskIds=persistVoiceResultToSqlite(job,result);job.storageError=''}catch(error){console.error('语音任务写入 SQLite 失败',error);job.storageError=error?.message||'SQLite 保存失败'}
+    job.status = 'completed';
+    job.stage = 'completed';
     await persistVoiceJob(job);
     await unlink(path.join(voiceJobsDir, job.audioFile)).catch(() => {});
   } catch (error) {
     if (job.cancelled) return;
     console.error(error);
     job.status = 'failed';
+    job.stage = 'failed';
     job.error = voiceErrorMessage(error);
     await persistVoiceJob(job).catch(console.error);
   } finally {
@@ -436,6 +451,7 @@ app.post('/api/voice-jobs', upload.single('audio'), requireQwen, async (req, res
     const job = {
       id,
       status: 'queued',
+      stage: 'queued',
       mime,
       audioFile,
       createdAt: new Date().toISOString(),
@@ -476,6 +492,7 @@ app.post('/api/voice-jobs/:id/retry', requireQwen, async (req, res) => {
   if (!job) return res.status(404).json({ error: 'VOICE_JOB_NOT_FOUND', message: '没有找到这条语音任务' });
   if (job.status === 'completed') return res.status(409).json({ message: '这条语音任务已经识别完成' });
   job.status = 'queued';
+  job.stage = 'queued';
   job.error = '';
   await persistVoiceJob(job);
   res.status(202).json(publicVoiceJob(job));
