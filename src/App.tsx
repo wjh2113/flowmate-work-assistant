@@ -11,9 +11,9 @@ type Priority = '高' | '中' | '低';
 type Task = { id:string; title:string; assignee:string; due:string; status:Status; priority:Priority; progress:number; estimatedMinutes:number; createdAt?:string; startedAt?:string; completedAt?:string; aiStatus?:'pending'|'failed' };
 type ParsedTask = { title:string; assignee:string; due:string; priority:Priority; confidence:number; estimatedMinutes?:number };
 type VoiceTaskChanges = Partial<Pick<Task,'title'|'assignee'|'due'|'priority'|'status'|'estimatedMinutes'>>;
-type VoiceCommand = { action:'create'|'update'|'clarify'; targetTaskId:string|null; changes:VoiceTaskChanges; task?:ParsedTask; message?:string; confidence:number };
+type VoiceCommand = { action:'create'|'update'|'clarify'; targetTaskId:string|null; changes:VoiceTaskChanges; tasks?:ParsedTask[]; task?:ParsedTask; message?:string; confidence:number };
 type DailyReport = { headline:string; summary:string; completed:string[]; risks:string[]; tomorrow:{title:string;reason:string;priority:Priority;suggestedTime:string}[] };
-type VoiceJob = { id:string; status:'queued'|'processing'|'completed'|'failed'; transcript?:string; task?:ParsedTask|null; command?:VoiceCommand|null; error?:string };
+type VoiceJob = { id:string; status:'queued'|'processing'|'completed'|'failed'; transcript?:string; tasks?:ParsedTask[]; task?:ParsedTask|null; command?:VoiceCommand|null; error?:string };
 
 const defaultEstimate=(priority:Priority)=>priority==='高'?120:priority==='低'?30:60;
 const normalizeTask=(task:Task):Task=>({...task,estimatedMinutes:Number(task.estimatedMinutes)>0?Number(task.estimatedMinutes):defaultEstimate(task.priority),startedAt:task.startedAt||((task.status==='doing'||task.status==='done')?task.createdAt:undefined)});
@@ -95,10 +95,10 @@ export default function App(){
     if(command?.action==='clarify'){
       setTasks(items=>items.filter(item=>item.id!==job.id));finishVoicePolling(job.id);notify(command.message||'请说出要修改的任务名称和内容');return
     }
-    const parsed=toSimplified(job.task||command?.task);if(!parsed){setTasks(items=>items.filter(item=>item.id!==job.id));finishVoicePolling(job.id);notify('没有识别到可执行的任务指令');return}
-    const task:Task={id:job.id,title:parsed.title||job.transcript||'语音任务',assignee:parsed.assignee||'我',due:parsed.due||'今天',status:'todo',priority:parsed.priority||'中',progress:0,estimatedMinutes:parsed.estimatedMinutes||defaultEstimate(parsed.priority||'中'),createdAt:new Date().toISOString()};
-    setTasks(items=>{const current=items.find(item=>item.id===job.id);const finished={...task,createdAt:current?.createdAt||task.createdAt};return current?items.map(item=>item.id===job.id?finished:item):[finished,...items]});
-    syncVoiceTask(task);setAiReady(true);finishVoicePolling(job.id);notify('语音任务已创建');
+    const rawTasks=job.tasks?.length?job.tasks:command?.tasks?.length?command.tasks:job.task||command?.task?[job.task||command?.task as ParsedTask]:[];
+    const parsedTasks=toSimplified(rawTasks).filter((item):item is ParsedTask=>Boolean(item?.title));if(!parsedTasks.length){setTasks(items=>items.filter(item=>item.id!==job.id));finishVoicePolling(job.id);notify('没有识别到可执行的任务指令');return}
+    const placeholder=tasksRef.current.find(item=>item.id===job.id);const now=new Date().toISOString();const created=parsedTasks.slice(0,10).map((parsed,index):Task=>({id:index===0?job.id:crypto.randomUUID(),title:parsed.title||job.transcript||'语音任务',assignee:parsed.assignee||'我',due:parsed.due||'今天',status:'todo',priority:parsed.priority||'中',progress:0,estimatedMinutes:parsed.estimatedMinutes||defaultEstimate(parsed.priority||'中'),createdAt:index===0?(placeholder?.createdAt||now):now}));
+    setTasks(items=>[...created,...items.filter(item=>item.id!==job.id)]);created.forEach(syncVoiceTask);setAiReady(true);finishVoicePolling(job.id);notify(created.length>1?`已拆解并创建 ${created.length} 项任务`:'语音任务已创建');
   };
   const failVoiceJob=(job:VoiceJob)=>{
     const current=tasksRef.current.find(item=>item.id===job.id);if(current)saveFileTask({...current,aiStatus:'failed',due:'识别失败'}).catch(()=>{});
@@ -133,6 +133,12 @@ export default function App(){
     setTasks(v=>[task,...v]);setTitle('');setEstimate(60);setTranscript('');setParsedTask(null);setModal(null);notify('任务已创建');
     setSyncing(true);(session&&teamId?upsertTask(toCloud(task,teamId,session.user.id)):saveFileTask(task)).catch(error=>alert(`任务保存失败：${error.message}`)).finally(()=>setSyncing(false));
   };
+  const createTasksFromText=async()=>{
+    const text=transcript.trim();if(!text)return;setProcessing(true);setVoiceTip('AI 正在拆解任务…');
+    try{const response=await fetch('/api/parse-task-text',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({transcript:text})});const data=await response.json();if(!response.ok)throw new Error(data.message||'任务拆解失败');const parsed=toSimplified<ParsedTask[]>(Array.isArray(data.tasks)?data.tasks:[]).filter(item=>item?.title).slice(0,10);if(!parsed.length)throw new Error('没有识别到可执行任务');const now=new Date().toISOString();const created:Task[]=parsed.map(item=>({id:crypto.randomUUID(),title:item.title,assignee:item.assignee||'我',due:item.due||'今天',status:'todo',priority:item.priority||'中',progress:0,estimatedMinutes:item.estimatedMinutes||defaultEstimate(item.priority||'中'),createdAt:now}));await Promise.all(created.map(task=>session&&teamId?upsertTask(toCloud(task,teamId,session.user.id)):saveFileTask(task)));setTasks(items=>[...created,...items]);setTranscript('');setParsedTask(null);setModal(null);setAiReady(true);notify(created.length>1?`已拆解并创建 ${created.length} 项任务`:'任务已创建')}
+    catch(error){setVoiceTip(error instanceof Error?error.message:'AI 任务拆解失败')}
+    finally{setProcessing(false)}
+  };
   const cycle=(id:string)=>{
     const current=tasks.find(t=>t.id===id);if(!current)return;const next:Status=current.status==='todo'?'doing':current.status==='doing'?'done':'todo';const now=new Date().toISOString();const changes={status:next,progress:next==='doing'?50:next==='done'?100:0,startedAt:next==='doing'?(current.startedAt||now):next==='todo'?undefined:current.startedAt,completedAt:next==='done'?now:undefined};
     if(current.aiStatus==='pending'){notify('AI 正在后台识别这条语音任务');return}
@@ -159,7 +165,7 @@ export default function App(){
       rec.onstop=()=>uploadRecording(new Blob(chunks.current,{type:rec.mimeType||'audio/webm'}));
       const Speech=window.SpeechRecognition||window.webkitSpeechRecognition;
       if(Speech){const r=new Speech();browserRecognition.current=r;r.lang='zh-CN';r.continuous=true;r.interimResults=true;r.onresult=e=>{let text='';for(let i=0;i<e.results.length;i++)text+=e.results[i][0].transcript;text=toSimplified(text);localTranscript.current=text;setTranscript(text)};try{r.start()}catch{}}
-      rec.start(500);setRecording(true);setVoiceTip('请说出新任务，或说明要修改的任务名称和内容…');
+      rec.start(500);setRecording(true);setVoiceTip('可以连续说多个任务，AI 会自动逐项拆解…');
     }catch{setVoiceTip('麦克风权限未开启。请点击地址栏左侧图标，允许本站使用麦克风。')}
   };
   const stopRecording=()=>{if(!recording)return;setRecording(false);setProcessing(true);setVoiceTip('正在安全保存录音…');try{browserRecognition.current?.stop()}catch{}recorder.current?.stop()};
@@ -209,12 +215,12 @@ export default function App(){
     {tab==='team'&&<ListPage title="团队任务" tasks={tasks.filter(t=>t.assignee!=='我')} cycle={cycle} remove={removeTask} now={clock}/>} 
     {tab==='mine'&&<Profile name={displayName} avatar={avatarText} tasks={tasks} install={install} aiReady={aiReady} cloudOnline={Boolean(session)} syncing={syncing} signOut={()=>supabase?.auth.signOut()} goTeam={()=>goTab('team')} notify={notify} openSettings={()=>setModal('settings')} openCloudSettings={()=>setModal('cloud')}/>} 
     <div className="quick-create" role="group" aria-label="新建任务">
-      <button className="quick-voice" type="button" onClick={()=>{setVoiceTip('可以新建任务，也可以修改已有任务');setModal('voice')}} aria-label="语音新建或修改任务"><MicIcon/><span>语音</span></button>
+      <button className="quick-voice" type="button" onClick={()=>{setVoiceTip('一次可以说多个任务，也可以修改已有任务');setModal('voice')}} aria-label="语音新建或修改任务"><MicIcon/><span>语音</span></button>
       <button className="quick-add" type="button" onClick={()=>setModal('add')} aria-label="手动新建任务">＋</button>
     </div>
     <nav>{([['home','⌂','首页'],['tasks','✓','任务'],['team','♟','团队'],['mine','●','我的']] as const).map(([id,icon,label])=><button className={tab===id?'active':''} onClick={()=>goTab(id)} key={id}><i>{icon}</i><span>{label}</span></button>)}</nav>
     {toast&&<div className="toast" role="status">✓ {toast}</div>}
-    {modal&&<div className="overlay" onClick={()=>!recording&&!processing&&setModal(null)}><section className={'sheet '+(modal==='settings'||modal==='cloud'?'settings-sheet':'')} onClick={e=>e.stopPropagation()}><div className="handle"/>{modal==='voice'?<><h2>{processing?'正在保存…':recording?'正在录音…':transcript?'录音待确认':'语音创建任务'}</h2><p className={'voice-tip '+(recording||processing?'live':'')}>{voiceTip}</p><button className={'record '+(recording?'recording':'')} disabled={processing} onClick={recording?stopRecording:beginRecording}><MicIcon/></button><p className="record-label">{processing?'保存后可立即离开':recording?'点击结束录音':'点击开始录音'}</p><textarea className="input transcript" value={transcript} placeholder="浏览器预识别内容会显示在这里" onChange={e=>{setTranscript(e.target.value);setParsedTask(null)}}/>{parsedTask&&<div className="ai-understanding"><b>已整理</b><span>任务：{parsedTask.title}</span><span>负责人：{parsedTask.assignee} · 截止：{parsedTask.due} · {parsedTask.priority}优先级</span><span>预计用时：{formatDuration(parsedTask.estimatedMinutes||defaultEstimate(parsedTask.priority))}</span></div>}<button className="primary" disabled={!transcript.trim()||processing||recording} onClick={()=>addTask(transcript,parsedTask)}>直接使用当前文字创建</button></>:modal==='settings'?<ModelSettings onClose={()=>setModal(null)} onSaved={()=>{setAiReady(true);notify('模型设置已保存');setModal(null)}}/>:modal==='cloud'?<CloudSettings onClose={()=>setModal(null)}/>:<><h2>新建任务</h2><label>任务内容</label><input className="input" value={title} onChange={e=>setTitle(e.target.value)} placeholder="例如：完成项目周报"/><label>负责人</label><div className="people"><button className="selected" onClick={()=>setAssignee('我')}>我</button></div><label>预估时间</label><select className="input" value={estimate} onChange={e=>setEstimate(Number(e.target.value))}><option value={15}>15 分钟</option><option value={30}>30 分钟</option><option value={60}>1 小时</option><option value={120}>2 小时</option><option value={240}>4 小时</option></select><button className="primary" disabled={!title.trim()} onClick={()=>addTask()}>创建任务</button></>}</section></div>}
+    {modal&&<div className="overlay" onClick={()=>!recording&&!processing&&setModal(null)}><section className={'sheet '+(modal==='settings'||modal==='cloud'?'settings-sheet':'')} onClick={e=>e.stopPropagation()}><div className="handle"/>{modal==='voice'?<><h2>{processing?'AI 正在拆解…':recording?'正在录音…':transcript?'录音待确认':'语音创建任务'}</h2><p className={'voice-tip '+(recording||processing?'live':'')}>{voiceTip}</p><button className={'record '+(recording?'recording':'')} disabled={processing} onClick={recording?stopRecording:beginRecording}><MicIcon/></button><p className="record-label">{processing?'识别多个事项并分别创建':recording?'点击结束录音':'点击开始录音'}</p><textarea className="input transcript" value={transcript} placeholder="可以一次说出多个任务，AI 会自动拆解" onChange={e=>{setTranscript(e.target.value);setParsedTask(null)}}/>{parsedTask&&<div className="ai-understanding"><b>已整理</b><span>任务：{parsedTask.title}</span><span>负责人：{parsedTask.assignee} · 截止：{parsedTask.due} · {parsedTask.priority}优先级</span><span>预计用时：{formatDuration(parsedTask.estimatedMinutes||defaultEstimate(parsedTask.priority))}</span></div>}<button className="primary" disabled={!transcript.trim()||processing||recording} onClick={createTasksFromText}>AI 拆解并创建任务</button></>:modal==='settings'?<ModelSettings onClose={()=>setModal(null)} onSaved={()=>{setAiReady(true);notify('模型设置已保存');setModal(null)}}/>:modal==='cloud'?<CloudSettings onClose={()=>setModal(null)}/>:<><h2>新建任务</h2><label>任务内容</label><input className="input" value={title} onChange={e=>setTitle(e.target.value)} placeholder="例如：完成项目周报"/><label>负责人</label><div className="people"><button className="selected" onClick={()=>setAssignee('我')}>我</button></div><label>预估时间</label><select className="input" value={estimate} onChange={e=>setEstimate(Number(e.target.value))}><option value={15}>15 分钟</option><option value={30}>30 分钟</option><option value={60}>1 小时</option><option value={120}>2 小时</option><option value={240}>4 小时</option></select><button className="primary" disabled={!title.trim()} onClick={()=>addTask()}>创建任务</button></>}</section></div>}
   </main></div>;
 }
 

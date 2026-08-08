@@ -140,16 +140,22 @@ function normalizeParsedTask(parsed, transcript) {
   });
 }
 
-async function parseTask(transcript) {
+function normalizeParsedTasks(parsed, transcript) {
+  const source=Array.isArray(parsed?.tasks)?parsed.tasks:Array.isArray(parsed)?parsed:[parsed?.task||parsed];
+  const tasks=source.filter(item=>item&&typeof item==='object'&&String(item.title||'').trim()).slice(0,10).map(item=>normalizeParsedTask(item,transcript));
+  return tasks.length?tasks:[normalizeParsedTask(parsed?.task||parsed,transcript)];
+}
+
+async function parseTasks(transcript) {
   const data = await qwenChat({
     messages: [
-      { role: 'system', content: '你是中文工作任务助手。把口语准确整理为单个可执行任务。不要虚构信息；未提负责人时写“我”，未提日期时写“今天”。任务标题只保留动作和对象。根据任务复杂度合理估算处理时长。只输出合法 JSON，不要 Markdown。JSON字段：title字符串、assignee字符串、due简短中文、priority为高/中/低、confidence为0到1数字、estimatedMinutes为15到480之间的整数分钟数。' },
+      { role: 'system', content: '你是中文工作任务拆解助手。把一段口语整理为一个或多个独立可执行任务。一句话中出现多个并列目标、不同课程、不同交付物或先后要完成的事项时，必须拆成多项；例如“学习日语直播课、英语雅思和AI练习”应拆成3项。不要把同一个目标的普通操作步骤过度拆分。最多10项，不要虚构信息；未提负责人时写“我”，未提日期时写“今天”。每个标题只保留一个动作和一个清晰对象。根据各任务复杂度分别估算时长。只输出合法 JSON，不要 Markdown。JSON结构：tasks为数组，每项包含title字符串、assignee字符串、due简短中文、priority为高/中/低、confidence为0到1数字、estimatedMinutes为15到480之间的整数分钟数。' },
       { role: 'user', content: `当前日期：${new Date().toLocaleDateString('zh-CN')}\n当前用户：我\n语音内容：${transcript}` }
     ],
     responseFormat: { type: 'json_object' }
   });
   const parsed = parseJSON(messageText(data));
-  return normalizeParsedTask(parsed, transcript);
+  return normalizeParsedTasks(parsed, transcript);
 }
 
 async function parseVoiceCommand(transcript, availableTasks = []) {
@@ -161,7 +167,7 @@ async function parseVoiceCommand(transcript, availableTasks = []) {
   })).filter(task => task.id && task.title);
   const data = await qwenChat({
     messages: [
-      { role: 'system', content: '你是中文工作任务语音指令助手。判断用户是在新建任务，还是修改已有任务。修改包括：更改标题、负责人、截止时间、优先级、预估时长，或把状态设为未开始(todo)、进行中(doing)、已完成(done)。修改时只能使用候选任务中真实存在的 id，并根据任务名称语义匹配最可能的唯一目标；目标不明确、存在多个相似候选或没有提供具体修改内容时必须返回 clarify，绝不能猜测。新建时整理成可执行任务。只输出合法 JSON，不要 Markdown。JSON结构：action为create/update/clarify；targetTaskId为字符串或null；changes为对象，仅包含用户明确要求修改的title、assignee、due、priority、status、estimatedMinutes；task为新建任务对象，包含title、assignee、due、priority、estimatedMinutes、confidence；message为简短中文说明；confidence为0到1数字。' },
+      { role: 'system', content: '你是中文工作任务语音指令助手。判断用户是在新建任务，还是修改已有任务。修改包括：更改标题、负责人、截止时间、优先级、预估时长，或把状态设为未开始(todo)、进行中(doing)、已完成(done)。修改时只能使用候选任务中真实存在的 id，并根据任务名称语义匹配最可能的唯一目标；目标不明确、存在多个相似候选或没有提供具体修改内容时必须返回 clarify，绝不能猜测。新建时，如果一句话包含多个并列目标、不同交付物或先后事项，必须拆成多个独立任务，但不要过度拆分同一目标的普通步骤，最多10项。只输出合法 JSON，不要 Markdown。JSON结构：action为create/update/clarify；targetTaskId为字符串或null；changes为对象，仅包含用户明确要求修改的title、assignee、due、priority、status、estimatedMinutes；tasks为新建任务数组，每项包含title、assignee、due、priority、estimatedMinutes、confidence；message为简短中文说明；confidence为0到1数字。' },
       { role: 'user', content: `当前日期：${new Date().toLocaleDateString('zh-CN')}\n当前用户：我\n候选任务：${JSON.stringify(tasks)}\n语音指令：${transcript}` }
     ],
     responseFormat: { type: 'json_object' }
@@ -181,7 +187,8 @@ async function parseVoiceCommand(transcript, availableTasks = []) {
     return { action: 'clarify', targetTaskId: null, changes: {}, message: '没有找到唯一的目标任务，请说出更完整的任务名称和修改内容', confidence: 0 };
   }
   if (parsed.action === 'clarify') return simplify({ action: 'clarify', targetTaskId: null, changes: {}, message: String(parsed.message || '请说出要修改的任务名称和修改内容'), confidence: Math.max(0, Math.min(1, Number(parsed.confidence) || 0)) });
-  return { action: 'create', targetTaskId: null, changes: {}, task: normalizeParsedTask(parsed.task || parsed, transcript), message: String(parsed.message || '创建新任务'), confidence: Math.max(0, Math.min(1, Number(parsed.confidence) || Number(parsed.task?.confidence) || 0.8)) };
+  const createdTasks=normalizeParsedTasks(parsed,transcript);
+  return { action: 'create', targetTaskId: null, changes: {}, tasks: createdTasks, task: createdTasks[0], message: String(parsed.message || `创建${createdTasks.length}项任务`), confidence: Math.max(0, Math.min(1, Number(parsed.confidence) || Number(createdTasks[0]?.confidence) || 0.8)) };
 }
 
 async function transcribeAudio(buffer, mime = 'audio/webm', availableTasks = []) {
@@ -195,9 +202,9 @@ async function transcribeAudio(buffer, mime = 'audio/webm', availableTasks = [])
   });
   const transcript = convertToSimplified(messageText(data).trim());
   if (!transcript) throw new Error('千问语音模型没有返回转写内容');
-  if (!availableTasks.length) return { transcript, task: await parseTask(transcript), command: null };
+  if (!availableTasks.length) { const tasks=await parseTasks(transcript);return { transcript, tasks, task: tasks[0], command: null }; }
   const command = await parseVoiceCommand(transcript, availableTasks);
-  return { transcript, command, task: command.action === 'create' ? command.task : null };
+  return { transcript, command, tasks: command.action === 'create' ? command.tasks : [], task: command.action === 'create' ? command.task : null };
 }
 
 function voiceErrorMessage(error) {
@@ -242,6 +249,7 @@ async function processVoiceJob(id) {
     if (job.cancelled) return;
     job.status = 'completed';
     job.transcript = result.transcript;
+    job.tasks = result.tasks || [];
     job.task = result.task;
     job.command = result.command;
     await persistVoiceJob(job);
@@ -382,6 +390,18 @@ app.put('/api/settings/model', requireSettingsAccess, async (req, res) => {
   }
 });
 
+app.post('/api/parse-task-text', requireQwen, async (req, res) => {
+  try{
+    const transcript=String(req.body?.transcript||'').trim().slice(0,5000);
+    if(!transcript)return res.status(400).json({message:'任务内容不能为空'});
+    const tasks=await parseTasks(transcript);
+    res.json({tasks,count:tasks.length});
+  }catch(error){
+    console.error(error);
+    res.status(502).json({message:error?.message||'AI 任务拆解失败'});
+  }
+});
+
 app.post('/api/voice-jobs', upload.single('audio'), requireQwen, async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'NO_AUDIO', message: '没有收到录音文件' });
@@ -401,6 +421,7 @@ app.post('/api/voice-jobs', upload.single('audio'), requireQwen, async (req, res
       updatedAt: new Date().toISOString(),
       availableTasks,
       transcript: '',
+      tasks: [],
       task: null,
       command: null,
       error: ''
