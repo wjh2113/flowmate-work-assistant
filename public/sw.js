@@ -1,4 +1,4 @@
-const CACHE = 'flowmate-v4';
+const CACHE = 'flowmate-v6-multitask';
 const APP_SHELL = ['/', '/manifest.webmanifest', '/icon.svg'];
 self.addEventListener('install', event => {
   self.skipWaiting();

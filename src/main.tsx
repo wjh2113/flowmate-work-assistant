@@ -24,11 +24,14 @@ void start();
 if ('serviceWorker' in navigator && import.meta.env.PROD) {
   window.addEventListener('load', async () => {
     const registration = await navigator.serviceWorker.register('/sw.js');
-    registration.update();
+    void registration.update();
+    window.setInterval(()=>void registration.update(),60_000);
+    let refreshing=false;
     navigator.serviceWorker.addEventListener('controllerchange', () => {
-      if (sessionStorage.getItem('flowmate-sw-reloaded')) return;
-      sessionStorage.setItem('flowmate-sw-reloaded', '1');
+      if(refreshing)return;refreshing=true;
       window.location.reload();
     });
+    const checkAppVersion=async()=>{try{const response=await fetch(`/version.json?t=${Date.now()}`,{cache:'no-store'});const data=await response.json();if(data.version&&data.version!==__APP_BUILD_VERSION__)window.location.reload()}catch{}};
+    window.setInterval(()=>void checkAppVersion(),60_000);
   });
 }

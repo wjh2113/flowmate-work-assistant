@@ -236,6 +236,26 @@ function publicVoiceJob(job) {
   return safeJob;
 }
 
+function persistVoiceResultToSqlite(job,result){
+  if(supabaseUrl)return [];
+  const command=result.command;
+  if(command?.action==='update'){
+    const current=getSqliteTask(command.targetTaskId);if(!current)return [];
+    const changes={...(command.changes||{})};const now=new Date().toISOString();
+    if(changes.status==='doing'){changes.progress=current.progress>0&&current.progress<100?current.progress:50;changes.startedAt=current.startedAt||now;changes.completedAt=null}
+    if(changes.status==='done'){changes.progress=100;changes.startedAt=current.startedAt||now;changes.completedAt=now}
+    if(changes.status==='todo'){changes.progress=0;changes.startedAt=null;changes.completedAt=null}
+    patchSqliteTask(current.id,changes);return [current.id];
+  }
+  if(command?.action==='clarify')return [];
+  const parsedTasks=(result.tasks?.length?result.tasks:command?.tasks?.length?command.tasks:result.task?[result.task]:[]).slice(0,10);
+  return parsedTasks.map((parsed,index)=>{
+    const id=index===0?job.id:`${job.id}-${index+1}`;
+    saveSqliteTask({id,title:parsed.title||result.transcript||'语音任务',assignee:parsed.assignee||'我',due:parsed.due||'今天',status:'todo',priority:parsed.priority||'中',progress:0,estimatedMinutes:parsed.estimatedMinutes||60,createdAt:job.createdAt,startedAt:null,completedAt:null,aiStatus:null});
+    return id;
+  });
+}
+
 async function processVoiceJob(id) {
   const job = voiceJobs.get(id);
   if (!job || runningVoiceJobs.has(id) || job.status === 'completed') return;
@@ -252,6 +272,7 @@ async function processVoiceJob(id) {
     job.tasks = result.tasks || [];
     job.task = result.task;
     job.command = result.command;
+    try{job.persistedTaskIds=persistVoiceResultToSqlite(job,result);job.storageError=''}catch(error){console.error('语音任务写入 SQLite 失败',error);job.storageError=error?.message||'SQLite 保存失败'}
     await persistVoiceJob(job);
     await unlink(path.join(voiceJobsDir, job.audioFile)).catch(() => {});
   } catch (error) {
@@ -495,8 +516,9 @@ app.post('/api/daily-plan', requireQwen, async (req, res) => {
 });
 
 const dist = path.resolve(__dirname, '../dist');
+app.use((req,res,next)=>{if(req.path==='/'||req.path==='/index.html'||req.path==='/sw.js')res.set('Cache-Control','no-store, no-cache, must-revalidate');next()});
 app.use(express.static(dist));
-app.get('/{*splat}', (_req, res) => res.sendFile(path.join(dist, 'index.html')));
+app.get('/{*splat}', (_req, res) => res.set('Cache-Control','no-store').sendFile(path.join(dist, 'index.html')));
 let sqliteClosed=false;
 const closeDatabase=()=>{if(sqliteClosed)return;sqliteClosed=true;closeSqlite()};
 process.once('SIGINT',()=>{closeDatabase();process.exit(0)});

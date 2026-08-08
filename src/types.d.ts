@@ -14,3 +14,5 @@ interface Window {
   SpeechRecognition?: SpeechRecognitionConstructor;
   webkitSpeechRecognition?: SpeechRecognitionConstructor;
 }
+
+declare const __APP_BUILD_VERSION__:string;
