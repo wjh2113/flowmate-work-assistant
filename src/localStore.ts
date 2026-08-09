@@ -1,7 +1,7 @@
 export type StoredTask={id:string;title:string;assignee:string;due:string;status:'todo'|'doing'|'done';priority:'高'|'中'|'低';progress:number;estimatedMinutes:number;createdAt?:string;startedAt?:string;completedAt?:string;aiStatus?:'pending'|'failed'};
 
 async function jsonRequest<T>(url:string,options?:RequestInit):Promise<T>{
-  const response=await fetch(url,options);
+  const response=await fetch(url,{...options,credentials:'include'});
   if(response.status===204)return null as T;
   const text=await response.text();
   let data:any={};

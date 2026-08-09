@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Session } from '@supabase/supabase-js';
 import { cloudConfigured, deleteDailyReport, deletePeriodReport, deleteTask, getSession, getWorkspace, listPeriodReports, listTasks, loadDailyReport, loadPeriodReport, saveDailyReport, savePeriodReport, sendMagicLink, supabase, updateTask, upsertTask, type CloudTask } from './cloud';
+import { apiFetch, getLocalUser, loginLocalUser, logoutLocalUser, registerLocalUser, type LocalUser } from './localAuth';
 import { deleteFileDailyReport, deleteFilePeriodReport, deleteFileTask, listFilePeriodReports, listFileTasks, loadFileDailyReport, loadFilePeriodReport, patchFileTask, saveFileDailyReport, saveFilePeriodReport, saveFileTask, type PeriodReportMeta } from './localStore';
 import GuidePage from './GuidePage';
 import { toSimplified } from './chinese';
@@ -51,7 +52,9 @@ export default function App(){
   const [voiceProgress,setVoiceProgress]=useState<VoiceProgress[]>([]);
   const [toast,setToast]=useState('');
   const [dialog,setDialog]=useState<AppDialog|null>(null);
-  const [session,setSession]=useState<Session|null>(null); const [authLoading,setAuthLoading]=useState(cloudConfigured);
+  const [session,setSession]=useState<Session|null>(null);
+  const [localUser,setLocalUser]=useState<LocalUser|null>(null);
+  const [authLoading,setAuthLoading]=useState(true);
   const [teamId,setTeamId]=useState(''); const [syncing,setSyncing]=useState(false);
   const [clock,setClock]=useState(()=>Date.now());
   const recorder=useRef<MediaRecorder|null>(null); const stream=useRef<MediaStream|null>(null); const chunks=useRef<Blob[]>([]);
@@ -80,8 +83,9 @@ export default function App(){
   const weekMeta=weekRange();
   const weekKey=isoWeekKey();
   const monthKeyValue=monthKey();
-  const displayName=String(session?.user.user_metadata?.name||session?.user.email?.split('@')[0]||'我');
+  const displayName=String(session?.user.user_metadata?.name||session?.user.email?.split('@')[0]||localUser?.name||localUser?.email?.split('@')[0]||'我');
   const avatarText=displayName.slice(0,1).toUpperCase();
+  const signedIn=Boolean(session||localUser);
   const [avatarUrl,setAvatarUrl]=useState<string>(()=>{try{return localStorage.getItem('flowmate.avatar')||''}catch{return''}});
   const saveAvatar=async(file:File)=>{
     if(!file.type.startsWith('image/')){notify('请选择图片文件');return}
@@ -106,16 +110,22 @@ export default function App(){
   useEffect(()=>{fetch('/api/health').then(r=>r.json()).then(data=>setAiReady(Boolean(data.ai))).catch(()=>setAiReady(false))},[]);
   useEffect(()=>{
     if(cloudConfigured)return;
+    if(!localUser)return;
     let active=true;let first=true;
-    const refresh=async()=>{try{if(first)setSyncing(true);const [storedTasks,storedReport,storedWeekly,storedMonthly]=await Promise.all([listFileTasks(),loadFileDailyReport<DailyReport>(dateKey),loadFilePeriodReport<PeriodReport>('weekly',weekKey),loadFilePeriodReport<PeriodReport>('monthly',monthKeyValue)]);if(active){const normalized=toSimplified(storedTasks).map(normalizeTask);const ghosts=normalized.filter(t=>!isRealTask(t));if(ghosts.length){for(const g of ghosts){if(g.aiStatus==='pending')localStorage.setItem('flowmate.voiceJobs',JSON.stringify([...new Set([...(JSON.parse(localStorage.getItem('flowmate.voiceJobs')||'[]') as string[]),g.id])]));deleteFileTask(g.id).catch(()=>{})}setVoiceProgress(prev=>{const map=new Map(prev.map(item=>[item.id,item]));for(const g of ghosts){if(!map.has(g.id))map.set(g.id,{id:g.id,title:g.title||'语音指令识别中…',stage:g.due||'AI后台处理中',status:g.aiStatus==='failed'?'failed':'pending',error:g.aiStatus==='failed'?(g.due||'识别失败'):undefined,createdAt:g.createdAt||new Date().toISOString()})}return [...map.values()]})}setTasks(normalized.filter(isRealTask));setReport(storedReport?toSimplified(storedReport):null);setWeeklyReport(storedWeekly?toSimplified(storedWeekly):null);setMonthlyReport(storedMonthly?toSimplified(storedMonthly):null)}}catch(error){if(active)setReportError(error instanceof Error?`SQLite 读取失败：${error.message}`:'SQLite 读取失败')}finally{if(active&&first){first=false;setSyncing(false)}}};
+    const refresh=async()=>{try{if(first)setSyncing(true);const [storedTasks,storedReport,storedWeekly,storedMonthly]=await Promise.all([listFileTasks(),loadFileDailyReport<DailyReport>(dateKey),loadFilePeriodReport<PeriodReport>('weekly',weekKey),loadFilePeriodReport<PeriodReport>('monthly',monthKeyValue)]);if(active){const normalized=toSimplified(storedTasks).map(normalizeTask);const ghosts=normalized.filter(t=>!isRealTask(t));if(ghosts.length){for(const g of ghosts){if(g.aiStatus==='pending')localStorage.setItem('flowmate.voiceJobs',JSON.stringify([...new Set([...(JSON.parse(localStorage.getItem('flowmate.voiceJobs')||'[]') as string[]),g.id])]));deleteFileTask(g.id).catch(()=>{})}setVoiceProgress(prev=>{const map=new Map(prev.map(item=>[item.id,item]));for(const g of ghosts){if(!map.has(g.id))map.set(g.id,{id:g.id,title:g.title||'语音指令识别中…',stage:g.due||'AI后台处理中',status:g.aiStatus==='failed'?'failed':'pending',error:g.aiStatus==='failed'?(g.due||'识别失败'):undefined,createdAt:g.createdAt||new Date().toISOString()})}return [...map.values()]})}setTasks(normalized.filter(isRealTask));setReport(storedReport?toSimplified(storedReport):null);setWeeklyReport(storedWeekly?toSimplified(storedWeekly):null);setMonthlyReport(storedMonthly?toSimplified(storedMonthly):null);setReportError('')}}catch(error){if(active)setReportError(error instanceof Error?`SQLite 读取失败：${error.message}`:'SQLite 读取失败')}finally{if(active&&first){first=false;setSyncing(false)}}};
     void refresh();const timer=window.setInterval(refresh,5000);
     return()=>{active=false;window.clearInterval(timer)};
-  },[dateKey,weekKey,monthKeyValue]);
+  },[localUser,dateKey,weekKey,monthKeyValue]);
   useEffect(()=>{
-    if(!supabase){setAuthLoading(false);return}
-    getSession().then(setSession).finally(()=>setAuthLoading(false));
-    const {data}=supabase.auth.onAuthStateChange((_event,next)=>{setSession(next);setAuthLoading(false)});
-    return()=>data.subscription.unsubscribe();
+    let active=true;
+    if(cloudConfigured){
+      if(!supabase){setAuthLoading(false);return}
+      getSession().then(next=>{if(active)setSession(next)}).finally(()=>{if(active)setAuthLoading(false)});
+      const {data}=supabase.auth.onAuthStateChange((_event,next)=>{if(active){setSession(next);setAuthLoading(false)}});
+      return()=>{active=false;data.subscription.unsubscribe()};
+    }
+    getLocalUser().then(user=>{if(active)setLocalUser(user)}).finally(()=>{if(active)setAuthLoading(false)});
+    return()=>{active=false};
   },[]);
   useEffect(()=>{
     if(!session||!supabase)return;
@@ -165,12 +175,12 @@ export default function App(){
       }
     }
     const retentionSlot=latestDueVoiceRetentionSlot(now,autoSchedule.voiceRetention);
-    if(retentionSlot&&!isSlotDone(retentionSlot.storageKey)){
-      void fetch('/api/voice-jobs/purge',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({retentionDays:retentionSlot.retentionDays})})
+    if(signedIn&&retentionSlot&&!isSlotDone(retentionSlot.storageKey)){
+      void apiFetch('/api/voice-jobs/purge',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({retentionDays:retentionSlot.retentionDays})})
         .then(async res=>{const data=await readApiJson<{skipped?:boolean}>(res);if(res.ok&&!data.skipped)markSlotDone(retentionSlot.storageKey)})
         .catch(()=>{});
     }
-  },[aiReady,tab,tasks.length,clock,autoSchedule]);
+  },[aiReady,tab,tasks.length,clock,autoSchedule,signedIn]);
 
   const notify=(message:string)=>{setToast(message);window.setTimeout(()=>setToast(''),2200)};
   const closeDialog=(ok:boolean)=>{setDialog(current=>{current?.resolve(ok);return null})};
@@ -229,7 +239,7 @@ export default function App(){
     if(voicePolling.current.has(id))return;voicePolling.current.add(id);
     const check=async()=>{
       try{
-        const response=await fetch(`/api/voice-jobs/${id}`);const job=await readApiJson<VoiceJob&{message?:string}>(response);
+        const response=await apiFetch(`/api/voice-jobs/${id}`);const job=await readApiJson<VoiceJob&{message?:string}>(response);
         if(response.status===404){failVoiceJob({id,status:'failed',error:job.message||'语音任务已失效'});return}
         if(!response.ok)throw new Error(job.message||'查询识别进度失败');
         if(job.status==='completed'){void completeVoiceJob(job);return}
@@ -249,7 +259,7 @@ export default function App(){
   };
   const retryVoiceJob=async(id:string)=>{
     try{
-      const response=await fetch(`/api/voice-jobs/${id}/retry`,{method:'POST'});const job=await readApiJson<{message?:string}>(response);if(!response.ok)throw new Error(job.message||'重试失败');
+      const response=await apiFetch(`/api/voice-jobs/${id}/retry`,{method:'POST'});const job=await readApiJson<{message?:string}>(response);if(!response.ok)throw new Error(job.message||'重试失败');
       setVoiceProgress(items=>items.map(item=>item.id===id?{...item,status:'pending',stage:'AI后台处理中',error:undefined}:item));
       rememberVoiceJob(id);voicePolling.current.delete(id);pollVoiceJob(id);notify('已重新提交后台识别');
     }catch(error){notify(error instanceof Error?error.message:'语音任务重试失败')}
@@ -258,12 +268,13 @@ export default function App(){
     removeVoiceProgress(id);finishVoicePolling(id);
   };
   useEffect(()=>{
+    if(!signedIn)return;
     pendingVoiceIds().forEach(id=>{
       setVoiceProgress(prev=>prev.some(item=>item.id===id)?prev:[{id,title:'语音指令识别中…',stage:'AI后台处理中',status:'pending',createdAt:new Date().toISOString()},...prev]);
       pollVoiceJob(id);
     });
     return()=>{voicePollTimers.current.forEach(timer=>window.clearTimeout(timer));voicePollTimers.current.clear();voicePolling.current.clear()};
-  },[]);
+  },[signedIn]);
 
   const pendingReportEditIds=()=>{try{return JSON.parse(localStorage.getItem('flowmate.reportEditJobs')||'[]') as {id:string;kind:ReportKind}[]}catch{return[]}};
   const rememberReportEditJob=(id:string,kind:ReportKind)=>localStorage.setItem('flowmate.reportEditJobs',JSON.stringify([...pendingReportEditIds().filter(item=>item.id!==id),{id,kind}]));
@@ -287,7 +298,7 @@ export default function App(){
     if(reportEditPolling.current.has(id))return;reportEditPolling.current.add(id);
     const check=async()=>{
       try{
-        const response=await fetch(`/api/report-edit-jobs/${id}`);const job=await readApiJson<ReportEditJob>(response);
+        const response=await apiFetch(`/api/report-edit-jobs/${id}`);const job=await readApiJson<ReportEditJob>(response);
         if(response.status===404){failReportEditJob({id,kind,status:'failed',error:job.message||'复盘改稿任务已失效'});return}
         if(!response.ok)throw new Error(job.message||'查询改稿进度失败');
         const stageText:Record<string,string>={queued:'等待AI处理',transcribing:'正在转写语音',understanding:'正在理解修改意见',saving:'正在写入复盘',completed:'处理完成',failed:'改稿失败'};
@@ -302,12 +313,16 @@ export default function App(){
   const retryReportEditJob=async(kind:ReportKind)=>{
     const pending=editPending[kind];if(!pending?.id)return;
     try{
-      const response=await fetch(`/api/report-edit-jobs/${pending.id}/retry`,{method:'POST'});const job=await readApiJson<ReportEditJob>(response);
+      const response=await apiFetch(`/api/report-edit-jobs/${pending.id}/retry`,{method:'POST'});const job=await readApiJson<ReportEditJob>(response);
       if(!response.ok)throw new Error(job.message||'重试失败');
       setEditPending(prev=>({...prev,[kind]:{id:pending.id,stage:'等待AI处理'}}));rememberReportEditJob(pending.id,kind);pollReportEditJob(pending.id,kind);notify('已重新提交后台改稿');
     }catch(error){notify(error instanceof Error?error.message:'复盘改稿重试失败')}
   };
-  useEffect(()=>{pendingReportEditIds().forEach(item=>{setEditPending(prev=>({...prev,[item.kind]:{id:item.id,stage:'AI后台处理中'}}));pollReportEditJob(item.id,item.kind)});return()=>{reportEditPollTimers.current.forEach(timer=>window.clearTimeout(timer));reportEditPollTimers.current.clear();reportEditPolling.current.clear()}},[]);
+  useEffect(()=>{
+    if(!signedIn)return;
+    pendingReportEditIds().forEach(item=>{setEditPending(prev=>({...prev,[item.kind]:{id:item.id,stage:'AI后台处理中'}}));pollReportEditJob(item.id,item.kind)});
+    return()=>{reportEditPollTimers.current.forEach(timer=>window.clearTimeout(timer));reportEditPollTimers.current.clear();reportEditPolling.current.clear()};
+  },[signedIn]);
 
   const realTasks=useMemo(()=>tasks.filter(isRealTask),[tasks]);
   const stats=useMemo(()=>({mine:realTasks.filter(t=>t.assignee==='我').length,done:realTasks.filter(t=>t.assignee==='我'&&t.status==='done').length,follow:realTasks.filter(t=>t.assignee!=='我'&&t.status!=='done').length}),[realTasks]);
@@ -317,40 +332,21 @@ export default function App(){
     setSyncing(true);(session&&teamId?upsertTask(toCloud(task,teamId,session.user.id)):saveFileTask(task)).catch(error=>notify(`任务保存失败：${error.message}`)).finally(()=>setSyncing(false));
   };
   const createTasksFromText=async()=>{
-    const text=transcript.trim();if(!text)return;setProcessing(true);setVoiceTip('AI 正在理解指令…');
+    const text=toSimplified(transcript.trim());if(!text)return;setProcessing(true);setVoiceTip('已提交，AI 将在后台整理…');
     try{
-      const response=await fetch('/api/parse-task-text',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      const response=await apiFetch('/api/voice-jobs/text',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
         transcript:text,
         tasks:tasksRef.current.map(({id,title,assignee,due,status,priority,estimatedMinutes})=>({id,title,assignee,due,status,priority,estimatedMinutes})),
         reports:{daily:reportRef.current,weekly:weeklyReportRef.current,monthly:monthlyReportRef.current}
       })});
-      const data=await readApiJson<{message?:string;tasks?:ParsedTask[];command?:VoiceCommand;editedReport?:DailyReport|PeriodReport|null;reportKind?:ReportKind;cleared?:boolean}>(response);
-      if(!response.ok)throw new Error(data.message||'指令理解失败');
-      const command=toSimplified(data.command);
-      if(command?.action==='edit_report'){
-        const kind=(data.reportKind||command.reportKind) as ReportKind|undefined;
-        const cleared=data.cleared===true;
-        const edited=data.editedReport?toSimplified(data.editedReport):null;
-        if(!kind||(!cleared&&!edited))throw new Error(command.message||'没有识别到可执行的复盘修改');
-        if(cleared)await clearReportRef.current(kind);else await persistEditedReportRef.current(kind,edited!);
-        setTranscript('');setParsedTask(null);setModal(null);setAiReady(true);goTab('home');
-        notify(command.message||(cleared?(kind==='weekly'?'周报已清空':kind==='monthly'?'月报已清空':'今日复盘已清空'):(kind==='weekly'?'周报已更新':kind==='monthly'?'月报已更新':'今日复盘已更新')));return
-      }
-      if(command?.action==='update'){
-        const requested=command.updates?.length?command.updates:[{targetTaskId:command.targetTaskId||'',changes:command.changes||{}}];const updatedTasks:Task[]=[];
-        for(const request of requested){const target=tasksRef.current.find(item=>item.id===request.targetTaskId);if(!target)continue;const {status,...fields}=request.changes||{};let updated:Task={...target,...fields};if(status)updated=transitionTaskStatus(updated,status);updatedTasks.push(updated)}
-        if(!updatedTasks.length)throw new Error(command.message||'没有找到要修改的任务');
-        setTasks(items=>items.map(item=>updatedTasks.find(updated=>updated.id===item.id)||item));updatedTasks.forEach(syncVoiceTask);
-        setTranscript('');setParsedTask(null);setModal(null);setAiReady(true);notify(updatedTasks.length>1?`已更新 ${updatedTasks.length} 项任务`:command.message||'任务已更新');return
-      }
-      if(command?.action==='clarify'){setVoiceTip(command.message||'请说明要新建任务，还是修改哪条任务/哪份复盘');return}
-      const parsed=toSimplified<ParsedTask[]>(Array.isArray(data.tasks)?data.tasks:command?.tasks||[]).filter(item=>item?.title).slice(0,10);
-      if(!parsed.length)throw new Error(command?.message||'没有识别到可执行任务');
-      const now=new Date().toISOString();const created:Task[]=parsed.map(item=>({id:crypto.randomUUID(),title:item.title,assignee:item.assignee||'我',due:item.due||'今天',status:'todo',priority:item.priority||'中',progress:0,estimatedMinutes:item.estimatedMinutes||defaultEstimate(item.priority||'中'),createdAt:now}));
-      await Promise.all(created.map(task=>session&&teamId?upsertTask(toCloud(task,teamId,session.user.id)):saveFileTask(task)));
-      setTasks(items=>[...created,...items]);setTranscript('');setParsedTask(null);setModal(null);setAiReady(true);if(created.length>1)goTab('tasks');notify(created.length>1?`已拆解 ${created.length} 项，以下为全部任务`:'任务已创建')
+      const job=await readApiJson<VoiceJob&{message?:string}>(response);
+      if(!response.ok)throw new Error(job.message||'指令提交失败');
+      upsertVoiceProgress({id:job.id,title:text,stage:'AI后台处理中',status:'pending',createdAt:job.createdAt||new Date().toISOString()});
+      rememberVoiceJob(job.id);pollVoiceJob(job.id);goTab('home');
+      setTranscript('');setParsedTask(null);setModal(null);
+      notify(`已提交“${text.slice(0,18)}${text.length>18?'…':''}”，AI 后台整理中`);
     }
-    catch(error){setVoiceTip(error instanceof Error?error.message:'AI 指令理解失败')}
+    catch(error){setVoiceTip(error instanceof Error?error.message:'指令提交失败，请重试')}
     finally{setProcessing(false)}
   };
   const cycle=(id:string)=>{
@@ -458,7 +454,7 @@ export default function App(){
       const ext=blob.type.includes('mp4')?'m4a':'webm';const form=new FormData();form.append('audio',blob,`task.${ext}`);
       form.append('tasks',JSON.stringify(tasksRef.current.map(({id,title,assignee,due,status,priority,estimatedMinutes})=>({id,title,assignee,due,status,priority,estimatedMinutes}))));
       form.append('reports',JSON.stringify({daily:reportRef.current,weekly:weeklyReportRef.current,monthly:monthlyReportRef.current}));
-      const res=await fetch('/api/voice-jobs',{method:'POST',body:form});const job=await readApiJson<VoiceJob&{message?:string}>(res);
+      const res=await apiFetch('/api/voice-jobs',{method:'POST',body:form});const job=await readApiJson<VoiceJob&{message?:string}>(res);
       if(!res.ok)throw new Error(job.message||'录音保存失败');
       const browserText=toSimplified(localTranscript.current.trim());
       upsertVoiceProgress({id:job.id,title:browserText||'语音指令识别中…',stage:'AI后台处理中',status:'pending',createdAt:job.createdAt||new Date().toISOString()});
@@ -475,7 +471,7 @@ export default function App(){
   const generateReport=async()=>{
     if(reportLoadingRef.current)return false;
     setReportLoading(true);setReportError('');
-    try{const res=await fetch('/api/daily-plan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tasks:tasksRef.current,date:dateKey,user:displayName})});const raw=await res.json();if(!res.ok)throw new Error(raw.message||'生成失败');const data=toSimplified<DailyReport>(raw);setReport(data);if(session&&teamId)await saveDailyReport(teamId,session.user.id,dateKey,data);else await saveFileDailyReport(dateKey,data);setAiReady(true);return true}
+    try{const res=await apiFetch('/api/daily-plan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tasks:tasksRef.current,date:dateKey,user:displayName})});const raw=await res.json();if(!res.ok)throw new Error(raw.message||'生成失败');const data=toSimplified<DailyReport>(raw);setReport(data);if(session&&teamId)await saveDailyReport(teamId,session.user.id,dateKey,data);else await saveFileDailyReport(dateKey,data);setAiReady(true);return true}
     catch(error){setReportError(error instanceof Error?error.message:'AI 日报生成失败');return false}
     finally{setReportLoading(false)}
   };
@@ -483,7 +479,7 @@ export default function App(){
   const generateWeeklyReport=async()=>{
     if(weeklyLoadingRef.current)return false;
     setWeeklyLoading(true);setWeeklyError('');
-    try{const res=await fetch('/api/weekly-plan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tasks:tasksRef.current,weekStart:weekMeta.weekStart,weekEnd:weekMeta.weekEnd,user:displayName})});const raw=await res.json();if(!res.ok)throw new Error(raw.message||'生成失败');const data=toSimplified<PeriodReport>(raw);setWeeklyReport(data);if(session&&teamId)await savePeriodReport(teamId,session.user.id,'weekly',weekKey,data);else await saveFilePeriodReport('weekly',weekKey,data);setAiReady(true);return true}
+    try{const res=await apiFetch('/api/weekly-plan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tasks:tasksRef.current,weekStart:weekMeta.weekStart,weekEnd:weekMeta.weekEnd,user:displayName})});const raw=await res.json();if(!res.ok)throw new Error(raw.message||'生成失败');const data=toSimplified<PeriodReport>(raw);setWeeklyReport(data);if(session&&teamId)await savePeriodReport(teamId,session.user.id,'weekly',weekKey,data);else await saveFilePeriodReport('weekly',weekKey,data);setAiReady(true);return true}
     catch(error){setWeeklyError(error instanceof Error?error.message:'AI 周报生成失败');return false}
     finally{setWeeklyLoading(false)}
   };
@@ -491,7 +487,7 @@ export default function App(){
   const generateMonthlyReport=async()=>{
     if(monthlyLoadingRef.current)return false;
     setMonthlyLoading(true);setMonthlyError('');
-    try{const res=await fetch('/api/monthly-plan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tasks:tasksRef.current,month:monthKeyValue,user:displayName})});const raw=await res.json();if(!res.ok)throw new Error(raw.message||'生成失败');const data=toSimplified<PeriodReport>(raw);setMonthlyReport(data);if(session&&teamId)await savePeriodReport(teamId,session.user.id,'monthly',monthKeyValue,data);else await saveFilePeriodReport('monthly',monthKeyValue,data);setAiReady(true);return true}
+    try{const res=await apiFetch('/api/monthly-plan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tasks:tasksRef.current,month:monthKeyValue,user:displayName})});const raw=await res.json();if(!res.ok)throw new Error(raw.message||'生成失败');const data=toSimplified<PeriodReport>(raw);setMonthlyReport(data);if(session&&teamId)await savePeriodReport(teamId,session.user.id,'monthly',monthKeyValue,data);else await saveFilePeriodReport('monthly',monthKeyValue,data);setAiReady(true);return true}
     catch(error){setMonthlyError(error instanceof Error?error.message:'AI 月报生成失败');return false}
     finally{setMonthlyLoading(false)}
   };
@@ -501,10 +497,25 @@ export default function App(){
   const addWeeklyNext=()=>{if(!weeklyReport)return;addPlanItems(weeklyReport.next,'下周','已将下周计划加入“我的任务”')};
   const install=async()=>{if(installEvent){installEvent.prompt();await installEvent.userChoice;setInstallEvent(null)}else void showAlert('iPhone：Safari 分享 → 添加到主屏幕。\nAndroid：浏览器菜单 → 安装应用。',{title:'添加到主屏幕'})};
 
+  const signOut=async()=>{
+    if(cloudConfigured){await supabase?.auth.signOut();return}
+    try{await logoutLocalUser()}catch{}
+    setLocalUser(null);setTasks([]);setReport(null);setWeeklyReport(null);setMonthlyReport(null);setVoiceProgress([]);setEditPending({});setTeamId('');
+  };
+
   if(showGuide)return <GuidePage/>;
   if(loginDemo)return <LoginPage demo/>;
-  if(authLoading)return <div className="viewport"><main className="app auth-shell"><div className="cloud-loader"><div className="ai-orb">✦</div><b>正在连接云端工作区…</b></div></main></div>;
+  if(authLoading)return <div className="viewport"><main className="app auth-shell"><div className="cloud-loader"><div className="ai-orb">✦</div><b>{cloudConfigured?'正在连接云端工作区…':'正在检查本地登录状态…'}</b></div></main></div>;
   if(cloudConfigured&&!session)return <LoginPage/>;
+  if(!cloudConfigured&&!localUser)return <LoginPage mode="local" onLocalAuth={async user=>{
+    // Prefer cookie-backed /me, but always enter home with the login response so a brief cookie lag won't block entry.
+    const verified=await getLocalUser().catch(()=>null);
+    setLocalUser(verified||user);
+    setTab('home');
+    setArchiveKind(null);
+    setVoiceHistoryOpen(false);
+    setReportError('');
+  }}/>;
 
   return <div className="viewport"><main className="app">
     {tab==='home'&&<div className="page home-page">
@@ -526,7 +537,7 @@ export default function App(){
     </div>}
     {tab==='tasks'&&<ListPage title="我的任务" tasks={realTasks.filter(t=>t.assignee==='我')} cycle={cycle} remove={removeTask} now={clock} voiceProgress={voiceProgress} onRetryVoice={id=>void retryVoiceJob(id)} onDismissVoice={id=>void dismissVoiceJob(id)}/>} 
     {tab==='team'&&<ListPage title="团队任务" tasks={realTasks.filter(t=>t.assignee!=='我')} cycle={cycle} remove={removeTask} now={clock}/>} 
-    {tab==='mine'&&(voiceHistoryOpen?<VoiceHistoryPage onBack={()=>setVoiceHistoryOpen(false)}/>:archiveKind?<PeriodArchivePage kind={archiveKind} session={session} teamId={teamId} currentKey={archiveKind==='weekly'?weekKey:monthKeyValue} onBack={()=>setArchiveKind(null)}/>:<Profile avatarText={avatarText} avatarUrl={avatarUrl} onAvatarFile={file=>void saveAvatar(file)} tasks={realTasks} install={install} aiReady={aiReady} cloudOnline={Boolean(session)} syncing={syncing} signOut={()=>supabase?.auth.signOut()} goTeam={()=>goTab('team')} openSettings={()=>setModal('settings')} openWeeklyArchive={()=>setArchiveKind('weekly')} openMonthlyArchive={()=>setArchiveKind('monthly')} openVoiceHistory={()=>setVoiceHistoryOpen(true)}/>)} 
+    {tab==='mine'&&(voiceHistoryOpen?<VoiceHistoryPage onBack={()=>setVoiceHistoryOpen(false)}/>:archiveKind?<PeriodArchivePage kind={archiveKind} session={session} teamId={teamId} currentKey={archiveKind==='weekly'?weekKey:monthKeyValue} onBack={()=>setArchiveKind(null)}/>:<Profile avatarText={avatarText} avatarUrl={avatarUrl} onAvatarFile={file=>void saveAvatar(file)} displayName={displayName} accountHint={session?.user.email||localUser?.email||''} tasks={realTasks} install={install} aiReady={aiReady} cloudOnline={Boolean(session)} localOnline={Boolean(localUser)} syncing={syncing} signOut={()=>void signOut()} goTeam={()=>goTab('team')} openSettings={()=>setModal('settings')} openWeeklyArchive={()=>setArchiveKind('weekly')} openMonthlyArchive={()=>setArchiveKind('monthly')} openVoiceHistory={()=>setVoiceHistoryOpen(true)}/>)} 
     <div className="quick-create" role="group" aria-label="新建任务">
       <button className="quick-voice" type="button" onClick={()=>{setVoiceTip('可以说任务，也可以改今日复盘/周报/月报');setModal('voice')}} aria-label="语音创建任务或修改复盘"><MicIcon/><span>语音</span></button>
       <button className="quick-add" type="button" onClick={()=>setModal('add')} aria-label="手动新建任务">＋</button>
@@ -578,7 +589,7 @@ function taskElapsed(task:Task,now:number){if(!task.startedAt)return 0;const sta
 function TrashIcon(){return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m-9 0 1 13h10l1-13M10 11v5m4-5v5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/></svg>}
 function TaskItem({task,cycle,remove,now}:{task:Task;cycle:(id:string)=>void;remove:(id:string,title:string)=>void;now:number}){const elapsed=taskElapsed(task,now);const priorityClass=task.priority==='高'?'priority-high':task.priority==='低'?'priority-low':'priority-mid';return <div className={'task-wrap '+priorityClass}><button className="task" onClick={()=>cycle(task.id)}><i className={`task-status ${task.status}`}>{task.status==='done'?'✓':''}</i><div><strong className={task.status==='done'?'done':''}>{task.title}</strong><p><b className={task.priority==='高'?'high':''}>{task.priority}优先级</b> · {task.due} · {task.assignee}</p><div className="task-time"><span>预计 {formatDuration(task.estimatedMinutes)}</span><span>已进行 {formatDuration(elapsed)}</span></div>{task.assignee!=='我'&&task.status!=='done'&&<span className="progress"><em style={{width:`${task.progress}%`}}/></span>}</div></button><button className="task-delete" type="button" onClick={()=>remove(task.id,task.title)} aria-label={`删除任务：${task.title}`}><TrashIcon/></button></div>}
 function ListPage({title,tasks,cycle,remove,now,voiceProgress,onRetryVoice,onDismissVoice}:{title:string;tasks:Task[];cycle:(id:string)=>void;remove:(id:string,title:string)=>void;now:number;voiceProgress?:VoiceProgress[];onRetryVoice?:(id:string)=>void;onDismissVoice?:(id:string)=>void}){const [filter,setFilter]=useState('全部');const list=tasks.filter(t=>filter==='全部'||(filter==='已完成'?t.status==='done':t.status!=='done'));return <div className="page"><h1 className="page-title">{title}</h1><p className="page-sub">轻点任务切换状态，右侧按钮可删除任务</p>{voiceProgress&&voiceProgress.length>0&&onRetryVoice&&onDismissVoice&&<VoiceProgressPanel items={voiceProgress} onRetry={onRetryVoice} onDismiss={onDismissVoice}/>}<div className="filters">{['全部','进行中','已完成'].map(f=><button key={f} className={f===filter?'active':''} onClick={()=>setFilter(f)}>{f}</button>)}</div>{list.map(t=><TaskItem key={t.id} task={t} cycle={cycle} remove={remove} now={now}/>)}{!list.length&&<div className="empty">还没有任务，点下方语音或加号开始</div>}</div>}
-function Profile({avatarText,avatarUrl,onAvatarFile,tasks,install,aiReady,cloudOnline,syncing,signOut,goTeam,openSettings,openWeeklyArchive,openMonthlyArchive,openVoiceHistory}:{avatarText:string;avatarUrl:string;onAvatarFile:(file:File)=>void;tasks:Task[];install:()=>void;aiReady:boolean|null;cloudOnline:boolean;syncing:boolean;signOut:()=>void;goTeam:()=>void;openSettings:()=>void;openWeeklyArchive:()=>void;openMonthlyArchive:()=>void;openVoiceHistory:()=>void}){
+function Profile({avatarText,avatarUrl,onAvatarFile,displayName,accountHint,tasks,install,aiReady,cloudOnline,localOnline,syncing,signOut,goTeam,openSettings,openWeeklyArchive,openMonthlyArchive,openVoiceHistory}:{avatarText:string;avatarUrl:string;onAvatarFile:(file:File)=>void;displayName:string;accountHint:string;tasks:Task[];install:()=>void;aiReady:boolean|null;cloudOnline:boolean;localOnline:boolean;syncing:boolean;signOut:()=>void;goTeam:()=>void;openSettings:()=>void;openWeeklyArchive:()=>void;openMonthlyArchive:()=>void;openVoiceHistory:()=>void}){
   const fileRef=useRef<HTMLInputElement|null>(null);
   const rate=Math.round(tasks.filter(t=>t.status==='done').length/Math.max(tasks.length,1)*100);
   const menus=[{i:'◷',t:'周报查询',action:openWeeklyArchive},{i:'◫',t:'月报查询',action:openMonthlyArchive},{i:'♪',t:'语音指令记录',action:openVoiceHistory},{i:'◎',t:'成员管理',action:goTeam},{i:'⚙',t:'设置',action:openSettings}];
@@ -586,13 +597,15 @@ function Profile({avatarText,avatarUrl,onAvatarFile,tasks,install,aiReady,cloudO
     <section className="profile">
       <button type="button" className="big-avatar uploadable" onClick={()=>fileRef.current?.click()} aria-label="上传头像">{avatarUrl?<img src={avatarUrl} alt="头像"/>:avatarText}<em>更换</em></button>
       <input ref={fileRef} type="file" accept="image/*" hidden onChange={e=>{const file=e.target.files?.[0];if(file)onAvatarFile(file);e.target.value=''}}/>
+      <div className="profile-identity"><b>{displayName}</b>{accountHint&&<span>{accountHint}</span>}</div>
       <span className={'ai-status '+(aiReady?'online':'')}>● {aiReady?'智能助手已连接':'智能助手待配置'}</span>
       {cloudOnline&&<span className="ai-status online">● {syncing?'云端同步中':'云端数据已同步'}</span>}
+      {localOnline&&!cloudOnline&&<span className="ai-status online">● 本机账号已登录</span>}
     </section>
     <section className="week"><h2>本周效率</h2><strong>{rate}%</strong><p>任务完成率</p><span><i style={{width:`${rate}%`}}/></span></section>
     {menus.map(item=><button className="menu" key={item.t} onClick={item.action}><i>{item.i}</i><span>{item.t}</span><b>›</b></button>)}
     <button className="install" onClick={install}>添加到手机主屏幕</button>
-    {cloudOnline&&<button className="sign-out" onClick={signOut}>退出当前账号</button>}
+    {(cloudOnline||localOnline)&&<button className="sign-out" onClick={signOut}>退出当前账号</button>}
   </div>;
 }
 
@@ -623,7 +636,7 @@ function VoiceHistoryPage({onBack}:{onBack:()=>void}){
   const [error,setError]=useState('');
   useEffect(()=>{
     let active=true;setLoading(true);setError('');
-    fetch('/api/voice-jobs').then(async res=>{
+    apiFetch('/api/voice-jobs').then(async res=>{
       const data=await readApiJson<{items?:VoiceHistoryItem[];retentionDays?:number;message?:string}>(res);
       if(!res.ok)throw new Error(data.message||'读取指令记录失败');
       if(!active)return;
@@ -636,7 +649,7 @@ function VoiceHistoryPage({onBack}:{onBack:()=>void}){
   useEffect(()=>{
     if(!selectedId){setDetail(null);return}
     let active=true;setLoadingDetail(true);
-    fetch(`/api/voice-jobs/${selectedId}`).then(async res=>{
+    apiFetch(`/api/voice-jobs/${selectedId}`).then(async res=>{
       const data=await readApiJson<VoiceJob&{message?:string;hasAudio?:boolean}>(res);
       if(!res.ok)throw new Error(data.message||'读取指令详情失败');
       if(active)setDetail(toSimplified(data));
@@ -782,48 +795,175 @@ function ScheduleSettings({schedule,onSaved,onClose}:{schedule:AutoSchedule;onSa
   </div>;
 }
 
+type ModelProviderId='bailian'|'deepseek'|'custom';
+type ModelPreset={id:ModelProviderId;label:string;baseURL:string;models:string[]};
+const DEFAULT_MODEL_PRESETS:ModelPreset[]=[
+  {id:'bailian',label:'阿里云百炼',baseURL:'https://dashscope.aliyuncs.com/compatible-mode/v1',models:['qwen3.7-plus','qwen-plus','qwen3.6-flash','deepseek-v4-flash','deepseek-v4-pro','deepseek-v3.2']},
+  {id:'deepseek',label:'DeepSeek',baseURL:'https://api.deepseek.com',models:['deepseek-v4-flash','deepseek-v4-pro']},
+  {id:'custom',label:'自定义',baseURL:'',models:[]}
+];
+const TEXT_MODEL_LABELS:Record<string,string>={
+  'qwen3.7-plus':'通义千问 3.7 Plus（推荐）',
+  'qwen-plus':'通义千问 Plus',
+  'qwen3.6-flash':'通义千问 3.6 Flash（经济）',
+  'deepseek-v3.2':'DeepSeek V3.2',
+  'deepseek-v4-pro':'DeepSeek V4 Pro',
+  'deepseek-v4-flash':'DeepSeek V4 Flash（推荐）'
+};
+
 function ModelSettings({onClose,onSaved}:{onClose:()=>void;onSaved:()=>void}){
-  const [loading,setLoading]=useState(true);const [saving,setSaving]=useState(false);
+  const [loading,setLoading]=useState(true);const [saving,setSaving]=useState(false);const [testing,setTesting]=useState(false);
   const [textConfigured,setTextConfigured]=useState(false);const [asrConfigured,setAsrConfigured]=useState(false);const [asrUsesTextKey,setAsrUsesTextKey]=useState(false);
   const [maskedTextKey,setMaskedTextKey]=useState('');const [maskedAsrKey,setMaskedAsrKey]=useState('');
   const [textApiKey,setTextApiKey]=useState('');const [asrApiKey,setAsrApiKey]=useState('');
   const [showTextKey,setShowTextKey]=useState(false);const [showAsrKey,setShowAsrKey]=useState(false);
   const [clearAsrKey,setClearAsrKey]=useState(false);
-  const [textModel,setTextModel]=useState('qwen3.7-plus');const [asrModel,setAsrModel]=useState('qwen3-asr-flash');const [error,setError]=useState('');
+  const [provider,setProvider]=useState<ModelProviderId>('bailian');
+  const [baseURL,setBaseURL]=useState(DEFAULT_MODEL_PRESETS[0].baseURL);
+  const [presets,setPresets]=useState<ModelPreset[]>(DEFAULT_MODEL_PRESETS);
+  const [textModel,setTextModel]=useState('qwen3.7-plus');const [customModel,setCustomModel]=useState('');
+  const [useCustomModel,setUseCustomModel]=useState(false);
+  const [asrModel,setAsrModel]=useState('qwen3-asr-flash');
+  const [error,setError]=useState('');const [success,setSuccess]=useState('');
   const headers=async()=>{const token=(await supabase?.auth.getSession())?.data.session?.access_token;return{'Content-Type':'application/json',...(token?{Authorization:`Bearer ${token}`}:{})}};
-  useEffect(()=>{headers().then(h=>fetch('/api/settings/model',{headers:h})).then(async response=>{const data=await response.json();if(!response.ok)throw new Error(data.message||'读取配置失败');setTextConfigured(Boolean(data.textConfigured??data.configured));setAsrConfigured(Boolean(data.asrConfigured));setAsrUsesTextKey(Boolean(data.asrUsesTextKey));setMaskedTextKey(data.maskedTextKey||data.maskedKey||'');setMaskedAsrKey(data.maskedAsrKey||'');setTextModel(data.textModel);setAsrModel(data.asrModel)}).catch(e=>setError(e.message)).finally(()=>setLoading(false))},[]);
-  const save=async()=>{
-    setSaving(true);setError('');
+  const applyServerState=(data:any)=>{
+    setTextConfigured(Boolean(data.textConfigured??data.configured));
+    setAsrConfigured(Boolean(data.asrConfigured));
+    setAsrUsesTextKey(Boolean(data.asrUsesTextKey));
+    setMaskedTextKey(data.maskedTextKey||data.maskedKey||'');
+    setMaskedAsrKey(data.maskedAsrKey||'');
+    const nextPresets=Array.isArray(data.presets)&&data.presets.length?data.presets as ModelPreset[]:DEFAULT_MODEL_PRESETS;
+    setPresets(nextPresets);
+    const nextProvider=(['bailian','deepseek','custom'].includes(data.provider)?data.provider:'bailian') as ModelProviderId;
+    setProvider(nextProvider);
+    setBaseURL(String(data.baseURL||nextPresets.find(item=>item.id===nextProvider)?.baseURL||''));
+    const model=String(data.textModel||'qwen3.7-plus');
+    const presetModels=nextPresets.find(item=>item.id===nextProvider)?.models||[];
+    if(presetModels.includes(model)){setUseCustomModel(false);setTextModel(model);setCustomModel('')}
+    else{setUseCustomModel(true);setTextModel('__custom__');setCustomModel(model)}
+    setAsrModel(data.asrModel||'qwen3-asr-flash');
+  };
+  useEffect(()=>{headers().then(h=>fetch('/api/settings/model',{headers:h,credentials:'include'})).then(async response=>{const data=await response.json();if(!response.ok)throw new Error(data.message||'读取配置失败');applyServerState(data)}).catch(e=>setError(e.message)).finally(()=>setLoading(false))},[]);
+  const currentPreset=presets.find(item=>item.id===provider)||DEFAULT_MODEL_PRESETS.find(item=>item.id===provider)||DEFAULT_MODEL_PRESETS[0];
+  const resolvedTextModel=useCustomModel?customModel.trim():textModel;
+  const payload=()=>({provider,baseURL:baseURL.trim(),textApiKey,asrApiKey:clearAsrKey?'':asrApiKey,clearAsrKey,textModel:resolvedTextModel,asrModel});
+  const switchProvider=(next:ModelProviderId)=>{
+    const preset=presets.find(item=>item.id===next)||DEFAULT_MODEL_PRESETS.find(item=>item.id===next)||DEFAULT_MODEL_PRESETS[0];
+    setProvider(next);
+    setBaseURL(preset.baseURL||'');
+    setError('');setSuccess('');
+    if(preset.models.length){setUseCustomModel(false);setTextModel(preset.models[0]);setCustomModel('')}
+    else{setUseCustomModel(true);setTextModel('__custom__');setCustomModel('')}
+  };
+  const test=async()=>{
+    setTesting(true);setError('');setSuccess('');
     try{
-      const response=await fetch('/api/settings/model',{method:'PUT',headers:await headers(),body:JSON.stringify({textApiKey,asrApiKey:clearAsrKey?'':asrApiKey,clearAsrKey,textModel,asrModel})});
+      if(!textConfigured&&!textApiKey.trim())throw new Error('请先填写任务理解 API Key');
+      if(provider==='custom'&&!baseURL.trim())throw new Error('自定义提供商需要填写 Base URL');
+      if(!resolvedTextModel)throw new Error('请填写模型名称');
+      const response=await fetch('/api/settings/model/test',{method:'POST',headers:await headers(),credentials:'include',body:JSON.stringify(payload())});
+      const data=await response.json();if(!response.ok)throw new Error(data.message||'连接测试失败');
+      setSuccess(data.message||'连接成功');
+    }catch(e){setError(e instanceof Error?e.message:'连接测试失败')}
+    finally{setTesting(false)}
+  };
+  const save=async()=>{
+    setSaving(true);setError('');setSuccess('');
+    try{
+      if(provider==='custom'&&!baseURL.trim())throw new Error('自定义提供商需要填写 Base URL');
+      if(!resolvedTextModel)throw new Error('请填写模型名称');
+      const response=await fetch('/api/settings/model',{method:'PUT',headers:await headers(),credentials:'include',body:JSON.stringify(payload())});
       const data=await response.json();if(!response.ok)throw new Error(data.message||'保存失败');
-      setTextConfigured(Boolean(data.textConfigured??data.configured));setAsrConfigured(Boolean(data.asrConfigured));setAsrUsesTextKey(Boolean(data.asrUsesTextKey));
-      setMaskedTextKey(data.maskedTextKey||data.maskedKey||'');setMaskedAsrKey(data.maskedAsrKey||'');
-      setTextApiKey('');setAsrApiKey('');setClearAsrKey(false);onSaved();
+      applyServerState(data);
+      setTextApiKey('');setAsrApiKey('');setClearAsrKey(false);setSuccess(data.message||'模型配置已保存并启用');onSaved();
     }catch(e){setError(e instanceof Error?e.message:'保存失败')}
     finally{setSaving(false)}
   };
   const configured=textConfigured;
+  const providerName=currentPreset.label;
   const statusText=configured
-    ?`任务理解 ${maskedTextKey || '已配置'} · 语音识别 ${asrConfigured?maskedAsrKey:(asrUsesTextKey?'沿用任务理解密钥':'未单独配置')}`
-    :'请分别填写任务理解与语音识别的阿里云百炼 API Key';
-  return <div className="model-settings-panel">{loading?<div className="settings-loading">正在读取服务端配置…</div>:<><div className={'settings-status '+(configured?'ready':'')}><i>{configured?'✓':'!'}</i><div><b>{configured?'模型服务已配置':'尚未配置 API Key'}</b><span>{statusText}</span></div></div>
+    ?`${providerName} · 任务理解 ${maskedTextKey||'已配置'} · 语音识别 ${asrConfigured?maskedAsrKey:(asrUsesTextKey?'沿用任务理解密钥':'未单独配置')}`
+    :'可接入阿里云百炼、DeepSeek 或任意 OpenAI 兼容接口';
+  const canTest=Boolean(textConfigured||textApiKey.trim());
+  const modelOptions=currentPreset.models;
+  return <div className="model-settings-panel">{loading?<div className="settings-loading">正在读取服务端配置…</div>:<><div className={'settings-status '+(configured?'ready':'')}><i>{configured?'✓':'!'}</i><div><b>{configured?'模型服务已配置':'尚未配置模型服务'}</b><span>{statusText}</span></div></div>
+    <label>任务理解提供商</label>
+    <select className="input model-select" value={provider} onChange={e=>switchProvider(e.target.value as ModelProviderId)}>
+      {presets.map(item=><option key={item.id} value={item.id}>{item.label}</option>)}
+    </select>
+    <label>Base URL</label>
+    <input className="input" value={baseURL} onChange={e=>setBaseURL(e.target.value)} placeholder={provider==='custom'?'https://api.example.com/v1':currentPreset.baseURL} autoCapitalize="off" autoCorrect="off"/>
+    <p className="field-help">任务理解走 OpenAI 兼容接口（/chat/completions）。切换提供商会自动填入推荐地址，也可手动修改。</p>
     <label>任务理解 API Key</label>
     <div className="key-field"><input className="input" type={showTextKey?'text':'password'} value={textApiKey} onChange={e=>setTextApiKey(e.target.value)} placeholder={textConfigured?`已配置 ${maskedTextKey}，留空则不修改`:'sk-xxxxxxxxxxxxxxxx'}/><button type="button" onClick={()=>setShowTextKey(v=>!v)}>{showTextKey?'隐藏':'显示'}</button></div>
-    <label>任务理解与每日复盘模型</label>
-    <select className="input model-select" value={textModel} onChange={e=>setTextModel(e.target.value)}><option value="qwen3.7-plus">通义千问 3.7 Plus（推荐）</option><option value="qwen-plus">通义千问 Plus</option><option value="qwen3.6-flash">通义千问 3.6 Flash（经济）</option><option value="deepseek-v3.2">DeepSeek V3.2</option><option value="deepseek-v4-pro">DeepSeek V4 Pro</option><option value="deepseek-v4-flash">DeepSeek V4 Flash</option></select>
-    <label>语音识别 API Key</label>
-    <div className="key-field"><input className="input" type={showAsrKey?'text':'password'} value={clearAsrKey?'':asrApiKey} onChange={e=>{setClearAsrKey(false);setAsrApiKey(e.target.value)}} placeholder={clearAsrKey?'将清除独立密钥，保存后沿用任务理解密钥':asrConfigured?`已配置 ${maskedAsrKey}，留空则不修改`:'可选；留空则沿用任务理解密钥'}/><button type="button" onClick={()=>setShowAsrKey(v=>!v)}>{showAsrKey?'隐藏':'显示'}</button></div>
-    <p className="field-help">两套密钥分别用于任务理解/复盘与语音转写，仅保存在服务端。语音识别密钥可留空以沿用任务理解密钥。{asrConfigured&&<button type="button" className="linkish" onClick={()=>{setClearAsrKey(true);setAsrApiKey('')}}>清除独立语音密钥</button>}</p>
+    <label>任务理解与复盘模型</label>
+    <select className="input model-select" value={useCustomModel?'__custom__':textModel} onChange={e=>{const value=e.target.value;if(value==='__custom__'){setUseCustomModel(true);setTextModel('__custom__')}else{setUseCustomModel(false);setTextModel(value);setCustomModel('')}}}>
+      {modelOptions.map(model=><option key={model} value={model}>{TEXT_MODEL_LABELS[model]||model}</option>)}
+      <option value="__custom__">自定义模型 ID…</option>
+    </select>
+    {useCustomModel&&<input className="input" value={customModel} onChange={e=>setCustomModel(e.target.value)} placeholder="例如 deepseek-v4-flash / gpt-4o-mini" autoCapitalize="off" autoCorrect="off"/>}
+    <p className="field-help">{provider==='deepseek'?'DeepSeek 官方可选 deepseek-v4-flash / deepseek-v4-pro。':provider==='bailian'?'百炼可选千问，也可选 DeepSeek V4 Flash / Pro（走百炼兼容接口与百炼 Key）。':'可手填任意 OpenAI 兼容模型 ID。'}</p>
+    <label>语音识别 API Key（百炼 ASR）</label>
+    <div className="key-field"><input className="input" type={showAsrKey?'text':'password'} value={clearAsrKey?'':asrApiKey} onChange={e=>{setClearAsrKey(false);setAsrApiKey(e.target.value)}} placeholder={clearAsrKey?'将清除独立密钥':asrConfigured?`已配置 ${maskedAsrKey}，留空则不修改`:provider==='bailian'?'可选；留空则沿用任务理解密钥':'非百炼时请单独填写百炼 ASR 密钥'}/><button type="button" onClick={()=>setShowAsrKey(v=>!v)}>{showAsrKey?'隐藏':'显示'}</button></div>
+    <p className="field-help">语音转写始终走阿里云百炼 ASR。使用 DeepSeek/自定义文本模型时，请单独填写百炼语音密钥。{asrConfigured&&<button type="button" className="linkish" onClick={()=>{setClearAsrKey(true);setAsrApiKey('')}}>清除独立语音密钥</button>}</p>
     <label>语音识别模型</label>
     <select className="input model-select" value={asrModel} onChange={e=>setAsrModel(e.target.value)}><option value="qwen3-asr-flash">千问 3 ASR Flash（推荐）</option><option value="qwen3-asr-flash-2026-02-10">千问 3 ASR Flash 2026-02-10</option></select>
+    {success&&<div className="settings-success">✓ {success}</div>}
     {error&&<div className="settings-error">{error}</div>}
-    <div className="settings-actions"><button type="button" onClick={onClose}>取消</button><button type="button" disabled={saving||(!configured&&!textApiKey.trim())} onClick={()=>void save()}>{saving?'正在保存…':'保存并启用'}</button></div></>}</div>;
+    <div className="settings-actions cloud-actions"><button type="button" disabled={testing||saving||!canTest} onClick={()=>void test()}>{testing?'正在测试…':'测试连接'}</button><button type="button" disabled={saving||testing||(!configured&&!textApiKey.trim())} onClick={()=>void save()}>{saving?'正在保存…':'保存并启用'}</button></div>
+    <button type="button" className="schedule-close" onClick={onClose}>取消</button>
+  </>}</div>;
 }
 
-function LoginPage({demo=false}:{demo?:boolean}){
-  const [email,setEmail]=useState(demo?'demo@flowmate.cn':'');const [sending,setSending]=useState(false);const [sent,setSent]=useState(false);const [error,setError]=useState('');
-  const submit=async(e:React.FormEvent)=>{e.preventDefault();if(!email.trim())return;setSending(true);setError('');try{if(demo)await new Promise(resolve=>setTimeout(resolve,700));else await sendMagicLink(email.trim());setSent(true)}catch(err){setError(err instanceof Error?err.message:'登录邮件发送失败')}finally{setSending(false)}};
+function LoginPage({demo=false,mode='cloud',onLocalAuth}:{demo?:boolean;mode?:'cloud'|'local';onLocalAuth?:(user:LocalUser)=>void|Promise<void>}){
+  const [authTab,setAuthTab]=useState<'login'|'register'>('login');
+  const [email,setEmail]=useState(demo?'demo@flowmate.cn':'');
+  const [password,setPassword]=useState('');
+  const [name,setName]=useState('');
+  const [sending,setSending]=useState(false);
+  const [sent,setSent]=useState(false);
+  const [error,setError]=useState('');
+  const submit=async(e:React.FormEvent)=>{
+    e.preventDefault();
+    if(!email.trim())return;
+    setSending(true);setError('');
+    try{
+      if(mode==='local'){
+        if(password.length<6)throw new Error('密码至少 6 位');
+        const user=authTab==='register'
+          ? await registerLocalUser({email:email.trim(),password,name:name.trim()||undefined})
+          : await loginLocalUser({email:email.trim(),password});
+        await onLocalAuth?.(user);
+        return;
+      }
+      if(demo)await new Promise(resolve=>setTimeout(resolve,700));
+      else await sendMagicLink(email.trim());
+      setSent(true);
+    }catch(err){setError(err instanceof Error?err.message:(mode==='local'?'登录失败':'登录邮件发送失败'))}
+    finally{setSending(false)}
+  };
+  if(mode==='local'){
+    return <div className="viewport"><main className="app auth-shell"><section className="login-card">
+      <div className="brand-mark">✓</div>
+      <span className="login-eyebrow">FLOWMATE LOCAL</span>
+      <h1>{authTab==='register'?'注册本机账号':'登录工作助手'}</h1>
+      <p>{authTab==='register'?'用邮箱和密码创建账号，任务与复盘仅对本账号可见。':'未配置云端时，请使用本机账号登录后继续使用。'}</p>
+      <div className="auth-tabs" role="tablist">
+        <button type="button" role="tab" aria-selected={authTab==='login'} className={authTab==='login'?'active':''} onClick={()=>{setAuthTab('login');setError('')}}>登录</button>
+        <button type="button" role="tab" aria-selected={authTab==='register'} className={authTab==='register'?'active':''} onClick={()=>{setAuthTab('register');setError('')}}>注册</button>
+      </div>
+      <form onSubmit={submit}>
+        {authTab==='register'&&<><label>昵称（可选）</label><input className="input" value={name} onChange={e=>setName(e.target.value)} placeholder="怎么称呼你" autoComplete="nickname"/></>}
+        <label>邮箱</label>
+        <input className="input" type="email" value={email} onChange={e=>setEmail(e.target.value)} placeholder="name@company.com" autoComplete="email" required/>
+        <label>密码</label>
+        <input className="input" type="password" value={password} onChange={e=>setPassword(e.target.value)} placeholder="至少 6 位" autoComplete={authTab==='register'?'new-password':'current-password'} required minLength={6}/>
+        <button className="primary" disabled={sending}>{sending?(authTab==='register'?'正在注册…':'正在登录…'):(authTab==='register'?'注册并进入':'登录')}</button>
+        {error&&<div className="login-error">{error}</div>}
+      </form>
+      <div className="cloud-benefits"><span>◇ 本机数据隔离</span><span>↻ SQLite 持久化</span><span>◎ 会话 Cookie</span></div>
+    </section></main></div>;
+  }
   return <div className="viewport"><main className="app auth-shell"><section className="login-card">{demo&&<div className="demo-ribbon">交互演示 · 不会发送邮件</div>}<div className="brand-mark">✓</div><span className="login-eyebrow">FLOWMATE CLOUD</span><h1>{sent?'检查你的邮箱':'登录工作助手'}</h1><p>{sent?`登录链接已发送至 ${email}，点击邮件中的链接即可进入云端工作区。`:'任务、日报和团队进度会安全同步到所有设备。'}</p>{!sent?<form onSubmit={submit}><label>工作邮箱</label><input className="input" type="email" value={email} onChange={e=>setEmail(e.target.value)} placeholder="name@company.com" autoComplete="email" required/><button className="primary" disabled={sending}>{sending?'正在发送…':'发送登录链接'}</button>{error&&<div className="login-error">{error}</div>}</form>:<><div className="mail-preview"><i>✉</i><div><b>FlowMate 登录邮件</b><span>点击邮件内的“登录 FlowMate”按钮，浏览器会自动返回应用。</span></div></div><button className="secondary-login" onClick={()=>setSent(false)}>更换邮箱</button></>}<div className="cloud-benefits"><span>☁ 多端实时同步</span><span>◇ 团队数据隔离</span><span>↻ 自动云端备份</span></div>{demo&&<a className="back-app" href="/">← 返回工作助手</a>}</section></main></div>;
 }
 

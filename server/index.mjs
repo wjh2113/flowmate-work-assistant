@@ -6,19 +6,77 @@ import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { mkdir, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises';
 import { Converter } from 'opencc-js/t2cn';
-import { closeSqlite, deleteSqlitePeriodReport, deleteSqliteReport, deleteSqliteTask, getSqliteTask, listSqlitePeriodReports, listSqliteTasks, loadSqlitePeriodReport, loadSqliteReport, patchSqliteTask, saveSqlitePeriodReport, saveSqliteReport, saveSqliteTask, sqliteDisplayPath } from './sqlite-store.mjs';
+import { authenticateSqliteUser, closeSqlite, createSqliteSession, createSqliteUser, deleteSqlitePeriodReport, deleteSqliteReport, deleteSqliteSession, deleteSqliteTask, getSqliteSession, getSqliteTask, getSqliteUser, listSqlitePeriodReports, listSqliteTasks, loadSqlitePeriodReport, loadSqliteReport, patchSqliteTask, saveSqlitePeriodReport, saveSqliteReport, saveSqliteTask, sqliteDisplayPath } from './sqlite-store.mjs';
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 const port = Number(process.env.PORT || 8787);
+const SESSION_COOKIE = 'flowmate_session';
+const SESSION_DAYS = 7;
+const BAILIAN_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1';
+const DEEPSEEK_BASE_URL = 'https://api.deepseek.com';
+const PROVIDER_PRESETS = {
+  bailian: { id: 'bailian', label: '阿里云百炼', baseURL: BAILIAN_BASE_URL },
+  deepseek: { id: 'deepseek', label: 'DeepSeek', baseURL: DEEPSEEK_BASE_URL },
+  custom: { id: 'custom', label: '自定义', baseURL: '' }
+};
+const PRESET_TEXT_MODELS = {
+  bailian: ['qwen3.7-plus', 'qwen-plus', 'qwen3.6-flash', 'deepseek-v3.2', 'deepseek-v4-pro', 'deepseek-v4-flash'],
+  deepseek: ['deepseek-v4-flash', 'deepseek-v4-pro'],
+  custom: []
+};
+const ALLOWED_ASR_MODELS = ['qwen3-asr-flash', 'qwen3-asr-flash-2026-02-10'];
+
 let textApiKey = process.env.DASHSCOPE_TEXT_API_KEY || process.env.DASHSCOPE_API_KEY || '';
 let asrApiKey = process.env.DASHSCOPE_ASR_API_KEY || '';
-const baseURL = (process.env.DASHSCOPE_BASE_URL || 'https://dashscope.aliyuncs.com/compatible-mode/v1').replace(/\/$/, '');
-let textModel = process.env.QWEN_TEXT_MODEL || 'qwen3.7-plus';
+let textProvider = normalizeTextProvider(process.env.TEXT_API_PROVIDER || inferProviderFromBaseURL(process.env.TEXT_API_BASE_URL || process.env.DASHSCOPE_BASE_URL));
+let textBaseURL = normalizeBaseURL(process.env.TEXT_API_BASE_URL || process.env.DASHSCOPE_BASE_URL || PROVIDER_PRESETS[textProvider].baseURL || BAILIAN_BASE_URL);
+let textModel = process.env.QWEN_TEXT_MODEL || (textProvider === 'deepseek' ? 'deepseek-v4-flash' : 'qwen3.7-plus');
 let asrModel = process.env.QWEN_ASR_MODEL || 'qwen3-asr-flash';
-const resolveAsrKey = () => asrApiKey || textApiKey;
+const resolveAsrKey = () => asrApiKey || (textProvider === 'bailian' ? textApiKey : '');
 const maskKey = (key) => (key ? `••••${key.slice(-4)}` : '');
-const isValidApiKey = (key) => key.startsWith('sk-') && key.length >= 16;
+const isValidApiKey = (key) => /^sk-[A-Za-z0-9_\-]{8,}$/.test(String(key || '').trim()) || String(key || '').trim().length >= 16;
+
+function normalizeTextProvider(value) {
+  const id = String(value || '').trim().toLowerCase();
+  return PROVIDER_PRESETS[id] ? id : 'bailian';
+}
+
+function inferProviderFromBaseURL(url) {
+  const value = String(url || '').toLowerCase();
+  if (value.includes('deepseek.com')) return 'deepseek';
+  if (value.includes('dashscope.aliyuncs.com')) return 'bailian';
+  if (value.trim()) return 'custom';
+  return 'bailian';
+}
+
+function normalizeBaseURL(url) {
+  const value = String(url || '').trim().replace(/\/$/, '');
+  if (!value) throw new Error('模型 Base URL 不能为空');
+  let parsed;
+  try { parsed = new URL(value); } catch { throw new Error('模型 Base URL 格式不正确'); }
+  if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('模型 Base URL 必须以 http:// 或 https:// 开头');
+  return value;
+}
+
+function normalizeTextModelName(model) {
+  const value = String(model || '').trim();
+  if (!value || value.length > 80) throw new Error('模型名称不合法');
+  if (!/^[A-Za-z0-9._:/-]+$/.test(value)) throw new Error('模型名称含有不支持的字符');
+  return value;
+}
+
+function providerLabel(id = textProvider) {
+  return PROVIDER_PRESETS[normalizeTextProvider(id)]?.label || '自定义';
+}
+
+function resolveProviderBaseURL(provider, rawBaseURL) {
+  const id = normalizeTextProvider(provider);
+  if (id === 'custom') return normalizeBaseURL(rawBaseURL);
+  const fallback = PROVIDER_PRESETS[id].baseURL;
+  const value = String(rawBaseURL || '').trim();
+  return normalizeBaseURL(value || fallback);
+}
 let supabaseUrl = process.env.VITE_SUPABASE_URL || '';
 let supabaseAnonKey = process.env.VITE_SUPABASE_ANON_KEY || '';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -44,6 +102,55 @@ function simplify(value) {
 app.use(express.json({ limit: '2mb' }));
 app.set('trust proxy', 1);
 
+function cloudMode() {
+  return Boolean(supabaseUrl && supabaseAnonKey);
+}
+
+function parseCookies(req) {
+  const header = String(req.headers.cookie || '');
+  const out = {};
+  for (const part of header.split(';')) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    const index = trimmed.indexOf('=');
+    if (index === -1) out[decodeURIComponent(trimmed)] = '';
+    else out[decodeURIComponent(trimmed.slice(0, index))] = decodeURIComponent(trimmed.slice(index + 1));
+  }
+  return out;
+}
+
+function requestIsHttps(req) {
+  if (req?.secure) return true;
+  const proto = String(req?.headers?.['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
+  return proto === 'https';
+}
+
+function setSessionCookie(res, sessionId, expiresAt, req) {
+  const maxAge = Math.max(0, Math.floor((Date.parse(expiresAt) - Date.now()) / 1000));
+  const parts = [`${SESSION_COOKIE}=${encodeURIComponent(sessionId)}`, 'Path=/', 'HttpOnly', 'SameSite=Lax', `Max-Age=${maxAge}`];
+  // Only mark Secure on real HTTPS; NODE_ENV=production over plain HTTP would drop the cookie in browsers.
+  if (requestIsHttps(req)) parts.push('Secure');
+  res.append('Set-Cookie', parts.join('; '));
+}
+
+function clearSessionCookie(res, req) {
+  const parts = [`${SESSION_COOKIE}=`, 'Path=/', 'HttpOnly', 'SameSite=Lax', 'Max-Age=0'];
+  if (requestIsHttps(req)) parts.push('Secure');
+  res.append('Set-Cookie', parts.join('; '));
+}
+
+function requireUser(req, res, next) {
+  if (cloudMode()) {
+    req.user = { id: 'cloud-shared', email: '', name: '云端' };
+    return next();
+  }
+  const session = getSqliteSession(parseCookies(req)[SESSION_COOKIE]);
+  if (!session?.user) return res.status(401).json({ error: 'UNAUTHORIZED', message: '请先登录' });
+  req.user = session.user;
+  req.sessionId = session.id;
+  next();
+}
+
 function requireTextAi(_req, res, next) {
   if (!textApiKey) return res.status(503).json({ error: 'AI_NOT_CONFIGURED', message: '服务端尚未配置任务理解 API Key' });
   next();
@@ -58,6 +165,10 @@ function requireVoiceAi(_req, res, next) {
 /** @deprecated prefer requireTextAi / requireVoiceAi */
 function requireQwen(req, res, next) {
   return requireTextAi(req, res, next);
+}
+
+function userVoiceJobsDir(userId) {
+  return path.join(voiceJobsDir, String(userId || 'anonymous'));
 }
 
 async function requireSettingsAccess(req, res, next) {
@@ -129,19 +240,20 @@ async function testCloudConnection(url, anonKey) {
   }
 }
 
-async function qwenChat({ model = textModel, messages, responseFormat, extra = {}, apiKey = textApiKey }) {
+async function qwenChat({ model = textModel, messages, responseFormat, extra = {}, apiKey = textApiKey, baseURL = textBaseURL }) {
   if (!apiKey) throw new Error('尚未配置对应的 API Key');
+  const endpoint = `${String(baseURL || textBaseURL).replace(/\/$/, '')}/chat/completions`;
   const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),90_000);
   try{
-    const response = await fetch(`${baseURL}/chat/completions`, {
+    const response = await fetch(endpoint, {
       method: 'POST',signal:controller.signal,
       headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ model, messages, ...(responseFormat ? { response_format: responseFormat } : {}), ...extra })
     });
     const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data?.error?.message || data?.message || `千问接口请求失败 (${response.status})`);
+    if (!response.ok) throw new Error(data?.error?.message || data?.message || `模型接口请求失败 (${response.status})`);
     return data;
-  }catch(error){if(error?.name==='AbortError')throw new Error('千问处理超过90秒，已停止本次请求，请点击任务重试');throw error}
+  }catch(error){if(error?.name==='AbortError')throw new Error('模型处理超过90秒，已停止本次请求，请点击任务重试');throw error}
   finally{clearTimeout(timer)}
 }
 
@@ -273,9 +385,12 @@ async function parseVoiceCommand(transcript, availableTasks = [], reports = {}) 
 
 async function transcribeAudio(buffer, mime = 'audio/webm', availableTasks = [], onStage = async()=>{}, reports = {}) {
   await onStage('transcribing');
+  const apiKey = resolveAsrKey();
+  if (!apiKey) throw new Error('尚未配置语音识别 API Key（非百炼文本提供商时需单独填写百炼 ASR 密钥）');
   const audio = `data:${mime};base64,${buffer.toString('base64')}`;
   const data = await qwenChat({
-    apiKey: resolveAsrKey(),
+    apiKey,
+    baseURL: BAILIAN_BASE_URL,
     model: asrModel,
     messages: [
       { role: 'user', content: [{ type: 'input_audio', input_audio: { data: audio } }] }
@@ -283,7 +398,7 @@ async function transcribeAudio(buffer, mime = 'audio/webm', availableTasks = [],
     extra: { stream: false, asr_options: { language: 'zh', enable_itn: true } }
   });
   const transcript = convertToSimplified(messageText(data).trim());
-  if (!transcript) throw new Error('千问语音模型没有返回转写内容');
+  if (!transcript) throw new Error('语音模型没有返回转写内容');
   await onStage('understanding',{transcript});
   const command = await parseVoiceCommand(transcript, availableTasks, reports);
   if (command.action === 'edit_report') return { transcript, command, tasks: [], task: null };
@@ -294,7 +409,7 @@ async function transcribeAudio(buffer, mime = 'audio/webm', availableTasks = [],
 function voiceErrorMessage(error) {
   const message = error?.message || '';
   if (/InvalidParameter|does not support this input/i.test(message)) return '语音模型无法读取这段录音，请重新录制后再试';
-  return message || '千问语音识别失败';
+  return message || '语音识别失败';
 }
 
 function audioExtension(mime = '') {
@@ -304,15 +419,24 @@ function audioExtension(mime = '') {
   return 'webm';
 }
 
-function voiceJobPath(id) {
-  return path.join(voiceJobsDir, `${id}.json`);
+function voiceJobPath(jobOrUserId, id) {
+  if (jobOrUserId && typeof jobOrUserId === 'object') {
+    const job = jobOrUserId;
+    return path.join(userVoiceJobsDir(job.userId), `${job.id}.json`);
+  }
+  return path.join(userVoiceJobsDir(jobOrUserId), `${id}.json`);
+}
+
+function voiceAudioPath(job) {
+  return path.join(userVoiceJobsDir(job.userId), job.audioFile);
 }
 
 async function persistVoiceJob(job) {
   job.updatedAt = new Date().toISOString();
   voiceJobs.set(job.id, job);
-  await mkdir(voiceJobsDir, { recursive: true });
-  await writeFile(voiceJobPath(job.id), JSON.stringify(job), { encoding: 'utf8', mode: 0o600 });
+  const dir = userVoiceJobsDir(job.userId);
+  await mkdir(dir, { recursive: true });
+  await writeFile(voiceJobPath(job), JSON.stringify(job), { encoding: 'utf8', mode: 0o600 });
 }
 
 function publicVoiceJob(job) {
@@ -417,11 +541,12 @@ function voiceJobListItem(job) {
   };
 }
 
-async function recordTextVoiceJob({ transcript, command, tasks = [], editedReport = null, reportKind = '', status = 'completed', error = '', cleared = false }) {
+async function recordTextVoiceJob({ userId, transcript, command, tasks = [], editedReport = null, reportKind = '', status = 'completed', error = '', cleared = false }) {
   const id = randomUUID();
   const now = new Date().toISOString();
   const job = {
     id,
+    userId: userId || 'anonymous',
     status,
     stage: status === 'completed' ? 'completed' : status === 'failed' ? 'failed' : 'completed',
     source: 'text',
@@ -448,11 +573,38 @@ async function purgeExpiredVoiceJobs(retentionDays = jobSettings.voiceRetention.
   const cutoff = Date.now() - voiceRetentionMs(retentionDays);
   let removed = 0;
   await mkdir(voiceJobsDir, { recursive: true });
-  const files = await readdir(voiceJobsDir);
-  for (const file of files) {
-    const full = path.join(voiceJobsDir, file);
+  const entries = await readdir(voiceJobsDir, { withFileTypes: true });
+  for (const entry of entries) {
+    const full = path.join(voiceJobsDir, entry.name);
     try {
-      if (file.endsWith('.json')) {
+      if (entry.isDirectory()) {
+        const files = await readdir(full);
+        for (const file of files) {
+          const filePath = path.join(full, file);
+          try {
+            if (file.endsWith('.json')) {
+              const job = JSON.parse(await readFile(filePath, 'utf8'));
+              const ts = Date.parse(job?.createdAt || job?.updatedAt || '') || 0;
+              if (!ts || ts >= cutoff) continue;
+              if (job?.id) voiceJobs.delete(job.id);
+              await unlink(filePath).catch(() => {});
+              if (job?.audioFile) await unlink(path.join(full, job.audioFile)).catch(() => {});
+              removed += 1;
+            } else {
+              const info = await stat(filePath);
+              if (info.mtimeMs < cutoff) {
+                await unlink(filePath).catch(() => {});
+                removed += 1;
+              }
+            }
+          } catch (error) {
+            console.error(`清理语音指令失败 ${file}`, error);
+          }
+        }
+        continue;
+      }
+      // legacy flat files
+      if (entry.name.endsWith('.json')) {
         const job = JSON.parse(await readFile(full, 'utf8'));
         const ts = Date.parse(job?.createdAt || job?.updatedAt || '') || 0;
         if (!ts || ts >= cutoff) continue;
@@ -460,15 +612,15 @@ async function purgeExpiredVoiceJobs(retentionDays = jobSettings.voiceRetention.
         await unlink(full).catch(() => {});
         if (job?.audioFile) await unlink(path.join(voiceJobsDir, job.audioFile)).catch(() => {});
         removed += 1;
-        continue;
-      }
-      const info = await stat(full);
-      if (info.mtimeMs < cutoff) {
-        await unlink(full).catch(() => {});
-        removed += 1;
+      } else {
+        const info = await stat(full);
+        if (info.mtimeMs < cutoff) {
+          await unlink(full).catch(() => {});
+          removed += 1;
+        }
       }
     } catch (error) {
-      console.error(`清理语音指令失败 ${file}`, error);
+      console.error(`清理语音指令失败 ${entry.name}`, error);
     }
   }
   return { removed, retentionDays: Math.max(1, Number(retentionDays) || 7) };
@@ -497,21 +649,23 @@ async function runVoiceRetentionJobIfDue(force = false) {
 
 function persistVoiceResultToSqlite(job,result){
   if(supabaseUrl)return [];
+  const userId=job.userId;
+  if(!userId)return [];
   const command=result.command;
-  if(command?.action==='edit_report'||command?.action==='clarify'){deleteSqliteTask(job.id);return []}
+  if(command?.action==='edit_report'||command?.action==='clarify'){deleteSqliteTask(userId,job.id);return []}
   if(command?.action==='update'){
-    deleteSqliteTask(job.id);const requested=command.updates?.length?command.updates:[{targetTaskId:command.targetTaskId,changes:command.changes}];const ids=[];
-    for(const entry of requested){const current=getSqliteTask(entry.targetTaskId);if(!current)continue;const changes={...(entry.changes||{})};const now=new Date().toISOString();
+    deleteSqliteTask(userId,job.id);const requested=command.updates?.length?command.updates:[{targetTaskId:command.targetTaskId,changes:command.changes}];const ids=[];
+    for(const entry of requested){const current=getSqliteTask(userId,entry.targetTaskId);if(!current)continue;const changes={...(entry.changes||{})};const now=new Date().toISOString();
       if(changes.status==='doing'){changes.progress=current.progress>0&&current.progress<100?current.progress:50;changes.startedAt=current.startedAt||now;changes.completedAt=null}
       if(changes.status==='done'){changes.progress=100;changes.startedAt=current.startedAt||now;changes.completedAt=now}
       if(changes.status==='todo'){changes.progress=0;changes.startedAt=null;changes.completedAt=null}
-      patchSqliteTask(current.id,changes);ids.push(current.id)}
+      patchSqliteTask(userId,current.id,changes);ids.push(current.id)}
     return ids;
   }
   const parsedTasks=(result.tasks?.length?result.tasks:command?.tasks?.length?command.tasks:result.task?[result.task]:[]).slice(0,10);
   return parsedTasks.map((parsed,index)=>{
     const id=index===0?job.id:`${job.id}-${index+1}`;
-    saveSqliteTask({id,title:parsed.title||result.transcript||'语音任务',assignee:parsed.assignee||'我',due:parsed.due||'今天',status:'todo',priority:parsed.priority||'中',progress:0,estimatedMinutes:parsed.estimatedMinutes||60,createdAt:job.createdAt,startedAt:null,completedAt:null,aiStatus:null});
+    saveSqliteTask(userId,{id,title:parsed.title||result.transcript||'语音任务',assignee:parsed.assignee||'我',due:parsed.due||'今天',status:'todo',priority:parsed.priority||'中',progress:0,estimatedMinutes:parsed.estimatedMinutes||60,createdAt:job.createdAt,startedAt:null,completedAt:null,aiStatus:null});
     return id;
   });
 }
@@ -522,11 +676,25 @@ async function processVoiceJob(id) {
   runningVoiceJobs.add(id);
   try {
     job.status = 'processing';
-    job.stage = 'transcribing';
     job.error = '';
-    await persistVoiceJob(job);
-    const buffer = await readFile(path.join(voiceJobsDir, job.audioFile));
-    const result = await transcribeAudio(buffer, job.mime, job.availableTasks || [],async(stage,details={})=>{job.stage=stage;if(details.transcript)job.transcript=details.transcript;await persistVoiceJob(job)}, job.reports || {});
+    let result;
+    if (job.audioFile) {
+      job.stage = 'transcribing';
+      await persistVoiceJob(job);
+      const buffer = await readFile(voiceAudioPath(job));
+      result = await transcribeAudio(buffer, job.mime, job.availableTasks || [],async(stage,details={})=>{job.stage=stage;if(details.transcript)job.transcript=details.transcript;await persistVoiceJob(job)}, job.reports || {});
+    } else {
+      job.stage = 'understanding';
+      await persistVoiceJob(job);
+      const transcript = convertToSimplified(String(job.transcript || '').trim());
+      if (!transcript) throw new Error('指令内容不能为空');
+      job.transcript = transcript;
+      await persistVoiceJob(job);
+      const command = await parseVoiceCommand(transcript, job.availableTasks || [], job.reports || {});
+      if (command.action === 'edit_report') result = { transcript, command, tasks: [], task: null };
+      else if (command.action === 'create') result = { transcript, command, tasks: command.tasks || [], task: command.task || null };
+      else result = { transcript, command, tasks: [], task: null };
+    }
     if (job.cancelled) return;
     job.transcript = result.transcript;
     job.command = result.command;
@@ -545,7 +713,7 @@ async function processVoiceJob(id) {
       job.task = null;
       if (job.cleared) job.command = { ...result.command, message: result.command.message || (kind === 'weekly' ? '周报已清空' : kind === 'monthly' ? '月报已清空' : '今日复盘已清空') };
       await persistVoiceJob(job);
-      try{deleteSqliteTask(job.id);job.persistedTaskIds=[];job.storageError=''}catch(error){job.storageError=error?.message||'清理占位任务失败'}
+      try{if(job.userId)deleteSqliteTask(job.userId,job.id);job.persistedTaskIds=[];job.storageError=''}catch(error){job.storageError=error?.message||'清理占位任务失败'}
     } else {
       job.stage = 'saving';
       job.tasks = result.tasks || [];
@@ -573,18 +741,28 @@ async function processVoiceJob(id) {
 
 async function recoverVoiceJobs() {
   await mkdir(voiceJobsDir, { recursive: true });
-  const files = await readdir(voiceJobsDir);
-  for (const file of files.filter(name => name.endsWith('.json'))) {
+  const loadJobFile = async (filePath, label) => {
     try {
-      const job = JSON.parse(await readFile(path.join(voiceJobsDir, file), 'utf8'));
-      if (!job?.id) continue;
+      const job = JSON.parse(await readFile(filePath, 'utf8'));
+      if (!job?.id) return;
+      if (!job.userId) job.userId = 'anonymous';
       voiceJobs.set(job.id, job);
       if (job.status === 'queued' || job.status === 'processing') {
         job.status = 'queued';
         setImmediate(() => void processVoiceJob(job.id));
       }
     } catch (error) {
-      console.error(`无法恢复语音任务 ${file}`, error);
+      console.error(`无法恢复语音任务 ${label}`, error);
+    }
+  };
+  const entries = await readdir(voiceJobsDir, { withFileTypes: true });
+  for (const entry of entries) {
+    const full = path.join(voiceJobsDir, entry.name);
+    if (entry.isDirectory()) {
+      const files = await readdir(full);
+      for (const file of files.filter(name => name.endsWith('.json'))) await loadJobFile(path.join(full, file), `${entry.name}/${file}`);
+    } else if (entry.name.endsWith('.json')) {
+      await loadJobFile(full, entry.name);
     }
   }
 }
@@ -628,14 +806,17 @@ async function editReportContent(kind, report, instruction) {
 }
 
 async function asrTranscript(buffer, mime = 'audio/webm') {
+  const apiKey = resolveAsrKey();
+  if (!apiKey) throw new Error('尚未配置语音识别 API Key（非百炼文本提供商时需单独填写百炼 ASR 密钥）');
   const data = await qwenChat({
-    apiKey: resolveAsrKey(),
+    apiKey,
+    baseURL: BAILIAN_BASE_URL,
     model: asrModel,
     messages: [{ role: 'user', content: [{ type: 'input_audio', input_audio: { data: `data:${mime};base64,${buffer.toString('base64')}` } }] }],
     extra: { stream: false, asr_options: { language: 'zh', enable_itn: true } }
   });
   const transcript = convertToSimplified(messageText(data).trim());
-  if (!transcript) throw new Error('千问语音模型没有返回转写内容');
+  if (!transcript) throw new Error('语音模型没有返回转写内容');
   return transcript;
 }
 
@@ -705,81 +886,122 @@ app.get('/api/health', (_req, res) => res.json({
   asr: Boolean(resolveAsrKey()),
   textConfigured: Boolean(textApiKey),
   asrConfigured: Boolean(asrApiKey),
-  asrUsesTextKey: Boolean(!asrApiKey && textApiKey),
-  provider: '阿里云百炼',
+  asrUsesTextKey: Boolean(!asrApiKey && textProvider === 'bailian' && textApiKey),
+  auth: cloudMode() ? 'supabase' : 'local',
+  provider: providerLabel(),
+  textProvider,
+  baseURL: textBaseURL,
   textModel,
   transcriptionModel: asrModel,
   storage: { mode: 'sqlite', file: sqliteDisplayPath }
 }));
 
-app.get('/api/sqlite/tasks', (_req, res) => res.json(listSqliteTasks()));
+app.post('/api/auth/register', (req, res) => {
+  if (cloudMode()) return res.status(400).json({ message: '当前已启用云端登录，请使用邮箱登录链接' });
+  try {
+    const user = createSqliteUser({ email: req.body?.email, password: req.body?.password, name: req.body?.name });
+    const session = createSqliteSession(user.id, SESSION_DAYS);
+    setSessionCookie(res, session.id, session.expiresAt, req);
+    res.status(201).json({ user });
+  } catch (error) {
+    res.status(400).json({ message: error?.message || '注册失败' });
+  }
+});
 
-app.get('/api/sqlite/tasks/:id', (req, res) => {
-  const task=getSqliteTask(req.params.id);
+app.post('/api/auth/login', (req, res) => {
+  if (cloudMode()) return res.status(400).json({ message: '当前已启用云端登录，请使用邮箱登录链接' });
+  try {
+    const user = authenticateSqliteUser(req.body?.email, req.body?.password);
+    const session = createSqliteSession(user.id, SESSION_DAYS);
+    setSessionCookie(res, session.id, session.expiresAt, req);
+    res.json({ user });
+  } catch (error) {
+    res.status(401).json({ message: error?.message || '登录失败' });
+  }
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  const sid = parseCookies(req)[SESSION_COOKIE];
+  if (sid) deleteSqliteSession(sid);
+  clearSessionCookie(res, req);
+  res.status(204).end();
+});
+
+app.get('/api/auth/me', (req, res) => {
+  if (cloudMode()) return res.json({ user: null, mode: 'supabase' });
+  const session = getSqliteSession(parseCookies(req)[SESSION_COOKIE]);
+  if (!session?.user) return res.status(401).json({ user: null, message: '未登录' });
+  res.json({ user: session.user, mode: 'local' });
+});
+
+app.get('/api/sqlite/tasks', requireUser, (req, res) => res.json(listSqliteTasks(req.user.id)));
+
+app.get('/api/sqlite/tasks/:id', requireUser, (req, res) => {
+  const task=getSqliteTask(req.user.id,req.params.id);
   if(!task)return res.status(404).json({message:'任务不存在'});
   res.json(task);
 });
 
-app.put('/api/sqlite/tasks/:id', (req, res) => {
-  try{res.json(saveSqliteTask({...req.body,id:req.params.id}))}
+app.put('/api/sqlite/tasks/:id', requireUser, (req, res) => {
+  try{res.json(saveSqliteTask(req.user.id,{...req.body,id:req.params.id}))}
   catch(error){res.status(400).json({message:error?.message||'任务保存失败'})}
 });
 
-app.patch('/api/sqlite/tasks/:id', (req, res) => {
-  try{const task=patchSqliteTask(req.params.id,req.body||{});if(!task)return res.status(404).json({message:'任务不存在'});res.json(task)}
+app.patch('/api/sqlite/tasks/:id', requireUser, (req, res) => {
+  try{const task=patchSqliteTask(req.user.id,req.params.id,req.body||{});if(!task)return res.status(404).json({message:'任务不存在'});res.json(task)}
   catch(error){res.status(400).json({message:error?.message||'任务更新失败'})}
 });
 
-app.delete('/api/sqlite/tasks/:id', (req, res) => {
-  deleteSqliteTask(req.params.id);res.status(204).end();
+app.delete('/api/sqlite/tasks/:id', requireUser, (req, res) => {
+  deleteSqliteTask(req.user.id,req.params.id);res.status(204).end();
 });
 
-app.get('/api/sqlite/reports/:date', (req, res) => {
+app.get('/api/sqlite/reports/:date', requireUser, (req, res) => {
   if(!/^\d{4}-\d{2}-\d{2}$/.test(req.params.date))return res.status(400).json({message:'日期格式不正确'});
-  res.json(loadSqliteReport(req.params.date));
+  res.json(loadSqliteReport(req.user.id,req.params.date));
 });
 
-app.put('/api/sqlite/reports/:date', (req, res) => {
+app.put('/api/sqlite/reports/:date', requireUser, (req, res) => {
   if(!/^\d{4}-\d{2}-\d{2}$/.test(req.params.date))return res.status(400).json({message:'日期格式不正确'});
   if(!req.body?.report||typeof req.body.report!=='object')return res.status(400).json({message:'日报内容不能为空'});
-  res.json(saveSqliteReport(req.params.date,req.body.report));
+  res.json(saveSqliteReport(req.user.id,req.params.date,req.body.report));
 });
 
-app.delete('/api/sqlite/reports/:date', (req, res) => {
-  deleteSqliteReport(req.params.date);res.status(204).end();
+app.delete('/api/sqlite/reports/:date', requireUser, (req, res) => {
+  deleteSqliteReport(req.user.id,req.params.date);res.status(204).end();
 });
 
-app.get('/api/sqlite/period-reports/:kind', (req, res) => {
+app.get('/api/sqlite/period-reports/:kind', requireUser, (req, res) => {
   try {
     if (!['weekly', 'monthly'].includes(req.params.kind)) return res.status(400).json({ message: '周期类型不正确' });
-    res.json(listSqlitePeriodReports(req.params.kind));
+    res.json(listSqlitePeriodReports(req.user.id,req.params.kind));
   } catch (error) {
     res.status(400).json({ message: error?.message || '读取周期复盘列表失败' });
   }
 });
 
-app.get('/api/sqlite/period-reports/:kind/:key', (req, res) => {
+app.get('/api/sqlite/period-reports/:kind/:key', requireUser, (req, res) => {
   try {
     if (!isPeriodKey(req.params.kind, req.params.key)) return res.status(400).json({ message: '周期键格式不正确' });
-    res.json(loadSqlitePeriodReport(req.params.kind, req.params.key));
+    res.json(loadSqlitePeriodReport(req.user.id,req.params.kind, req.params.key));
   } catch (error) {
     res.status(400).json({ message: error?.message || '读取周期复盘失败' });
   }
 });
 
-app.put('/api/sqlite/period-reports/:kind/:key', (req, res) => {
+app.put('/api/sqlite/period-reports/:kind/:key', requireUser, (req, res) => {
   try {
     if (!isPeriodKey(req.params.kind, req.params.key)) return res.status(400).json({ message: '周期键格式不正确' });
     if (!req.body?.report || typeof req.body.report !== 'object') return res.status(400).json({ message: '复盘内容不能为空' });
-    res.json(saveSqlitePeriodReport(req.params.kind, req.params.key, req.body.report));
+    res.json(saveSqlitePeriodReport(req.user.id,req.params.kind, req.params.key, req.body.report));
   } catch (error) {
     res.status(400).json({ message: error?.message || '保存周期复盘失败' });
   }
 });
 
-app.delete('/api/sqlite/period-reports/:kind/:key', (req, res) => {
+app.delete('/api/sqlite/period-reports/:kind/:key', requireUser, (req, res) => {
   try {
-    deleteSqlitePeriodReport(req.params.kind, req.params.key);
+    deleteSqlitePeriodReport(req.user.id,req.params.kind, req.params.key);
     res.status(204).end();
   } catch (error) {
     res.status(400).json({ message: error?.message || '删除周期复盘失败' });
@@ -830,60 +1052,141 @@ app.delete('/api/settings/cloud', requireSettingsAccess, async (_req, res) => {
   }
 });
 
-app.get('/api/settings/model', requireSettingsAccess, (_req, res) => res.json({
-  configured: Boolean(textApiKey),
-  textConfigured: Boolean(textApiKey),
-  asrConfigured: Boolean(asrApiKey),
-  asrUsesTextKey: Boolean(!asrApiKey && textApiKey),
-  maskedTextKey: maskKey(textApiKey),
-  maskedAsrKey: maskKey(asrApiKey),
-  maskedKey: maskKey(textApiKey),
-  textModel,
-  asrModel,
-  provider: '阿里云百炼'
-}));
+function modelSettingsPublic() {
+  return {
+    configured: Boolean(textApiKey),
+    textConfigured: Boolean(textApiKey),
+    asrConfigured: Boolean(asrApiKey),
+    asrUsesTextKey: Boolean(!asrApiKey && textProvider === 'bailian' && textApiKey),
+    maskedTextKey: maskKey(textApiKey),
+    maskedAsrKey: maskKey(asrApiKey),
+    maskedKey: maskKey(textApiKey),
+    provider: textProvider,
+    providerLabel: providerLabel(),
+    baseURL: textBaseURL,
+    textModel,
+    asrModel,
+    presets: Object.values(PROVIDER_PRESETS).map(item => ({
+      id: item.id,
+      label: item.label,
+      baseURL: item.baseURL,
+      models: PRESET_TEXT_MODELS[item.id] || []
+    })),
+    asrModels: ALLOWED_ASR_MODELS
+  };
+}
+
+app.get('/api/settings/model', requireSettingsAccess, (_req, res) => res.json(modelSettingsPublic()));
+
+async function probeBailianKey(apiKey) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20_000);
+  try {
+    const response = await fetch(`${BAILIAN_BASE_URL}/models`, {
+      method: 'GET',
+      signal: controller.signal,
+      headers: { Authorization: `Bearer ${apiKey}` }
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data?.error?.message || data?.message || `语音密钥校验失败 (${response.status})`);
+    return true;
+  } catch (error) {
+    if (error?.name === 'AbortError') throw new Error('语音密钥校验超时，请稍后重试');
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function testTextModelConnection(apiKey, model, baseURL) {
+  const data = await qwenChat({
+    model,
+    apiKey,
+    baseURL,
+    messages: [{ role: 'user', content: '只回复两个字：成功' }],
+    extra: { max_tokens: 16, temperature: 0 }
+  });
+  return String(messageText(data) || '').trim().slice(0, 40);
+}
+
+function parseModelSettingsBody(body = {}) {
+  const nextProvider = normalizeTextProvider(body.provider || body.textProvider || textProvider);
+  const nextBaseURL = resolveProviderBaseURL(nextProvider, body.baseURL ?? body.textBaseURL ?? (nextProvider === textProvider ? textBaseURL : ''));
+  const nextTextKey = String(body.textApiKey || body.apiKey || '').trim();
+  const nextAsrKey = String(body.asrApiKey || '').trim();
+  const clearAsrKey = Boolean(body.clearAsrKey);
+  const nextTextModel = normalizeTextModelName(body.textModel || textModel);
+  const nextAsrModel = String(body.asrModel || asrModel).trim();
+  if (!ALLOWED_ASR_MODELS.includes(nextAsrModel)) throw new Error('不支持所选语音识别模型');
+  if (nextTextKey && !isValidApiKey(nextTextKey)) throw new Error('任务理解 API Key 格式不正确');
+  if (nextAsrKey && !isValidApiKey(nextAsrKey)) throw new Error('语音识别 API Key 格式不正确');
+  return { nextProvider, nextBaseURL, nextTextKey, nextAsrKey, clearAsrKey, nextTextModel, nextAsrModel };
+}
+
+app.post('/api/settings/model/test', requireSettingsAccess, async (req, res) => {
+  try {
+    const parsed = parseModelSettingsBody(req.body);
+    const candidateTextKey = parsed.nextTextKey || textApiKey;
+    const candidateAsrKey = parsed.clearAsrKey ? '' : (parsed.nextAsrKey || asrApiKey);
+    if (!candidateTextKey) return res.status(400).json({ message: '请先填写任务理解 API Key，或保存后再测试' });
+
+    const reply = await testTextModelConnection(candidateTextKey, parsed.nextTextModel, parsed.nextBaseURL);
+    let asrNote = '未校验语音识别';
+    if (parsed.nextProvider === 'bailian') {
+      const effectiveAsrKey = candidateAsrKey || candidateTextKey;
+      if (candidateAsrKey && candidateAsrKey !== candidateTextKey) {
+        await probeBailianKey(candidateAsrKey);
+        asrNote = '独立语音密钥校验通过';
+      } else if (effectiveAsrKey) {
+        asrNote = candidateAsrKey ? '独立语音密钥与任务理解密钥相同' : '语音识别将沿用任务理解密钥';
+      }
+    } else if (candidateAsrKey) {
+      await probeBailianKey(candidateAsrKey);
+      asrNote = '百炼语音密钥校验通过';
+    } else {
+      asrNote = '非百炼文本提供商：语音识别需单独配置百炼 ASR 密钥';
+    }
+    res.json({
+      ok: true,
+      message: `连接成功：${providerLabel(parsed.nextProvider)} / ${parsed.nextTextModel} 可用${reply ? `（回复：${reply}）` : ''}；${asrNote}`,
+      provider: parsed.nextProvider,
+      baseURL: parsed.nextBaseURL,
+      textModel: parsed.nextTextModel,
+      sample: reply
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(400).json({ message: error?.message || '模型连接测试失败' });
+  }
+});
 
 app.put('/api/settings/model', requireSettingsAccess, async (req, res) => {
   try {
-    const nextTextKey = String(req.body?.textApiKey || req.body?.apiKey || '').trim();
-    const nextAsrKey = String(req.body?.asrApiKey || '').trim();
-    const clearAsrKey = Boolean(req.body?.clearAsrKey);
-    const nextTextModel = String(req.body?.textModel || textModel).trim();
-    const nextAsrModel = String(req.body?.asrModel || asrModel).trim();
-    const allowedText = ['qwen3.7-plus', 'qwen-plus', 'qwen3.6-flash', 'deepseek-v3.2', 'deepseek-v4-pro', 'deepseek-v4-flash'];
-    const allowedAsr = ['qwen3-asr-flash', 'qwen3-asr-flash-2026-02-10'];
-    if (!textApiKey && !nextTextKey) return res.status(400).json({ message: '首次配置必须填写任务理解 API Key' });
-    if (nextTextKey && !isValidApiKey(nextTextKey)) return res.status(400).json({ message: '任务理解 API Key 格式不正确' });
-    if (nextAsrKey && !isValidApiKey(nextAsrKey)) return res.status(400).json({ message: '语音识别 API Key 格式不正确' });
-    if (!allowedText.includes(nextTextModel) || !allowedAsr.includes(nextAsrModel)) return res.status(400).json({ message: '不支持所选模型' });
-    if (nextTextKey) textApiKey = nextTextKey;
-    if (clearAsrKey) asrApiKey = '';
-    else if (nextAsrKey) asrApiKey = nextAsrKey;
-    textModel = nextTextModel; asrModel = nextAsrModel;
+    const parsed = parseModelSettingsBody(req.body);
+    if (!textApiKey && !parsed.nextTextKey) return res.status(400).json({ message: '首次配置必须填写任务理解 API Key' });
+    if (parsed.nextTextKey) textApiKey = parsed.nextTextKey;
+    if (parsed.clearAsrKey) asrApiKey = '';
+    else if (parsed.nextAsrKey) asrApiKey = parsed.nextAsrKey;
+    textProvider = parsed.nextProvider;
+    textBaseURL = parsed.nextBaseURL;
+    textModel = parsed.nextTextModel;
+    asrModel = parsed.nextAsrModel;
     await persistEnv({
-      ...(nextTextKey ? { DASHSCOPE_API_KEY: nextTextKey, DASHSCOPE_TEXT_API_KEY: nextTextKey } : {}),
+      TEXT_API_PROVIDER: textProvider,
+      TEXT_API_BASE_URL: textBaseURL,
+      ...(parsed.nextTextKey ? { DASHSCOPE_API_KEY: parsed.nextTextKey, DASHSCOPE_TEXT_API_KEY: parsed.nextTextKey } : {}),
       DASHSCOPE_ASR_API_KEY: asrApiKey,
       QWEN_TEXT_MODEL: textModel,
       QWEN_ASR_MODEL: asrModel
     });
-    res.json({
-      configured: true,
-      textConfigured: Boolean(textApiKey),
-      asrConfigured: Boolean(asrApiKey),
-      asrUsesTextKey: Boolean(!asrApiKey && textApiKey),
-      maskedTextKey: maskKey(textApiKey),
-      maskedAsrKey: maskKey(asrApiKey),
-      maskedKey: maskKey(textApiKey),
-      textModel,
-      asrModel,
-      message: '模型设置已保存并立即生效'
-    });
+    res.json({ ...modelSettingsPublic(), message: '模型设置已保存并立即生效' });
   } catch (error) {
-    res.status(500).json({ message: error?.message || '模型设置保存失败' });
+    const status = /不合法|不正确|不能为空|不支持/.test(String(error?.message || '')) ? 400 : 500;
+    res.status(status).json({ message: error?.message || '模型设置保存失败' });
   }
 });
 
-app.post('/api/parse-task-text', requireTextAi, async (req, res) => {
+app.post('/api/parse-task-text', requireUser, requireTextAi, async (req, res) => {
   try{
     const transcript=String(req.body?.transcript||'').trim().slice(0,5000);
     if(!transcript)return res.status(400).json({message:'指令内容不能为空'});
@@ -907,20 +1210,20 @@ app.post('/api/parse-task-text', requireTextAi, async (req, res) => {
       const nextCommand = cleared
         ? { ...command, message: command.message || (kind === 'weekly' ? '周报已清空' : kind === 'monthly' ? '月报已清空' : '今日复盘已清空') }
         : command;
-      const job = await recordTextVoiceJob({ transcript, command: nextCommand, tasks: [], editedReport, reportKind: kind, status: 'completed', cleared });
+      const job = await recordTextVoiceJob({ userId: req.user.id, transcript, command: nextCommand, tasks: [], editedReport, reportKind: kind, status: 'completed', cleared });
       return res.json({ command: nextCommand, reportKind: kind, editedReport, cleared, tasks: [], count: 0, jobId: job.id });
     }
     if (command.action === 'update' || command.action === 'clarify') {
-      const job = await recordTextVoiceJob({ transcript, command, tasks: [], status: 'completed' });
+      const job = await recordTextVoiceJob({ userId: req.user.id, transcript, command, tasks: [], status: 'completed' });
       return res.json({ command, tasks: [], count: 0, jobId: job.id });
     }
     const tasks = command.tasks || [];
-    const job = await recordTextVoiceJob({ transcript, command, tasks, status: 'completed' });
+    const job = await recordTextVoiceJob({ userId: req.user.id, transcript, command, tasks, status: 'completed' });
     res.json({ command, tasks, count: tasks.length, jobId: job.id });
   }catch(error){
     console.error(error);
     const transcript=String(req.body?.transcript||'').trim().slice(0,5000);
-    if(transcript)await recordTextVoiceJob({ transcript, command: null, status: 'failed', error: error?.message||'AI 指令理解失败' }).catch(()=>{});
+    if(transcript)await recordTextVoiceJob({ userId: req.user?.id, transcript, command: null, status: 'failed', error: error?.message||'AI 指令理解失败' }).catch(()=>{});
     res.status(502).json({message:error?.message||'AI 指令理解失败'});
   }
 });
@@ -940,7 +1243,7 @@ app.put('/api/settings/jobs', async (req, res) => {
   }
 });
 
-app.post('/api/voice-jobs/purge', async (req, res) => {
+app.post('/api/voice-jobs/purge', requireUser, async (req, res) => {
   try {
     const days = Number(req.body?.retentionDays);
     if (Number.isInteger(days) && days >= 1 && days <= 90) {
@@ -965,11 +1268,13 @@ app.post('/api/voice-jobs/purge', async (req, res) => {
   }
 });
 
-app.get('/api/voice-jobs', async (_req, res) => {
+app.get('/api/voice-jobs', requireUser, async (req, res) => {
   try {
     const retentionDays = jobSettings.voiceRetention.retentionDays;
     const cutoff = Date.now() - voiceRetentionMs(retentionDays);
+    const userId = req.user.id;
     const items = [...voiceJobs.values()]
+      .filter(job => (job.userId || 'anonymous') === userId)
       .filter(job => {
         const ts = Date.parse(job?.createdAt || job?.updatedAt || '') || 0;
         return !ts || ts >= cutoff;
@@ -983,29 +1288,76 @@ app.get('/api/voice-jobs', async (_req, res) => {
   }
 });
 
-app.post('/api/voice-jobs', upload.single('audio'), requireVoiceAi, async (req, res) => {
+function parseVoiceJobContext(body = {}) {
+  let availableTasks = [];
+  let reports = {};
+  try {
+    const parsed = typeof body.tasks === 'string' ? JSON.parse(body.tasks || '[]') : body.tasks;
+    if (Array.isArray(parsed)) availableTasks = parsed.slice(0, 100);
+  } catch {}
+  try {
+    const parsed = typeof body.reports === 'string' ? JSON.parse(body.reports || '{}') : body.reports;
+    if (parsed && typeof parsed === 'object') {
+      reports = {
+        daily: parsed.daily && typeof parsed.daily === 'object' ? parsed.daily : null,
+        weekly: parsed.weekly && typeof parsed.weekly === 'object' ? parsed.weekly : null,
+        monthly: parsed.monthly && typeof parsed.monthly === 'object' ? parsed.monthly : null
+      };
+    }
+  } catch {}
+  return { availableTasks, reports };
+}
+
+app.post('/api/voice-jobs/text', requireUser, requireTextAi, async (req, res) => {
+  try {
+    const transcript = convertToSimplified(String(req.body?.transcript || '').trim().slice(0, 5000));
+    if (!transcript) return res.status(400).json({ error: 'NO_TEXT', message: '指令内容不能为空' });
+    const { availableTasks, reports } = parseVoiceJobContext(req.body || {});
+    const id = randomUUID();
+    const now = new Date().toISOString();
+    const job = {
+      id,
+      userId: req.user.id,
+      status: 'queued',
+      stage: 'queued',
+      source: 'text',
+      mime: '',
+      audioFile: '',
+      createdAt: now,
+      updatedAt: now,
+      availableTasks,
+      reports,
+      transcript,
+      tasks: [],
+      task: null,
+      command: null,
+      editedReport: null,
+      reportKind: '',
+      cleared: false,
+      error: ''
+    };
+    await persistVoiceJob(job);
+    res.status(202).json(publicVoiceJob(job));
+    setImmediate(() => void processVoiceJob(id));
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'VOICE_JOB_SAVE_FAILED', message: '文字指令提交失败，请重试' });
+  }
+});
+
+app.post('/api/voice-jobs', upload.single('audio'), requireUser, requireVoiceAi, async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'NO_AUDIO', message: '没有收到录音文件' });
     const mime = req.file.mimetype || 'audio/webm';
-    let availableTasks = [];
-    let reports = {};
-    try { const parsed = JSON.parse(String(req.body?.tasks || '[]')); if (Array.isArray(parsed)) availableTasks = parsed.slice(0, 100); } catch {}
-    try {
-      const parsed = JSON.parse(String(req.body?.reports || '{}'));
-      if (parsed && typeof parsed === 'object') {
-        reports = {
-          daily: parsed.daily && typeof parsed.daily === 'object' ? parsed.daily : null,
-          weekly: parsed.weekly && typeof parsed.weekly === 'object' ? parsed.weekly : null,
-          monthly: parsed.monthly && typeof parsed.monthly === 'object' ? parsed.monthly : null
-        };
-      }
-    } catch {}
+    const { availableTasks, reports } = parseVoiceJobContext(req.body || {});
     const id = randomUUID();
     const audioFile = `${id}.${audioExtension(mime)}`;
-    await mkdir(voiceJobsDir, { recursive: true });
-    await writeFile(path.join(voiceJobsDir, audioFile), req.file.buffer, { mode: 0o600 });
+    const dir = userVoiceJobsDir(req.user.id);
+    await mkdir(dir, { recursive: true });
+    await writeFile(path.join(dir, audioFile), req.file.buffer, { mode: 0o600 });
     const job = {
       id,
+      userId: req.user.id,
       status: 'queued',
       stage: 'queued',
       source: 'audio',
@@ -1032,16 +1384,26 @@ app.post('/api/voice-jobs', upload.single('audio'), requireVoiceAi, async (req, 
   }
 });
 
-app.get('/api/voice-jobs/:id', (req, res) => {
+function ownedVoiceJob(req, res) {
   const job = voiceJobs.get(req.params.id);
-  if (!job) return res.status(404).json({ error: 'VOICE_JOB_NOT_FOUND', message: '没有找到这条语音任务' });
+  if (!job || (job.userId || 'anonymous') !== req.user.id) {
+    res.status(404).json({ error: 'VOICE_JOB_NOT_FOUND', message: '没有找到这条语音任务' });
+    return null;
+  }
+  return job;
+}
+
+app.get('/api/voice-jobs/:id', requireUser, (req, res) => {
+  const job = ownedVoiceJob(req, res);
+  if (!job) return;
   res.json(publicVoiceJob(job));
 });
 
-app.get('/api/voice-jobs/:id/audio', async (req, res) => {
-  const job = voiceJobs.get(req.params.id);
-  if (!job?.audioFile) return res.status(404).json({ message: '这条指令没有可播放的录音' });
-  const filePath = path.join(voiceJobsDir, job.audioFile);
+app.get('/api/voice-jobs/:id/audio', requireUser, async (req, res) => {
+  const job = ownedVoiceJob(req, res);
+  if (!job) return;
+  if (!job.audioFile) return res.status(404).json({ message: '这条指令没有可播放的录音' });
+  const filePath = voiceAudioPath(job);
   try {
     await stat(filePath);
   } catch {
@@ -1052,19 +1414,26 @@ app.get('/api/voice-jobs/:id/audio', async (req, res) => {
   res.sendFile(filePath);
 });
 
-app.delete('/api/voice-jobs/:id', async (req, res) => {
-  const job = voiceJobs.get(req.params.id);
-  if (job) job.cancelled = true;
+app.delete('/api/voice-jobs/:id', requireUser, async (req, res) => {
+  const job = ownedVoiceJob(req, res);
+  if (!job) return;
+  job.cancelled = true;
   voiceJobs.delete(req.params.id);
-  await unlink(voiceJobPath(req.params.id)).catch(() => {});
-  if (job?.audioFile) await unlink(path.join(voiceJobsDir, job.audioFile)).catch(() => {});
+  await unlink(voiceJobPath(job)).catch(() => {});
+  if (job.audioFile) await unlink(voiceAudioPath(job)).catch(() => {});
   res.status(204).end();
 });
 
-app.post('/api/voice-jobs/:id/retry', requireVoiceAi, async (req, res) => {
-  const job = voiceJobs.get(req.params.id);
-  if (!job) return res.status(404).json({ error: 'VOICE_JOB_NOT_FOUND', message: '没有找到这条语音任务' });
+app.post('/api/voice-jobs/:id/retry', requireUser, async (req, res) => {
+  const job = ownedVoiceJob(req, res);
+  if (!job) return;
   if (job.status === 'completed') return res.status(409).json({ message: '这条语音任务已经识别完成' });
+  if (job.audioFile) {
+    if (!resolveAsrKey()) return res.status(503).json({ error: 'ASR_NOT_CONFIGURED', message: '服务端尚未配置语音识别 API Key' });
+    if (!textApiKey) return res.status(503).json({ error: 'AI_NOT_CONFIGURED', message: '服务端尚未配置任务理解 API Key' });
+  } else if (!textApiKey) {
+    return res.status(503).json({ error: 'AI_NOT_CONFIGURED', message: '服务端尚未配置任务理解 API Key' });
+  }
   job.status = 'queued';
   job.stage = 'queued';
   job.error = '';
@@ -1073,7 +1442,7 @@ app.post('/api/voice-jobs/:id/retry', requireVoiceAi, async (req, res) => {
   setImmediate(() => void processVoiceJob(job.id));
 });
 
-app.post('/api/transcribe', upload.single('audio'), requireVoiceAi, async (req, res) => {
+app.post('/api/transcribe', upload.single('audio'), requireUser, requireVoiceAi, async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'NO_AUDIO', message: '没有收到录音文件' });
     let availableTasks = [];
@@ -1085,7 +1454,7 @@ app.post('/api/transcribe', upload.single('audio'), requireVoiceAi, async (req, 
   }
 });
 
-app.post('/api/daily-plan', requireTextAi, async (req, res) => {
+app.post('/api/daily-plan', requireUser, requireTextAi, async (req, res) => {
   try {
     const { tasks = [], date, user = '用户' } = req.body || {};
     const data = await qwenChat({
@@ -1102,7 +1471,7 @@ app.post('/api/daily-plan', requireTextAi, async (req, res) => {
   }
 });
 
-app.post('/api/weekly-plan', requireTextAi, async (req, res) => {
+app.post('/api/weekly-plan', requireUser, requireTextAi, async (req, res) => {
   try {
     const { tasks = [], weekStart, weekEnd, user = '用户' } = req.body || {};
     const data = await qwenChat({
@@ -1119,7 +1488,7 @@ app.post('/api/weekly-plan', requireTextAi, async (req, res) => {
   }
 });
 
-app.post('/api/monthly-plan', requireTextAi, async (req, res) => {
+app.post('/api/monthly-plan', requireUser, requireTextAi, async (req, res) => {
   try {
     const { tasks = [], month, user = '用户' } = req.body || {};
     const data = await qwenChat({
@@ -1136,7 +1505,7 @@ app.post('/api/monthly-plan', requireTextAi, async (req, res) => {
   }
 });
 
-app.post('/api/edit-report', upload.single('audio'), requireTextAi, async (req, res) => {
+app.post('/api/edit-report', upload.single('audio'), requireUser, requireTextAi, async (req, res) => {
   try {
     const kind = String(req.body?.kind || '').trim();
     if (!['daily', 'weekly', 'monthly'].includes(kind)) return res.status(400).json({ message: '复盘类型不正确' });
@@ -1162,7 +1531,7 @@ app.post('/api/edit-report', upload.single('audio'), requireTextAi, async (req, 
   }
 });
 
-app.post('/api/report-edit-jobs', upload.single('audio'), requireTextAi, async (req, res) => {
+app.post('/api/report-edit-jobs', upload.single('audio'), requireUser, requireTextAi, async (req, res) => {
   try {
     const kind = String(req.body?.kind || '').trim();
     if (!['daily', 'weekly', 'monthly'].includes(kind)) return res.status(400).json({ message: '复盘类型不正确' });
@@ -1184,6 +1553,7 @@ app.post('/api/report-edit-jobs', upload.single('audio'), requireTextAi, async (
     }
     const job = {
       id,
+      userId: req.user.id,
       kind,
       status: 'queued',
       stage: 'queued',
@@ -1206,24 +1576,34 @@ app.post('/api/report-edit-jobs', upload.single('audio'), requireTextAi, async (
   }
 });
 
-app.get('/api/report-edit-jobs/:id', requireTextAi, (req, res) => {
+function ownedReportEditJob(req, res) {
   const job = reportEditJobs.get(req.params.id);
-  if (!job) return res.status(404).json({ error: 'REPORT_EDIT_JOB_NOT_FOUND', message: '没有找到这条复盘改稿任务' });
+  if (!job || (job.userId || 'anonymous') !== req.user.id) {
+    res.status(404).json({ error: 'REPORT_EDIT_JOB_NOT_FOUND', message: '没有找到这条复盘改稿任务' });
+    return null;
+  }
+  return job;
+}
+
+app.get('/api/report-edit-jobs/:id', requireUser, requireTextAi, (req, res) => {
+  const job = ownedReportEditJob(req, res);
+  if (!job) return;
   res.json(publicReportEditJob(job));
 });
 
-app.delete('/api/report-edit-jobs/:id', async (req, res) => {
-  const job = reportEditJobs.get(req.params.id);
-  if (job) job.cancelled = true;
+app.delete('/api/report-edit-jobs/:id', requireUser, async (req, res) => {
+  const job = ownedReportEditJob(req, res);
+  if (!job) return;
+  job.cancelled = true;
   reportEditJobs.delete(req.params.id);
   await unlink(reportEditJobPath(req.params.id)).catch(() => {});
-  if (job?.audioFile) await unlink(path.join(reportEditJobsDir, job.audioFile)).catch(() => {});
+  if (job.audioFile) await unlink(path.join(reportEditJobsDir, job.audioFile)).catch(() => {});
   res.status(204).end();
 });
 
-app.post('/api/report-edit-jobs/:id/retry', requireVoiceAi, async (req, res) => {
-  const job = reportEditJobs.get(req.params.id);
-  if (!job) return res.status(404).json({ error: 'REPORT_EDIT_JOB_NOT_FOUND', message: '没有找到这条复盘改稿任务' });
+app.post('/api/report-edit-jobs/:id/retry', requireUser, requireVoiceAi, async (req, res) => {
+  const job = ownedReportEditJob(req, res);
+  if (!job) return;
   if (job.status === 'completed') return res.status(409).json({ message: '这条复盘改稿任务已经完成' });
   job.status = 'queued';
   job.stage = 'queued';

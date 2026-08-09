@@ -12,7 +12,15 @@ export default defineConfig({
     proxy: {
       '/api': {
         target: 'http://localhost:8790',
+        changeOrigin: true,
         configure(proxy) {
+          (proxy as any).on('proxyRes', (proxyRes: { headers: Record<string, string | string[] | undefined> }) => {
+            const raw = proxyRes.headers['set-cookie'];
+            if (!raw) return;
+            const list = Array.isArray(raw) ? raw : [raw];
+            // Keep session cookies scoped to the Vite origin (not the API host).
+            proxyRes.headers['set-cookie'] = list.map(cookie => cookie.replace(/;\s*Domain=[^;]+/i, ''));
+          });
           (proxy as any).on('error', (_err: unknown, _req: unknown, res: any) => {
             if (res && typeof res.writeHead === 'function' && !res.headersSent) {
               res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' });
