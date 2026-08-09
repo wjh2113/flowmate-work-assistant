@@ -1,0 +1,40 @@
+.dialog-overlay{
+  position:fixed;inset:0;z-index:80;display:grid;place-items:center;padding:22px;
+  background:rgba(15,23,42,.38);
+  -webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);
+  animation:dialog-fade .16s ease;
+}
+.dialog-card{
+  width:min(100%,340px);padding:22px 20px 16px;border-radius:22px;
+  background:
+    radial-gradient(circle at 90% 0%,rgba(34,211,238,.18),transparent 34%),
+    rgba(252,253,255,.94);
+  border:1px solid rgba(255,255,255,.88);
+  box-shadow:0 22px 60px rgba(15,23,42,.18),inset 0 1px 0 #fff;
+  -webkit-backdrop-filter:blur(24px) saturate(140%);backdrop-filter:blur(24px) saturate(140%);
+  animation:dialog-pop .2s cubic-bezier(.2,.9,.2,1);
+}
+.dialog-icon{
+  width:42px;height:42px;border-radius:14px;display:grid;place-items:center;margin-bottom:12px;
+  background:linear-gradient(135deg,#ecfeff,#a5f3fc);color:#0e7490;font-size:18px;font-weight:800;
+}
+.dialog-card.danger .dialog-icon{background:linear-gradient(135deg,#ffe8e1,#ffd2c6);color:#d26545}
+.dialog-card h3{margin:0;font-size:17px;letter-spacing:-.2px;color:#0f172a}
+.dialog-card .dialog-body{margin:8px 0 0;color:#64748b;font-size:13px;line-height:1.55;white-space:pre-wrap}
+.dialog-actions{display:flex;gap:8px;margin-top:18px}
+.dialog-actions button{
+  flex:1;min-height:42px;border-radius:12px;font-size:13px;font-weight:800;border:0;cursor:pointer;
+}
+.dialog-actions .dialog-cancel{
+  background:rgba(255,255,255,.72);border:1px solid rgba(226,232,240,.95);color:#64748b;
+}
+.dialog-actions .dialog-ok{
+  background:linear-gradient(135deg,#0891b2,#06b6d4);color:#fff;
+  box-shadow:0 8px 18px rgba(8,145,178,.28);
+}
+.dialog-card.danger .dialog-ok{
+  background:linear-gradient(135deg,#e87a58,#d35a3d);
+  box-shadow:0 8px 18px rgba(211,90,61,.25);
+}
+@keyframes dialog-fade{from{opacity:0}to{opacity:1}}
+@keyframes dialog-pop{from{opacity:0;transform:translateY(8px) scale(.96)}to{opacity:1;transform:none}}

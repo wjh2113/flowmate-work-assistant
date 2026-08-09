@@ -14,7 +14,7 @@
   min-height: 40px;
   max-width: 360px;
   margin: 0 auto 10px;
-  color: var(--muted);
+  color: #b0b4c4;
   font-size: 13px;
   line-height: 20px;
   text-align: center;
@@ -38,19 +38,32 @@
 }
 
 .record-label {
-  margin: 0 0 16px;
-  color: var(--muted);
+  margin: 0 0 10px;
+  color: #b4b8c7;
   font-size: 12px;
   text-align: center;
 }
 
+.record-cancel{
+  display:block;width:100%;max-width:220px;margin:0 auto 14px;padding:10px 12px;
+  border-radius:12px;border:1px solid #e4e2ef;background:rgba(255,255,255,.72);
+  color:#7a7e93;font-size:12px;font-weight:700;
+}
+.record-cancel:active{transform:scale(.98)}
+
+.sheet .input.transcript::placeholder,
+.sheet textarea.transcript::placeholder {
+  color: #c9ccd8;
+  opacity: 1;
+}
+
 .task.ai-pending {
-  border-color: rgba(99, 91, 255, 0.22);
+  border-color: rgba(8, 145, 178, 0.22);
 }
 
 .task.ai-pending > i {
   color: var(--primary);
-  background: rgba(99, 91, 255, 0.1);
+  background: rgba(8, 145, 178, 0.1);
   animation: voice-task-pulse 1.2s ease-in-out infinite;
 }
 
@@ -87,8 +100,8 @@
 }
 
 .task.ai-pending > i.task-status {
-  border-color: rgba(82, 102, 197, 0.42);
-  background: rgba(82, 102, 197, 0.1);
+  border-color: rgba(8, 145, 178, 0.42);
+  background: rgba(8, 145, 178, 0.1);
   color: var(--primary);
 }
 
@@ -120,4 +133,103 @@
   height: 2px;
   border-radius: 50%;
   background: #b9bdc9;
+}
+
+.voice-progress {
+  margin: 0 0 16px;
+  padding: 14px 15px;
+  border-radius: calc(var(--radius, 0.75rem) + 0.5rem);
+  border: 1px solid rgba(8, 145, 178, 0.18);
+  background: linear-gradient(145deg, #ecfeff, #ffffff);
+  box-shadow:
+    0 1px 1px rgba(15, 23, 42, 0.03),
+    0 4px 12px rgba(15, 23, 42, 0.05),
+    0 16px 28px rgba(15, 23, 42, 0.04);
+}
+
+.voice-progress-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.voice-progress-head .ai-orb {
+  width: 36px;
+  height: 36px;
+  border-radius: 12px;
+  animation: voice-task-pulse 1.2s ease-in-out infinite;
+}
+
+.voice-progress-head small {
+  display: block;
+  color: #8a8fa0;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+}
+
+.voice-progress-head h3 {
+  margin: 2px 0 0;
+  font-size: 15px;
+  line-height: 1.25;
+}
+
+.voice-progress-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 11px 12px;
+  border-radius: 13px;
+  background: rgba(255, 255, 255, 0.86);
+  border: 1px solid #ebe9f8;
+}
+
+.voice-progress-item + .voice-progress-item {
+  margin-top: 8px;
+}
+
+.voice-progress-item b {
+  display: block;
+  font-size: 13px;
+  line-height: 18px;
+  color: #2f3348;
+}
+
+.voice-progress-item p {
+  margin: 3px 0 0;
+  color: var(--primary);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.voice-progress-item.failed p {
+  color: #d85656;
+}
+
+.voice-progress-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.voice-progress-actions button {
+  padding: 7px 10px;
+  border-radius: calc(var(--radius, 0.75rem) - 0.125rem);
+  border: 1px solid #a5f3fc;
+  background: #ecfeff;
+  color: var(--primary);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.voice-progress-dismiss {
+  width: 30px;
+  padding: 0 !important;
+  line-height: 30px;
+  color: #8a8fa0 !important;
+  background: #f3f4f8 !important;
+  border-color: #e6e7ee !important;
 }

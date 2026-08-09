@@ -37,6 +37,13 @@ db.exec(`
     report_json TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS period_reports (
+    kind TEXT NOT NULL CHECK(kind IN ('weekly','monthly')),
+    period_key TEXT NOT NULL,
+    report_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (kind, period_key)
+  );
 `);
 
 const selectTasks=db.prepare('SELECT * FROM tasks ORDER BY created_at DESC');
@@ -55,6 +62,13 @@ const deleteReportStatement=db.prepare('DELETE FROM daily_reports WHERE report_d
 const upsertReportStatement=db.prepare(`
   INSERT INTO daily_reports(report_date,report_json,updated_at) VALUES(?,?,?)
   ON CONFLICT(report_date) DO UPDATE SET report_json=excluded.report_json,updated_at=excluded.updated_at
+`);
+const selectPeriodReport=db.prepare('SELECT report_json FROM period_reports WHERE kind=? AND period_key=?');
+const selectPeriodReports=db.prepare('SELECT kind,period_key,report_json,updated_at FROM period_reports WHERE kind=? ORDER BY period_key DESC');
+const deletePeriodReportStatement=db.prepare('DELETE FROM period_reports WHERE kind=? AND period_key=?');
+const upsertPeriodReportStatement=db.prepare(`
+  INSERT INTO period_reports(kind,period_key,report_json,updated_at) VALUES(?,?,?,?)
+  ON CONFLICT(kind,period_key) DO UPDATE SET report_json=excluded.report_json,updated_at=excluded.updated_at
 `);
 
 function toTask(row){
@@ -101,5 +115,33 @@ export function saveSqliteReport(date,report){
   return report;
 }
 export function deleteSqliteReport(date){return Number(deleteReportStatement.run(String(date)).changes)>0}
+
+function normalizePeriodKind(kind){
+  const value=String(kind||'').trim();
+  if(value!=='weekly'&&value!=='monthly')throw new Error('周期类型只能是 weekly 或 monthly');
+  return value;
+}
+
+export function loadSqlitePeriodReport(kind,periodKey){
+  const row=selectPeriodReport.get(normalizePeriodKind(kind),String(periodKey));if(!row)return null;
+  try{return JSON.parse(row.report_json)}catch{return null}
+}
+export function listSqlitePeriodReports(kind){
+  return selectPeriodReports.all(normalizePeriodKind(kind)).map(row=>{
+    let headline='';
+    try{headline=String(JSON.parse(row.report_json)?.headline||'').trim()}catch{}
+    return {kind:row.kind,periodKey:row.period_key,updatedAt:row.updated_at,headline};
+  });
+}
+export function saveSqlitePeriodReport(kind,periodKey,report){
+  const normalized=normalizePeriodKind(kind);
+  const key=String(periodKey||'').trim();
+  if(!key)throw new Error('周期键不能为空');
+  upsertPeriodReportStatement.run(normalized,key,JSON.stringify(report),new Date().toISOString());
+  return report;
+}
+export function deleteSqlitePeriodReport(kind,periodKey){
+  return Number(deletePeriodReportStatement.run(normalizePeriodKind(kind),String(periodKey)).changes)>0;
+}
 
 export function closeSqlite(){db.close()}

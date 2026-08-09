@@ -5,7 +5,8 @@ android/
 *.jks
 *.keystore
 .env
-data/voice-jobs/
+data/**
+!data/.gitkeep
 data/*.db
 data/*.db-shm
 data/*.db-wal

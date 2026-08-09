@@ -2,7 +2,11 @@ export type StoredTask={id:string;title:string;assignee:string;due:string;status
 
 async function jsonRequest<T>(url:string,options?:RequestInit):Promise<T>{
   const response=await fetch(url,options);
-  const data=response.status===204?null:await response.json().catch(()=>({}));
+  if(response.status===204)return null as T;
+  const text=await response.text();
+  let data:any={};
+  if(text.trim()){try{data=JSON.parse(text)}catch{throw new Error(response.ok?'服务响应异常，请稍后重试':`文件存储请求失败（${response.status}）`)}}
+  else if(!response.ok)throw new Error(response.status>=500?'后端服务暂时不可用，请稍后重试':`文件存储请求失败（${response.status}）`);
   if(!response.ok)throw new Error(data?.message||`文件存储请求失败（${response.status}）`);
   return data as T;
 }
@@ -14,3 +18,9 @@ export const patchFileTask=(id:string,changes:Record<string,unknown>)=>jsonReque
 export const deleteFileTask=(id:string)=>jsonRequest<null>(`/api/sqlite/tasks/${encodeURIComponent(id)}`,{method:'DELETE'});
 export const loadFileDailyReport=<T>(date:string)=>jsonRequest<T|null>(`/api/sqlite/reports/${encodeURIComponent(date)}`);
 export const saveFileDailyReport=<T>(date:string,report:T)=>jsonRequest<T>(`/api/sqlite/reports/${encodeURIComponent(date)}`,{method:'PUT',headers:jsonHeaders,body:JSON.stringify({report})});
+export const deleteFileDailyReport=(date:string)=>jsonRequest<null>(`/api/sqlite/reports/${encodeURIComponent(date)}`,{method:'DELETE'});
+export const loadFilePeriodReport=<T>(kind:'weekly'|'monthly',key:string)=>jsonRequest<T|null>(`/api/sqlite/period-reports/${encodeURIComponent(kind)}/${encodeURIComponent(key)}`);
+export const saveFilePeriodReport=<T>(kind:'weekly'|'monthly',key:string,report:T)=>jsonRequest<T>(`/api/sqlite/period-reports/${encodeURIComponent(kind)}/${encodeURIComponent(key)}`,{method:'PUT',headers:jsonHeaders,body:JSON.stringify({report})});
+export const deleteFilePeriodReport=(kind:'weekly'|'monthly',key:string)=>jsonRequest<null>(`/api/sqlite/period-reports/${encodeURIComponent(kind)}/${encodeURIComponent(key)}`,{method:'DELETE'});
+export type PeriodReportMeta={kind:'weekly'|'monthly';periodKey:string;updatedAt?:string;headline?:string};
+export const listFilePeriodReports=(kind:'weekly'|'monthly')=>jsonRequest<PeriodReportMeta[]>(`/api/sqlite/period-reports/${encodeURIComponent(kind)}`);

@@ -76,3 +76,34 @@ export async function loadDailyReport(teamId:string,userId:string,date:string){
 export async function saveDailyReport(teamId:string,userId:string,date:string,report:unknown){
   if(!supabase)throw new Error('云存储尚未配置');const {error}=await supabase.from('daily_reports').upsert({team_id:teamId,user_id:userId,report_date:date,report},{onConflict:'team_id,user_id,report_date'});if(error)throw error;
 }
+
+export async function deleteDailyReport(teamId:string,userId:string,date:string){
+  if(!supabase)throw new Error('云存储尚未配置');
+  const {error}=await supabase.from('daily_reports').delete().eq('team_id',teamId).eq('user_id',userId).eq('report_date',date);
+  if(error)throw error;
+}
+
+export async function loadPeriodReport(teamId:string,userId:string,kind:'weekly'|'monthly',periodKey:string){
+  if(!supabase)return null;
+  const {data,error}=await supabase.from('period_reports').select('report').eq('team_id',teamId).eq('user_id',userId).eq('kind',kind).eq('period_key',periodKey).maybeSingle();
+  if(error)throw error;return data?.report||null;
+}
+
+export async function savePeriodReport(teamId:string,userId:string,kind:'weekly'|'monthly',periodKey:string,report:unknown){
+  if(!supabase)throw new Error('云存储尚未配置');
+  const {error}=await supabase.from('period_reports').upsert({team_id:teamId,user_id:userId,kind,period_key:periodKey,report},{onConflict:'team_id,user_id,kind,period_key'});
+  if(error)throw error;
+}
+
+export async function deletePeriodReport(teamId:string,userId:string,kind:'weekly'|'monthly',periodKey:string){
+  if(!supabase)throw new Error('云存储尚未配置');
+  const {error}=await supabase.from('period_reports').delete().eq('team_id',teamId).eq('user_id',userId).eq('kind',kind).eq('period_key',periodKey);
+  if(error)throw error;
+}
+
+export async function listPeriodReports(teamId:string,userId:string,kind:'weekly'|'monthly'){
+  if(!supabase)return [];
+  const {data,error}=await supabase.from('period_reports').select('period_key,report,updated_at').eq('team_id',teamId).eq('user_id',userId).eq('kind',kind).order('period_key',{ascending:false});
+  if(error)throw error;
+  return (data||[]).map(row=>({kind,periodKey:String(row.period_key),updatedAt:row.updated_at?String(row.updated_at):undefined,headline:String((row.report as any)?.headline||'').trim()}));
+}

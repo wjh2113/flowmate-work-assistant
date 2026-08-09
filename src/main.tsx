@@ -13,6 +13,9 @@ import './guide.css';
 import './interaction.css';
 import './settings.css';
 import './layout-fix.css';
+import './dialog.css';
+import './theme.css';
+import './polish.css';
 
 async function start(){
   await bootstrapCloud();
