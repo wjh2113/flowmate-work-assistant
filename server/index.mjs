@@ -4,9 +4,9 @@ import multer from 'multer';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { mkdir, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { Converter } from 'opencc-js/t2cn';
-import { authenticateSqliteUser, closeSqlite, createSqliteSession, createSqliteUser, deleteSqlitePeriodReport, deleteSqliteReport, deleteSqliteSession, deleteSqliteTask, getSqliteSession, getSqliteTask, getSqliteUser, listSqlitePeriodReports, listSqliteTasks, loadSqlitePeriodReport, loadSqliteReport, patchSqliteTask, saveSqlitePeriodReport, saveSqliteReport, saveSqliteTask, sqliteDisplayPath } from './sqlite-store.mjs';
+import { authenticateSqliteUser, autoClaimSqliteLegacyData, claimSqliteLegacyData, closeSqlite, createSqliteSession, createSqliteUser, deleteSqlitePeriodReport, deleteSqliteReport, deleteSqliteSession, deleteSqliteTask, getSqliteSession, getSqliteTask, getSqliteUser, getSqliteUserModelSettings, getSqliteUserPreferences, LEGACY_USER_ID, listSqlitePeriodReports, listSqliteTasks, loadSqlitePeriodReport, loadSqliteReport, patchSqliteTask, saveSqlitePeriodReport, saveSqliteReport, saveSqliteTask, saveSqliteUserModelSettings, saveSqliteUserPreferences, sqliteDisplayPath } from './sqlite-store.mjs';
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -33,9 +33,91 @@ let textProvider = normalizeTextProvider(process.env.TEXT_API_PROVIDER || inferP
 let textBaseURL = normalizeBaseURL(process.env.TEXT_API_BASE_URL || process.env.DASHSCOPE_BASE_URL || PROVIDER_PRESETS[textProvider].baseURL || BAILIAN_BASE_URL);
 let textModel = process.env.QWEN_TEXT_MODEL || (textProvider === 'deepseek' ? 'deepseek-v4-flash' : 'qwen3.7-plus');
 let asrModel = process.env.QWEN_ASR_MODEL || 'qwen3-asr-flash';
-const resolveAsrKey = () => asrApiKey || (textProvider === 'bailian' ? textApiKey : '');
 const maskKey = (key) => (key ? `••••${key.slice(-4)}` : '');
 const isValidApiKey = (key) => /^sk-[A-Za-z0-9_\-]{8,}$/.test(String(key || '').trim()) || String(key || '').trim().length >= 16;
+
+function emptyAiConfig(overrides = {}) {
+  const provider = normalizeTextProvider(overrides.provider || textProvider);
+  return {
+    source: 'user',
+    provider,
+    baseURL: resolveProviderBaseURL(provider, overrides.baseURL || (provider === textProvider ? textBaseURL : '')),
+    textApiKey: '',
+    asrApiKey: '',
+    textModel: overrides.textModel || textModel || (provider === 'deepseek' ? 'deepseek-v4-flash' : 'qwen3.7-plus'),
+    asrModel: overrides.asrModel || asrModel || 'qwen3-asr-flash',
+    resolveAsrKey: () => ''
+  };
+}
+
+/** Per-user keys only — server .env keys are never used for AI calls. */
+function resolveAiConfig(userId) {
+  const stored = userId ? getSqliteUserModelSettings(userId) : null;
+  if (!stored) return emptyAiConfig();
+  const provider = normalizeTextProvider(stored.provider);
+  const baseURL = resolveProviderBaseURL(provider, stored.baseURL);
+  const textKey = String(stored.textApiKey || '');
+  const asrStored = String(stored.asrApiKey || '');
+  const asrKey = asrStored || (provider === 'bailian' ? textKey : '');
+  return {
+    source: 'user',
+    provider,
+    baseURL,
+    textApiKey: textKey,
+    asrApiKey: asrStored,
+    textModel: stored.textModel || (provider === 'deepseek' ? 'deepseek-v4-flash' : 'qwen3.7-plus'),
+    asrModel: stored.asrModel || 'qwen3-asr-flash',
+    resolveAsrKey: () => asrKey
+  };
+}
+
+async function adoptLegacyVoiceDirs(userId) {
+  if (!userId || userId === LEGACY_USER_ID) return;
+  const target = userVoiceJobsDir(userId);
+  await mkdir(target, { recursive: true });
+  for (const sourceId of [LEGACY_USER_ID, 'anonymous']) {
+    const source = userVoiceJobsDir(sourceId);
+    if (source === target) continue;
+    let files = [];
+    try { files = await readdir(source); } catch { continue; }
+    for (const file of files) {
+      const from = path.join(source, file);
+      const to = path.join(target, file);
+      try {
+        await stat(to);
+        continue; // keep existing target file
+      } catch {}
+      try {
+        await rename(from, to);
+        if (file.endsWith('.json')) {
+          try {
+            const job = JSON.parse(await readFile(to, 'utf8'));
+            if (job?.id) {
+              job.userId = userId;
+              voiceJobs.set(job.id, job);
+              await writeFile(to, JSON.stringify(job), { encoding: 'utf8', mode: 0o600 });
+            }
+          } catch {}
+        }
+      } catch (error) {
+        console.error(`迁移历史语音目录失败 ${sourceId}/${file}`, error);
+      }
+    }
+  }
+}
+
+function applyLegacyClaim(userId) {
+  try {
+    const result = claimSqliteLegacyData(userId);
+    if (result?.claimed || result?.reason === 'empty' || result?.by === userId) {
+      void adoptLegacyVoiceDirs(userId);
+    }
+    return result;
+  } catch (error) {
+    console.error('认领历史数据失败', error);
+    return { claimed: false, reason: 'error', message: error?.message };
+  }
+}
 
 function normalizeTextProvider(value) {
   const id = String(value || '').trim().toLowerCase();
@@ -151,14 +233,18 @@ function requireUser(req, res, next) {
   next();
 }
 
-function requireTextAi(_req, res, next) {
-  if (!textApiKey) return res.status(503).json({ error: 'AI_NOT_CONFIGURED', message: '服务端尚未配置任务理解 API Key' });
+function requireTextAi(req, res, next) {
+  const ai = resolveAiConfig(req.user?.id);
+  if (!ai.textApiKey) return res.status(503).json({ error: 'AI_NOT_CONFIGURED', message: '请先在「设置 → 大模型」配置任务理解 API Key' });
+  req.ai = ai;
   next();
 }
 
-function requireVoiceAi(_req, res, next) {
-  if (!resolveAsrKey()) return res.status(503).json({ error: 'ASR_NOT_CONFIGURED', message: '服务端尚未配置语音识别 API Key' });
-  if (!textApiKey) return res.status(503).json({ error: 'AI_NOT_CONFIGURED', message: '服务端尚未配置任务理解 API Key' });
+function requireVoiceAi(req, res, next) {
+  const ai = resolveAiConfig(req.user?.id);
+  if (!ai.textApiKey) return res.status(503).json({ error: 'AI_NOT_CONFIGURED', message: '请先在「设置 → 大模型」配置任务理解 API Key' });
+  if (!ai.resolveAsrKey()) return res.status(503).json({ error: 'ASR_NOT_CONFIGURED', message: '请先在「设置 → 大模型」配置语音识别 API Key' });
+  req.ai = ai;
   next();
 }
 
@@ -319,19 +405,28 @@ function normalizeParsedTasks(parsed, transcript) {
   return tasks.length?tasks:[normalizeParsedTask(parsed?.task||parsed,transcript)];
 }
 
-async function parseTasks(transcript) {
-  const data = await qwenChat({
+function withAi(ai, opts = {}) {
+  return {
+    ...opts,
+    model: opts.model ?? ai.textModel,
+    apiKey: opts.apiKey ?? ai.textApiKey,
+    baseURL: opts.baseURL ?? ai.baseURL
+  };
+}
+
+async function parseTasks(transcript, ai) {
+  const data = await qwenChat(withAi(ai, {
     messages: [
       { role: 'system', content: '你是中文工作任务拆解助手。把一段口语整理为一个或多个独立可执行任务。一句话中出现多个并列目标、不同课程、不同交付物或先后要完成的事项时，必须拆成多项；例如“学习日语直播课、英语雅思和AI练习”应拆成3项。不要把同一个目标的普通操作步骤过度拆分。最多10项，不要虚构信息；未提负责人时写“我”，未提日期时写“今天”。每个标题只保留一个动作和一个清晰对象。根据各任务复杂度分别估算时长。只输出合法 JSON，不要 Markdown。JSON结构：tasks为数组，每项包含title字符串、assignee字符串、due简短中文、priority为高/中/低、confidence为0到1数字、estimatedMinutes为15到480之间的整数分钟数。' },
       { role: 'user', content: `当前日期：${new Date().toLocaleDateString('zh-CN')}\n当前用户：我\n语音内容：${transcript}` }
     ],
     responseFormat: { type: 'json_object' }
-  });
+  }));
   const parsed = parseJSON(messageText(data));
   return normalizeParsedTasks(parsed, transcript);
 }
 
-async function parseVoiceCommand(transcript, availableTasks = [], reports = {}) {
+async function parseVoiceCommand(transcript, availableTasks = [], reports = {}, ai) {
   const tasks = availableTasks.slice(0, 100).map(task => ({
     id: String(task.id || ''), title: String(task.title || ''), assignee: String(task.assignee || '我'),
     due: String(task.due || '今天'), status: ['todo','doing','done'].includes(task.status) ? task.status : 'todo',
@@ -343,13 +438,13 @@ async function parseVoiceCommand(transcript, availableTasks = [], reports = {}) 
     weekly: Boolean(reports?.weekly),
     monthly: Boolean(reports?.monthly)
   };
-  const data = await qwenChat({
+  const data = await qwenChat(withAi(ai, {
     messages: [
       { role: 'system', content: '你是中文工作助手的统一语音指令解析器。先判断用户意图属于哪一类：1) edit_report：修改今日复盘/日报、本周周报、本月月报（含小结、亮点、风险、明日/下周/下月计划等表述）；2) create：新建待办任务；3) update：修改已有任务；4) clarify：目标不明确。提及“今日复盘/今日小结/日报/明天建议”→reportKind=daily；“周报/本周复盘/下周计划”→weekly；“月报/本月复盘/下月计划”→monthly。若同时像任务又像复盘，优先看是否明确点名复盘/周报/月报。edit_report 时 instruction 写清具体修改意见。修改任务时只能使用候选任务真实 id，不明确则 clarify。新建任务最多10项。只输出合法JSON，不要Markdown。JSON字段：action为create/update/clarify/edit_report；reportKind为daily/weekly/monthly或空；instruction字符串；updates数组(targetTaskId,changes)；tasks新建数组；message简短中文；confidence为0到1。' },
       { role: 'user', content: `当前日期：${new Date().toLocaleDateString('zh-CN')}\n当前用户：我\n已有复盘：${JSON.stringify(reportMeta)}\n候选任务：${JSON.stringify(tasks)}\n语音指令：${transcript}` }
     ],
     responseFormat: { type: 'json_object' }
-  });
+  }));
   const parsed = parseJSON(messageText(data));
   if (parsed.action === 'edit_report') {
     const reportKind = ['daily', 'weekly', 'monthly'].includes(parsed.reportKind) ? parsed.reportKind : '';
@@ -383,15 +478,15 @@ async function parseVoiceCommand(transcript, availableTasks = [], reports = {}) 
   return { action: 'create', targetTaskId: null, changes: {}, tasks: createdTasks, task: createdTasks[0], message: String(parsed.message || `创建${createdTasks.length}项任务`), confidence: Math.max(0, Math.min(1, Number(parsed.confidence) || Number(createdTasks[0]?.confidence) || 0.8)) };
 }
 
-async function transcribeAudio(buffer, mime = 'audio/webm', availableTasks = [], onStage = async()=>{}, reports = {}) {
+async function transcribeAudio(buffer, mime = 'audio/webm', availableTasks = [], onStage = async()=>{}, reports = {}, ai) {
   await onStage('transcribing');
-  const apiKey = resolveAsrKey();
+  const apiKey = ai.resolveAsrKey();
   if (!apiKey) throw new Error('尚未配置语音识别 API Key（非百炼文本提供商时需单独填写百炼 ASR 密钥）');
   const audio = `data:${mime};base64,${buffer.toString('base64')}`;
   const data = await qwenChat({
     apiKey,
     baseURL: BAILIAN_BASE_URL,
-    model: asrModel,
+    model: ai.asrModel,
     messages: [
       { role: 'user', content: [{ type: 'input_audio', input_audio: { data: audio } }] }
     ],
@@ -400,7 +495,7 @@ async function transcribeAudio(buffer, mime = 'audio/webm', availableTasks = [],
   const transcript = convertToSimplified(messageText(data).trim());
   if (!transcript) throw new Error('语音模型没有返回转写内容');
   await onStage('understanding',{transcript});
-  const command = await parseVoiceCommand(transcript, availableTasks, reports);
+  const command = await parseVoiceCommand(transcript, availableTasks, reports, ai);
   if (command.action === 'edit_report') return { transcript, command, tasks: [], task: null };
   if (command.action === 'create') return { transcript, command, tasks: command.tasks || [], task: command.task || null };
   return { transcript, command, tasks: [], task: null };
@@ -569,73 +664,106 @@ async function recordTextVoiceJob({ userId, transcript, command, tasks = [], edi
   return job;
 }
 
-async function purgeExpiredVoiceJobs(retentionDays = jobSettings.voiceRetention.retentionDays) {
+async function purgeExpiredVoiceJobsInDir(dir, retentionDays) {
   const cutoff = Date.now() - voiceRetentionMs(retentionDays);
   let removed = 0;
+  let files = [];
+  try {
+    files = await readdir(dir);
+  } catch {
+    return 0;
+  }
+  for (const file of files) {
+    const filePath = path.join(dir, file);
+    try {
+      if (file.endsWith('.json')) {
+        const job = JSON.parse(await readFile(filePath, 'utf8'));
+        const ts = Date.parse(job?.createdAt || job?.updatedAt || '') || 0;
+        if (!ts || ts >= cutoff) continue;
+        if (job?.id) voiceJobs.delete(job.id);
+        await unlink(filePath).catch(() => {});
+        if (job?.audioFile) await unlink(path.join(dir, job.audioFile)).catch(() => {});
+        removed += 1;
+      } else {
+        const info = await stat(filePath);
+        if (info.mtimeMs < cutoff) {
+          await unlink(filePath).catch(() => {});
+          removed += 1;
+        }
+      }
+    } catch (error) {
+      console.error(`清理语音指令失败 ${file}`, error);
+    }
+  }
+  return removed;
+}
+
+async function purgeExpiredVoiceJobs(retentionDays = jobSettings.voiceRetention.retentionDays, userId = null) {
+  const days = Math.max(1, Number(retentionDays) || 7);
+  let removed = 0;
   await mkdir(voiceJobsDir, { recursive: true });
+  if (userId) {
+    removed += await purgeExpiredVoiceJobsInDir(userVoiceJobsDir(userId), days);
+    return { removed, retentionDays: days, userId };
+  }
   const entries = await readdir(voiceJobsDir, { withFileTypes: true });
   for (const entry of entries) {
     const full = path.join(voiceJobsDir, entry.name);
     try {
       if (entry.isDirectory()) {
-        const files = await readdir(full);
-        for (const file of files) {
-          const filePath = path.join(full, file);
-          try {
-            if (file.endsWith('.json')) {
-              const job = JSON.parse(await readFile(filePath, 'utf8'));
-              const ts = Date.parse(job?.createdAt || job?.updatedAt || '') || 0;
-              if (!ts || ts >= cutoff) continue;
-              if (job?.id) voiceJobs.delete(job.id);
-              await unlink(filePath).catch(() => {});
-              if (job?.audioFile) await unlink(path.join(full, job.audioFile)).catch(() => {});
-              removed += 1;
-            } else {
-              const info = await stat(filePath);
-              if (info.mtimeMs < cutoff) {
-                await unlink(filePath).catch(() => {});
-                removed += 1;
-              }
-            }
-          } catch (error) {
-            console.error(`清理语音指令失败 ${file}`, error);
-          }
-        }
+        const prefs = getSqliteUserPreferences(entry.name);
+        const userDays = prefs?.voiceRetention?.retentionDays || days;
+        removed += await purgeExpiredVoiceJobsInDir(full, userDays);
         continue;
       }
-      // legacy flat files
+      // legacy flat files — only when sweeping all users
       if (entry.name.endsWith('.json')) {
         const job = JSON.parse(await readFile(full, 'utf8'));
         const ts = Date.parse(job?.createdAt || job?.updatedAt || '') || 0;
-        if (!ts || ts >= cutoff) continue;
+        if (!ts || ts >= Date.now() - voiceRetentionMs(days)) continue;
         if (job?.id) voiceJobs.delete(job.id);
         await unlink(full).catch(() => {});
         if (job?.audioFile) await unlink(path.join(voiceJobsDir, job.audioFile)).catch(() => {});
         removed += 1;
-      } else {
-        const info = await stat(full);
-        if (info.mtimeMs < cutoff) {
-          await unlink(full).catch(() => {});
-          removed += 1;
-        }
       }
     } catch (error) {
       console.error(`清理语音指令失败 ${entry.name}`, error);
     }
   }
-  return { removed, retentionDays: Math.max(1, Number(retentionDays) || 7) };
+  return { removed, retentionDays: days };
 }
 
-async function runVoiceRetentionJobIfDue(force = false) {
+function userVoiceRetention(userId) {
+  const prefs = userId ? getSqliteUserPreferences(userId) : null;
+  if (prefs?.voiceRetention) return normalizeVoiceRetentionSettings(prefs.voiceRetention);
+  return normalizeVoiceRetentionSettings(jobSettings.voiceRetention);
+}
+
+async function runVoiceRetentionJobIfDue(force = false, userId = null) {
+  if (userId) {
+    const schedule = userVoiceRetention(userId);
+    if (!force && !schedule.enabled) return null;
+    const now = new Date();
+    const time = force ? (schedule.times[0] || '03:00') : latestDueJobTime(schedule.times, now);
+    if (!time) return null;
+    const dateKey = localDateKey(now);
+    const slotKey = `voiceRetention:${userId}:${dateKey}-${time.replace(':', '')}`;
+    if (!force && jobSettings.doneSlots?.[slotKey]) return null;
+    const result = await purgeExpiredVoiceJobs(schedule.retentionDays, userId);
+    jobSettings.doneSlots = { ...(jobSettings.doneSlots || {}), [slotKey]: new Date().toISOString() };
+    await persistJobSettings();
+    return { ...result, slotKey, time, voiceRetention: schedule };
+  }
+  // Server sweep: each user dir with that user's retention (fallback to default)
   const schedule = jobSettings.voiceRetention;
   if (!force && !schedule.enabled) return null;
   const now = new Date();
   const time = force ? (schedule.times[0] || '03:00') : latestDueJobTime(schedule.times, now);
   if (!time) return null;
   const dateKey = localDateKey(now);
-  const slotKey = `voiceRetention:${dateKey}-${time.replace(':', '')}`;
+  const slotKey = `voiceRetention:all:${dateKey}-${time.replace(':', '')}`;
   if (!force && jobSettings.doneSlots?.[slotKey]) return null;
-  const result = await purgeExpiredVoiceJobs(schedule.retentionDays);
+  const result = await purgeExpiredVoiceJobs(schedule.retentionDays, null);
   const doneSlots = { ...(jobSettings.doneSlots || {}), [slotKey]: new Date().toISOString() };
   const cutoff = Date.now() - 3 * 24 * 60 * 60 * 1000;
   for (const [key, value] of Object.entries(doneSlots)) {
@@ -675,14 +803,17 @@ async function processVoiceJob(id) {
   if (!job || runningVoiceJobs.has(id) || job.status === 'completed') return;
   runningVoiceJobs.add(id);
   try {
+    const ai = resolveAiConfig(job.userId);
+    if (!ai.textApiKey) throw new Error('请先在「设置 → 大模型」配置任务理解 API Key');
     job.status = 'processing';
     job.error = '';
     let result;
     if (job.audioFile) {
+      if (!ai.resolveAsrKey()) throw new Error('请先在「设置 → 大模型」配置语音识别 API Key');
       job.stage = 'transcribing';
       await persistVoiceJob(job);
       const buffer = await readFile(voiceAudioPath(job));
-      result = await transcribeAudio(buffer, job.mime, job.availableTasks || [],async(stage,details={})=>{job.stage=stage;if(details.transcript)job.transcript=details.transcript;await persistVoiceJob(job)}, job.reports || {});
+      result = await transcribeAudio(buffer, job.mime, job.availableTasks || [],async(stage,details={})=>{job.stage=stage;if(details.transcript)job.transcript=details.transcript;await persistVoiceJob(job)}, job.reports || {}, ai);
     } else {
       job.stage = 'understanding';
       await persistVoiceJob(job);
@@ -690,7 +821,7 @@ async function processVoiceJob(id) {
       if (!transcript) throw new Error('指令内容不能为空');
       job.transcript = transcript;
       await persistVoiceJob(job);
-      const command = await parseVoiceCommand(transcript, job.availableTasks || [], job.reports || {});
+      const command = await parseVoiceCommand(transcript, job.availableTasks || [], job.reports || {}, ai);
       if (command.action === 'edit_report') result = { transcript, command, tasks: [], task: null };
       else if (command.action === 'create') result = { transcript, command, tasks: command.tasks || [], task: command.task || null };
       else result = { transcript, command, tasks: [], task: null };
@@ -703,7 +834,7 @@ async function processVoiceJob(id) {
       await persistVoiceJob(job);
       const kind = result.command.reportKind;
       const source = job.reports?.[kind];
-      const edited = await editReportContent(kind, source, result.command.instruction || result.transcript);
+      const edited = await editReportContent(kind, source, result.command.instruction || result.transcript, ai);
       if (job.cancelled) return;
       job.stage = 'saving';
       job.editedReport = edited;
@@ -767,15 +898,28 @@ async function recoverVoiceJobs() {
   }
 }
 
-function reportEditJobPath(id) {
-  return path.join(reportEditJobsDir, `${id}.json`);
+function userReportEditJobsDir(userId) {
+  return path.join(reportEditJobsDir, String(userId || 'anonymous'));
+}
+
+function reportEditJobPath(jobOrUserId, id) {
+  if (jobOrUserId && typeof jobOrUserId === 'object') {
+    const job = jobOrUserId;
+    return path.join(userReportEditJobsDir(job.userId), `${job.id}.json`);
+  }
+  return path.join(userReportEditJobsDir(jobOrUserId), `${id}.json`);
+}
+
+function reportEditAudioPath(job) {
+  return path.join(userReportEditJobsDir(job.userId), job.audioFile);
 }
 
 async function persistReportEditJob(job) {
   job.updatedAt = new Date().toISOString();
   reportEditJobs.set(job.id, job);
-  await mkdir(reportEditJobsDir, { recursive: true });
-  await writeFile(reportEditJobPath(job.id), JSON.stringify(job), { encoding: 'utf8', mode: 0o600 });
+  const dir = userReportEditJobsDir(job.userId);
+  await mkdir(dir, { recursive: true });
+  await writeFile(reportEditJobPath(job), JSON.stringify(job), { encoding: 'utf8', mode: 0o600 });
 }
 
 function publicReportEditJob(job) {
@@ -788,30 +932,30 @@ function isClearReportInstruction(instruction = '') {
   return /(清空|清除|删掉|删除|重置).{0,12}(复盘|日报|周报|月报|内容|全部|小结)?|(复盘|日报|周报|月报|小结).{0,12}(清空|清除|删掉|删除|重置)|全部清空|清空全部|不要复盘|取消复盘/.test(text);
 }
 
-async function editReportContent(kind, report, instruction) {
+async function editReportContent(kind, report, instruction, ai) {
   if (isClearReportInstruction(instruction)) return null;
   const schema = kind === 'daily'
     ? '保持日报结构：headline、summary、completed字符串数组、risks字符串数组、tomorrow对象数组(title,reason,priority高/中/低,suggestedTime)。若用户要求清空/删除整份复盘，输出 {"cleared":true}。'
     : '保持周/月报结构：headline、summary、highlights字符串数组、risks字符串数组、next对象数组(title,reason,priority高/中/低,suggestedTime)。若用户要求清空/删除整份复盘，输出 {"cleared":true}。';
-  const data = await qwenChat({
+  const data = await qwenChat(withAi(ai, {
     messages: [
       { role: 'system', content: `你是中文工作复盘编辑助手。根据用户修改意见，在现有复盘 JSON 上做最小必要修改，保留未提及内容。不要虚构成果。只输出合法 JSON，不要 Markdown。${schema}` },
       { role: 'user', content: `复盘类型：${kind}\n现有复盘：${JSON.stringify(report)}\n修改意见：${instruction}` }
     ],
     responseFormat: { type: 'json_object' }
-  });
+  }));
   const edited = parseJSON(messageText(data));
   if (edited?.cleared === true) return null;
   return kind === 'daily' ? normalizeDailyReport(edited) : normalizePeriodReport(edited, 8);
 }
 
-async function asrTranscript(buffer, mime = 'audio/webm') {
-  const apiKey = resolveAsrKey();
+async function asrTranscript(buffer, mime = 'audio/webm', ai) {
+  const apiKey = ai.resolveAsrKey();
   if (!apiKey) throw new Error('尚未配置语音识别 API Key（非百炼文本提供商时需单独填写百炼 ASR 密钥）');
   const data = await qwenChat({
     apiKey,
     baseURL: BAILIAN_BASE_URL,
-    model: asrModel,
+    model: ai.asrModel,
     messages: [{ role: 'user', content: [{ type: 'input_audio', input_audio: { data: `data:${mime};base64,${buffer.toString('base64')}` } }] }],
     extra: { stream: false, asr_options: { language: 'zh', enable_itn: true } }
   });
@@ -825,14 +969,17 @@ async function processReportEditJob(id) {
   if (!job || runningReportEditJobs.has(id) || job.status === 'completed') return;
   runningReportEditJobs.add(id);
   try {
+    const ai = resolveAiConfig(job.userId);
+    if (!ai.textApiKey) throw new Error('请先在「设置 → 大模型」配置任务理解 API Key');
     job.status = 'processing';
     job.stage = job.audioFile ? 'transcribing' : 'understanding';
     job.error = '';
     await persistReportEditJob(job);
     let instruction = String(job.instruction || '').trim();
     if (job.audioFile) {
-      const buffer = await readFile(path.join(reportEditJobsDir, job.audioFile));
-      const spoken = await asrTranscript(buffer, job.mime || 'audio/webm');
+      if (!ai.resolveAsrKey()) throw new Error('请先在「设置 → 大模型」配置语音识别 API Key');
+      const buffer = await readFile(reportEditAudioPath(job));
+      const spoken = await asrTranscript(buffer, job.mime || 'audio/webm', ai);
       if (job.cancelled) return;
       job.transcript = spoken;
       instruction = instruction ? `${instruction}\n${spoken}` : spoken;
@@ -841,7 +988,7 @@ async function processReportEditJob(id) {
     }
     if (!instruction) throw new Error('没有识别到可执行的修改意见');
     job.instruction = instruction;
-    const report = await editReportContent(job.kind, job.sourceReport, instruction);
+    const report = await editReportContent(job.kind, job.sourceReport, instruction, ai);
     if (job.cancelled) return;
     job.stage = 'saving';
     job.report = report;
@@ -850,7 +997,7 @@ async function processReportEditJob(id) {
     job.status = 'completed';
     job.stage = 'completed';
     await persistReportEditJob(job);
-    if (job.audioFile) await unlink(path.join(reportEditJobsDir, job.audioFile)).catch(() => {});
+    if (job.audioFile) await unlink(reportEditAudioPath(job)).catch(() => {});
   } catch (error) {
     if (job.cancelled) return;
     console.error(error);
@@ -865,36 +1012,51 @@ async function processReportEditJob(id) {
 
 async function recoverReportEditJobs() {
   await mkdir(reportEditJobsDir, { recursive: true });
-  const files = await readdir(reportEditJobsDir);
-  for (const file of files.filter(name => name.endsWith('.json'))) {
+  const loadJobFile = async (filePath, label) => {
     try {
-      const job = JSON.parse(await readFile(path.join(reportEditJobsDir, file), 'utf8'));
-      if (!job?.id) continue;
+      const job = JSON.parse(await readFile(filePath, 'utf8'));
+      if (!job?.id) return;
+      if (!job.userId) job.userId = 'anonymous';
       reportEditJobs.set(job.id, job);
       if (job.status === 'queued' || job.status === 'processing') {
         job.status = 'queued';
         setImmediate(() => void processReportEditJob(job.id));
       }
     } catch (error) {
-      console.error(`无法恢复复盘改稿任务 ${file}`, error);
+      console.error(`无法恢复复盘改稿任务 ${label}`, error);
+    }
+  };
+  const entries = await readdir(reportEditJobsDir, { withFileTypes: true });
+  for (const entry of entries) {
+    const full = path.join(reportEditJobsDir, entry.name);
+    if (entry.isDirectory()) {
+      const files = await readdir(full);
+      for (const file of files.filter(name => name.endsWith('.json'))) await loadJobFile(path.join(full, file), `${entry.name}/${file}`);
+    } else if (entry.name.endsWith('.json')) {
+      await loadJobFile(full, entry.name);
     }
   }
 }
 
-app.get('/api/health', (_req, res) => res.json({
-  ai: Boolean(textApiKey),
-  asr: Boolean(resolveAsrKey()),
-  textConfigured: Boolean(textApiKey),
-  asrConfigured: Boolean(asrApiKey),
-  asrUsesTextKey: Boolean(!asrApiKey && textProvider === 'bailian' && textApiKey),
-  auth: cloudMode() ? 'supabase' : 'local',
-  provider: providerLabel(),
-  textProvider,
-  baseURL: textBaseURL,
-  textModel,
-  transcriptionModel: asrModel,
-  storage: { mode: 'sqlite', file: sqliteDisplayPath }
-}));
+app.get('/api/health', (_req, res) => {
+  const defaults = emptyAiConfig();
+  res.json({
+    ai: false,
+    asr: false,
+    textConfigured: false,
+    asrConfigured: false,
+    asrUsesTextKey: false,
+    requiresUserModel: true,
+    auth: cloudMode() ? 'supabase' : 'local',
+    provider: providerLabel(defaults.provider),
+    textProvider: defaults.provider,
+    baseURL: defaults.baseURL,
+    textModel: defaults.textModel,
+    transcriptionModel: defaults.asrModel,
+    modelScope: 'user',
+    storage: { mode: 'sqlite', file: sqliteDisplayPath }
+  });
+});
 
 app.post('/api/auth/register', (req, res) => {
   if (cloudMode()) return res.status(400).json({ message: '当前已启用云端登录，请使用邮箱登录链接' });
@@ -902,7 +1064,8 @@ app.post('/api/auth/register', (req, res) => {
     const user = createSqliteUser({ email: req.body?.email, password: req.body?.password, name: req.body?.name });
     const session = createSqliteSession(user.id, SESSION_DAYS);
     setSessionCookie(res, session.id, session.expiresAt, req);
-    res.status(201).json({ user });
+    const legacy = applyLegacyClaim(user.id);
+    res.status(201).json({ user, legacy });
   } catch (error) {
     res.status(400).json({ message: error?.message || '注册失败' });
   }
@@ -914,7 +1077,8 @@ app.post('/api/auth/login', (req, res) => {
     const user = authenticateSqliteUser(req.body?.email, req.body?.password);
     const session = createSqliteSession(user.id, SESSION_DAYS);
     setSessionCookie(res, session.id, session.expiresAt, req);
-    res.json({ user });
+    const legacy = applyLegacyClaim(user.id);
+    res.json({ user, legacy });
   } catch (error) {
     res.status(401).json({ message: error?.message || '登录失败' });
   }
@@ -1052,20 +1216,26 @@ app.delete('/api/settings/cloud', requireSettingsAccess, async (_req, res) => {
   }
 });
 
-function modelSettingsPublic() {
+function modelSettingsPublic(userId) {
+  const ai = resolveAiConfig(userId);
+  const textKey = ai.textApiKey;
+  const asrKey = ai.asrApiKey;
   return {
-    configured: Boolean(textApiKey),
-    textConfigured: Boolean(textApiKey),
-    asrConfigured: Boolean(asrApiKey),
-    asrUsesTextKey: Boolean(!asrApiKey && textProvider === 'bailian' && textApiKey),
-    maskedTextKey: maskKey(textApiKey),
-    maskedAsrKey: maskKey(asrApiKey),
-    maskedKey: maskKey(textApiKey),
-    provider: textProvider,
-    providerLabel: providerLabel(),
-    baseURL: textBaseURL,
-    textModel,
-    asrModel,
+    configured: Boolean(textKey),
+    textConfigured: Boolean(textKey),
+    asrConfigured: Boolean(asrKey),
+    asrUsesTextKey: Boolean(!asrKey && ai.provider === 'bailian' && textKey),
+    maskedTextKey: maskKey(textKey),
+    maskedAsrKey: maskKey(asrKey),
+    maskedKey: maskKey(textKey),
+    provider: ai.provider,
+    providerLabel: providerLabel(ai.provider),
+    baseURL: ai.baseURL,
+    textModel: ai.textModel,
+    asrModel: ai.asrModel,
+    scope: 'user',
+    source: 'user',
+    requiresUserKey: true,
     presets: Object.values(PROVIDER_PRESETS).map(item => ({
       id: item.id,
       label: item.label,
@@ -1076,7 +1246,10 @@ function modelSettingsPublic() {
   };
 }
 
-app.get('/api/settings/model', requireSettingsAccess, (_req, res) => res.json(modelSettingsPublic()));
+app.get('/api/settings/model', requireUser, (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json(modelSettingsPublic(req.user.id));
+});
 
 async function probeBailianKey(apiKey) {
   const controller = new AbortController();
@@ -1109,25 +1282,26 @@ async function testTextModelConnection(apiKey, model, baseURL) {
   return String(messageText(data) || '').trim().slice(0, 40);
 }
 
-function parseModelSettingsBody(body = {}) {
-  const nextProvider = normalizeTextProvider(body.provider || body.textProvider || textProvider);
-  const nextBaseURL = resolveProviderBaseURL(nextProvider, body.baseURL ?? body.textBaseURL ?? (nextProvider === textProvider ? textBaseURL : ''));
+function parseModelSettingsBody(body = {}, currentAi = resolveAiConfig(null)) {
+  const nextProvider = normalizeTextProvider(body.provider || body.textProvider || currentAi.provider);
+  const nextBaseURL = resolveProviderBaseURL(nextProvider, body.baseURL ?? body.textBaseURL ?? (nextProvider === currentAi.provider ? currentAi.baseURL : ''));
   const nextTextKey = String(body.textApiKey || body.apiKey || '').trim();
   const nextAsrKey = String(body.asrApiKey || '').trim();
   const clearAsrKey = Boolean(body.clearAsrKey);
-  const nextTextModel = normalizeTextModelName(body.textModel || textModel);
-  const nextAsrModel = String(body.asrModel || asrModel).trim();
+  const nextTextModel = normalizeTextModelName(body.textModel || currentAi.textModel);
+  const nextAsrModel = String(body.asrModel || currentAi.asrModel).trim();
   if (!ALLOWED_ASR_MODELS.includes(nextAsrModel)) throw new Error('不支持所选语音识别模型');
   if (nextTextKey && !isValidApiKey(nextTextKey)) throw new Error('任务理解 API Key 格式不正确');
   if (nextAsrKey && !isValidApiKey(nextAsrKey)) throw new Error('语音识别 API Key 格式不正确');
   return { nextProvider, nextBaseURL, nextTextKey, nextAsrKey, clearAsrKey, nextTextModel, nextAsrModel };
 }
 
-app.post('/api/settings/model/test', requireSettingsAccess, async (req, res) => {
+app.post('/api/settings/model/test', requireUser, async (req, res) => {
   try {
-    const parsed = parseModelSettingsBody(req.body);
-    const candidateTextKey = parsed.nextTextKey || textApiKey;
-    const candidateAsrKey = parsed.clearAsrKey ? '' : (parsed.nextAsrKey || asrApiKey);
+    const current = resolveAiConfig(req.user.id);
+    const parsed = parseModelSettingsBody(req.body, current);
+    const candidateTextKey = parsed.nextTextKey || current.textApiKey;
+    const candidateAsrKey = parsed.clearAsrKey ? '' : (parsed.nextAsrKey || current.asrApiKey);
     if (!candidateTextKey) return res.status(400).json({ message: '请先填写任务理解 API Key，或保存后再测试' });
 
     const reply = await testTextModelConnection(candidateTextKey, parsed.nextTextModel, parsed.nextBaseURL);
@@ -1160,26 +1334,26 @@ app.post('/api/settings/model/test', requireSettingsAccess, async (req, res) => 
   }
 });
 
-app.put('/api/settings/model', requireSettingsAccess, async (req, res) => {
+app.put('/api/settings/model', requireUser, async (req, res) => {
   try {
-    const parsed = parseModelSettingsBody(req.body);
-    if (!textApiKey && !parsed.nextTextKey) return res.status(400).json({ message: '首次配置必须填写任务理解 API Key' });
-    if (parsed.nextTextKey) textApiKey = parsed.nextTextKey;
-    if (parsed.clearAsrKey) asrApiKey = '';
-    else if (parsed.nextAsrKey) asrApiKey = parsed.nextAsrKey;
-    textProvider = parsed.nextProvider;
-    textBaseURL = parsed.nextBaseURL;
-    textModel = parsed.nextTextModel;
-    asrModel = parsed.nextAsrModel;
-    await persistEnv({
-      TEXT_API_PROVIDER: textProvider,
-      TEXT_API_BASE_URL: textBaseURL,
-      ...(parsed.nextTextKey ? { DASHSCOPE_API_KEY: parsed.nextTextKey, DASHSCOPE_TEXT_API_KEY: parsed.nextTextKey } : {}),
-      DASHSCOPE_ASR_API_KEY: asrApiKey,
-      QWEN_TEXT_MODEL: textModel,
-      QWEN_ASR_MODEL: asrModel
+    const stored = getSqliteUserModelSettings(req.user.id);
+    const current = resolveAiConfig(req.user.id);
+    const parsed = parseModelSettingsBody(req.body, current);
+    const nextTextKey = parsed.nextTextKey || stored?.textApiKey || '';
+    if (!nextTextKey) return res.status(400).json({ message: '请填写任务理解 API Key（每位用户需单独配置，不再使用服务端 .env）' });
+    let nextAsrKey = '';
+    if (parsed.clearAsrKey) nextAsrKey = '';
+    else if (parsed.nextAsrKey) nextAsrKey = parsed.nextAsrKey;
+    else nextAsrKey = stored?.asrApiKey || '';
+    saveSqliteUserModelSettings(req.user.id, {
+      provider: parsed.nextProvider,
+      baseURL: parsed.nextBaseURL,
+      textApiKey: nextTextKey,
+      asrApiKey: nextAsrKey,
+      textModel: parsed.nextTextModel,
+      asrModel: parsed.nextAsrModel
     });
-    res.json({ ...modelSettingsPublic(), message: '模型设置已保存并立即生效' });
+    res.json({ ...modelSettingsPublic(req.user.id), message: '你的模型配置已保存并立即生效' });
   } catch (error) {
     const status = /不合法|不正确|不能为空|不支持/.test(String(error?.message || '')) ? 400 : 500;
     res.status(status).json({ message: error?.message || '模型设置保存失败' });
@@ -1201,11 +1375,11 @@ app.post('/api/parse-task-text', requireUser, requireTextAi, async (req, res) =>
         monthly: parsed.monthly && typeof parsed.monthly === 'object' ? parsed.monthly : null
       };
     } catch {}
-    const command = await parseVoiceCommand(transcript, availableTasks, reports);
+    const command = await parseVoiceCommand(transcript, availableTasks, reports, req.ai);
     if (command.action === 'edit_report') {
       const kind = command.reportKind;
       const source = reports?.[kind];
-      const editedReport = await editReportContent(kind, source, command.instruction || transcript);
+      const editedReport = await editReportContent(kind, source, command.instruction || transcript, req.ai);
       const cleared = editedReport == null;
       const nextCommand = cleared
         ? { ...command, message: command.message || (kind === 'weekly' ? '周报已清空' : kind === 'monthly' ? '月报已清空' : '今日复盘已清空') }
@@ -1228,15 +1402,54 @@ app.post('/api/parse-task-text', requireUser, requireTextAi, async (req, res) =>
   }
 });
 
-app.get('/api/settings/jobs', (_req, res) => {
-  res.json({ voiceRetention: jobSettings.voiceRetention });
+function publicUserPreferences(userId) {
+  const prefs = getSqliteUserPreferences(userId) || { avatar: '', autoSchedule: null, voiceRetention: null };
+  return {
+    avatar: prefs.avatar || '',
+    autoSchedule: prefs.autoSchedule || null,
+    voiceRetention: prefs.voiceRetention ? normalizeVoiceRetentionSettings(prefs.voiceRetention) : userVoiceRetention(userId)
+  };
+}
+
+app.get('/api/settings/profile', requireUser, (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json(publicUserPreferences(req.user.id));
 });
 
-app.put('/api/settings/jobs', async (req, res) => {
+app.put('/api/settings/profile', requireUser, (req, res) => {
   try {
-    jobSettings.voiceRetention = normalizeVoiceRetentionSettings(req.body?.voiceRetention || req.body);
-    await persistJobSettings();
-    res.json({ voiceRetention: jobSettings.voiceRetention, message: '后台作业设置已保存' });
+    const patch = {};
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'avatar')) {
+      const avatar = String(req.body.avatar || '');
+      if (avatar && !/^data:image\/(png|jpeg|jpg|webp|gif);base64,/i.test(avatar)) {
+        return res.status(400).json({ message: '头像格式不正确' });
+      }
+      patch.avatar = avatar;
+    }
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'autoSchedule')) {
+      patch.autoSchedule = req.body.autoSchedule && typeof req.body.autoSchedule === 'object' ? req.body.autoSchedule : null;
+    }
+    saveSqliteUserPreferences(req.user.id, patch);
+    res.json({ ...publicUserPreferences(req.user.id), message: '个人设置已保存' });
+  } catch (error) {
+    res.status(400).json({ message: error?.message || '个人设置保存失败' });
+  }
+});
+
+app.get('/api/settings/jobs', requireUser, (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json({ voiceRetention: userVoiceRetention(req.user.id), scope: 'user' });
+});
+
+app.put('/api/settings/jobs', requireUser, async (req, res) => {
+  try {
+    const voiceRetention = normalizeVoiceRetentionSettings(req.body?.voiceRetention || req.body);
+    const autoSchedule = req.body?.autoSchedule && typeof req.body.autoSchedule === 'object' ? req.body.autoSchedule : undefined;
+    saveSqliteUserPreferences(req.user.id, {
+      voiceRetention,
+      ...(autoSchedule !== undefined ? { autoSchedule } : {})
+    });
+    res.json({ voiceRetention, message: '你的后台作业设置已保存' });
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: '保存后台作业设置失败' });
@@ -1245,23 +1458,26 @@ app.put('/api/settings/jobs', async (req, res) => {
 
 app.post('/api/voice-jobs/purge', requireUser, async (req, res) => {
   try {
+    const schedule = userVoiceRetention(req.user.id);
     const days = Number(req.body?.retentionDays);
+    const retentionDays = Number.isInteger(days) && days >= 1 && days <= 90 ? days : schedule.retentionDays;
     if (Number.isInteger(days) && days >= 1 && days <= 90) {
-      jobSettings.voiceRetention = { ...jobSettings.voiceRetention, retentionDays: days };
+      saveSqliteUserPreferences(req.user.id, { voiceRetention: { ...schedule, retentionDays } });
     }
     const force = Boolean(req.body?.force);
     const result = force
-      ? await purgeExpiredVoiceJobs(jobSettings.voiceRetention.retentionDays).then(async data => {
+      ? await purgeExpiredVoiceJobs(retentionDays, req.user.id).then(async data => {
           const now = new Date();
-          const time = latestDueJobTime(jobSettings.voiceRetention.times, now) || jobSettings.voiceRetention.times[0] || '03:00';
-          const slotKey = `voiceRetention:${localDateKey(now)}-${String(time).replace(':', '')}`;
+          const time = latestDueJobTime(schedule.times, now) || schedule.times[0] || '03:00';
+          const slotKey = `voiceRetention:${req.user.id}:${localDateKey(now)}-${String(time).replace(':', '')}`;
           jobSettings.doneSlots = { ...(jobSettings.doneSlots || {}), [slotKey]: new Date().toISOString() };
           await persistJobSettings();
           return { ...data, slotKey, time };
         })
-      : await runVoiceRetentionJobIfDue(false);
-    if (!result) return res.json({ skipped: true, message: '当前未到清理作业时间，或本时段已执行', voiceRetention: jobSettings.voiceRetention });
-    res.json({ skipped: false, ...result, voiceRetention: jobSettings.voiceRetention, message: `已清理 ${result.removed} 条过期指令` });
+      : await runVoiceRetentionJobIfDue(false, req.user.id);
+    const voiceRetention = userVoiceRetention(req.user.id);
+    if (!result) return res.json({ skipped: true, message: '当前未到清理作业时间，或本时段已执行', voiceRetention });
+    res.json({ skipped: false, ...result, voiceRetention, message: `已清理 ${result.removed} 条过期指令` });
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: '清理语音指令失败' });
@@ -1270,7 +1486,7 @@ app.post('/api/voice-jobs/purge', requireUser, async (req, res) => {
 
 app.get('/api/voice-jobs', requireUser, async (req, res) => {
   try {
-    const retentionDays = jobSettings.voiceRetention.retentionDays;
+    const retentionDays = userVoiceRetention(req.user.id).retentionDays;
     const cutoff = Date.now() - voiceRetentionMs(retentionDays);
     const userId = req.user.id;
     const items = [...voiceJobs.values()]
@@ -1281,7 +1497,7 @@ app.get('/api/voice-jobs', requireUser, async (req, res) => {
       })
       .sort((a, b) => Date.parse(b.createdAt || b.updatedAt || 0) - Date.parse(a.createdAt || a.updatedAt || 0))
       .map(voiceJobListItem);
-    res.json({ retentionDays, voiceRetention: jobSettings.voiceRetention, items });
+    res.json({ retentionDays, voiceRetention: userVoiceRetention(userId), items });
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: '读取语音指令历史失败' });
@@ -1428,12 +1644,9 @@ app.post('/api/voice-jobs/:id/retry', requireUser, async (req, res) => {
   const job = ownedVoiceJob(req, res);
   if (!job) return;
   if (job.status === 'completed') return res.status(409).json({ message: '这条语音任务已经识别完成' });
-  if (job.audioFile) {
-    if (!resolveAsrKey()) return res.status(503).json({ error: 'ASR_NOT_CONFIGURED', message: '服务端尚未配置语音识别 API Key' });
-    if (!textApiKey) return res.status(503).json({ error: 'AI_NOT_CONFIGURED', message: '服务端尚未配置任务理解 API Key' });
-  } else if (!textApiKey) {
-    return res.status(503).json({ error: 'AI_NOT_CONFIGURED', message: '服务端尚未配置任务理解 API Key' });
-  }
+  const ai = resolveAiConfig(req.user.id);
+  if (!ai.textApiKey) return res.status(503).json({ error: 'AI_NOT_CONFIGURED', message: '请先在「设置 → 大模型」配置任务理解 API Key' });
+  if (job.audioFile && !ai.resolveAsrKey()) return res.status(503).json({ error: 'ASR_NOT_CONFIGURED', message: '请先在「设置 → 大模型」配置语音识别 API Key' });
   job.status = 'queued';
   job.stage = 'queued';
   job.error = '';
@@ -1447,7 +1660,7 @@ app.post('/api/transcribe', upload.single('audio'), requireUser, requireVoiceAi,
     if (!req.file) return res.status(400).json({ error: 'NO_AUDIO', message: '没有收到录音文件' });
     let availableTasks = [];
     try { const parsed = JSON.parse(String(req.body?.tasks || '[]')); if (Array.isArray(parsed)) availableTasks = parsed.slice(0, 100); } catch {}
-    res.json(await transcribeAudio(req.file.buffer, req.file.mimetype || 'audio/webm', availableTasks));
+    res.json(await transcribeAudio(req.file.buffer, req.file.mimetype || 'audio/webm', availableTasks, async () => {}, {}, req.ai));
   } catch (error) {
     console.error(error);
     res.status(502).json({ error: 'QWEN_TRANSCRIBE_FAILED', message: voiceErrorMessage(error) });
@@ -1457,13 +1670,13 @@ app.post('/api/transcribe', upload.single('audio'), requireUser, requireVoiceAi,
 app.post('/api/daily-plan', requireUser, requireTextAi, async (req, res) => {
   try {
     const { tasks = [], date, user = '用户' } = req.body || {};
-    const data = await qwenChat({
+    const data = await qwenChat(withAi(req.ai, {
       messages: [
         { role: 'system', content: '你是务实的中文工作规划助手。根据真实任务数据总结当天完成情况，并规划明天。优先考虑逾期、进行中、高优先级和依赖关系，不要声称未提供的成果。次日计划最多5项，按重要性排序。只输出合法 JSON，不要 Markdown。JSON字段：headline字符串、summary字符串、completed字符串数组、risks字符串数组、tomorrow对象数组；tomorrow每项包含title、reason、priority(高/中/低)、suggestedTime。' },
         { role: 'user', content: `用户：${user}\n日期：${date}\n任务数据：${JSON.stringify(tasks)}` }
       ],
       responseFormat: { type: 'json_object' }
-    });
+    }));
     res.json(normalizeDailyReport(parseJSON(messageText(data))));
   } catch (error) {
     console.error(error);
@@ -1474,13 +1687,13 @@ app.post('/api/daily-plan', requireUser, requireTextAi, async (req, res) => {
 app.post('/api/weekly-plan', requireUser, requireTextAi, async (req, res) => {
   try {
     const { tasks = [], weekStart, weekEnd, user = '用户' } = req.body || {};
-    const data = await qwenChat({
+    const data = await qwenChat(withAi(req.ai, {
       messages: [
         { role: 'system', content: '你是务实的中文周报助手。根据真实任务数据总结本周完成亮点与风险，并规划下周重点。不要虚构未提供的成果。下周计划最多8项，按重要性排序。只输出合法 JSON，不要 Markdown。JSON字段：headline字符串、summary字符串、highlights字符串数组、risks字符串数组、next对象数组；next每项包含title、reason、priority(高/中/低)、suggestedTime。' },
         { role: 'user', content: `用户：${user}\n本周：${weekStart} 至 ${weekEnd}\n任务数据：${JSON.stringify(tasks)}` }
       ],
       responseFormat: { type: 'json_object' }
-    });
+    }));
     res.json(normalizePeriodReport(parseJSON(messageText(data)), 8));
   } catch (error) {
     console.error(error);
@@ -1491,13 +1704,13 @@ app.post('/api/weekly-plan', requireUser, requireTextAi, async (req, res) => {
 app.post('/api/monthly-plan', requireUser, requireTextAi, async (req, res) => {
   try {
     const { tasks = [], month, user = '用户' } = req.body || {};
-    const data = await qwenChat({
+    const data = await qwenChat(withAi(req.ai, {
       messages: [
         { role: 'system', content: '你是务实的中文月报助手。根据真实任务数据总结本月完成亮点与风险，并规划下月重点。不要虚构未提供的成果。下月计划最多8项，按重要性排序。只输出合法 JSON，不要 Markdown。JSON字段：headline字符串、summary字符串、highlights字符串数组、risks字符串数组、next对象数组；next每项包含title、reason、priority(高/中/低)、suggestedTime。' },
         { role: 'user', content: `用户：${user}\n月份：${month}\n任务数据：${JSON.stringify(tasks)}` }
       ],
       responseFormat: { type: 'json_object' }
-    });
+    }));
     res.json(normalizePeriodReport(parseJSON(messageText(data)), 8));
   } catch (error) {
     console.error(error);
@@ -1516,13 +1729,12 @@ app.post('/api/edit-report', upload.single('audio'), requireUser, requireTextAi,
     if (!report || typeof report !== 'object') return res.status(400).json({ message: '复盘内容不能为空' });
     let instruction = String(req.body?.instruction || req.body?.transcript || '').trim();
     if (req.file) {
-      if (!resolveAsrKey()) return res.status(503).json({ message: '服务端尚未配置语音识别 API Key' });
-      const spoken = await asrTranscript(req.file.buffer, req.file.mimetype || 'audio/webm');
+      if (!req.ai.resolveAsrKey()) return res.status(503).json({ message: '请先在「设置 → 大模型」配置语音识别 API Key' });
+      const spoken = await asrTranscript(req.file.buffer, req.file.mimetype || 'audio/webm', req.ai);
       instruction = instruction ? `${instruction}\n${spoken}` : spoken;
     }
     if (!instruction) return res.status(400).json({ message: '请提供修改说明或录音' });
-    if (req.file && !resolveAsrKey()) return res.status(503).json({ message: '服务端尚未配置语音识别 API Key' });
-    const normalized = await editReportContent(kind, report, instruction);
+    const normalized = await editReportContent(kind, report, instruction, req.ai);
     if (normalized == null) return res.json({ report: null, cleared: true, transcript: instruction });
     res.json({ report: normalized, cleared: false, transcript: instruction });
   } catch (error) {
@@ -1542,14 +1754,15 @@ app.post('/api/report-edit-jobs', upload.single('audio'), requireUser, requireTe
     if (!report || typeof report !== 'object') return res.status(400).json({ message: '复盘内容不能为空' });
     const instruction = String(req.body?.instruction || req.body?.transcript || '').trim();
     if (!req.file && !instruction) return res.status(400).json({ message: '请提供修改说明或录音' });
-    if (req.file && !resolveAsrKey()) return res.status(503).json({ message: '服务端尚未配置语音识别 API Key' });
+    if (req.file && !req.ai.resolveAsrKey()) return res.status(503).json({ message: '请先在「设置 → 大模型」配置语音识别 API Key' });
     const id = randomUUID();
     const mime = req.file?.mimetype || 'audio/webm';
     let audioFile = '';
     if (req.file) {
       audioFile = `${id}.${audioExtension(mime)}`;
-      await mkdir(reportEditJobsDir, { recursive: true });
-      await writeFile(path.join(reportEditJobsDir, audioFile), req.file.buffer, { mode: 0o600 });
+      const dir = userReportEditJobsDir(req.user.id);
+      await mkdir(dir, { recursive: true });
+      await writeFile(path.join(dir, audioFile), req.file.buffer, { mode: 0o600 });
     }
     const job = {
       id,
@@ -1585,7 +1798,7 @@ function ownedReportEditJob(req, res) {
   return job;
 }
 
-app.get('/api/report-edit-jobs/:id', requireUser, requireTextAi, (req, res) => {
+app.get('/api/report-edit-jobs/:id', requireUser, (req, res) => {
   const job = ownedReportEditJob(req, res);
   if (!job) return;
   res.json(publicReportEditJob(job));
@@ -1596,8 +1809,8 @@ app.delete('/api/report-edit-jobs/:id', requireUser, async (req, res) => {
   if (!job) return;
   job.cancelled = true;
   reportEditJobs.delete(req.params.id);
-  await unlink(reportEditJobPath(req.params.id)).catch(() => {});
-  if (job.audioFile) await unlink(path.join(reportEditJobsDir, job.audioFile)).catch(() => {});
+  await unlink(reportEditJobPath(job)).catch(() => {});
+  if (job.audioFile) await unlink(reportEditAudioPath(job)).catch(() => {});
   res.status(204).end();
 });
 
@@ -1624,6 +1837,15 @@ process.once('SIGTERM',()=>{closeDatabase();process.exit(0)});
 process.once('exit',closeDatabase);
 Promise.all([loadJobSettings(), recoverVoiceJobs(), recoverReportEditJobs()])
   .then(() => {
+    try {
+      const legacy = autoClaimSqliteLegacyData();
+      if (legacy?.claimed) {
+        console.log(`已将 local-legacy 历史数据归属用户 ${legacy.by}`, legacy.moved);
+        void adoptLegacyVoiceDirs(legacy.by);
+      }
+    } catch (error) {
+      console.error('自动认领历史数据失败', error);
+    }
     setInterval(() => { void runVoiceRetentionJobIfDue(false).catch(console.error); }, 60 * 1000);
     app.listen(port, '0.0.0.0', () => console.log(`FlowMate Qwen server: http://localhost:${port}`));
   })

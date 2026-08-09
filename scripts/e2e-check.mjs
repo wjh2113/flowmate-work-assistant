@@ -21,6 +21,7 @@ const ok = (name, cond, detail = '') => results.push({ name, ok: Boolean(cond), 
 
 const health = await (await fetch(`${base}/api/health`)).json();
 ok('health.localAuth', health.auth === 'local', health.auth);
+ok('health.noEnvAiFallback', health.requiresUserModel === true && health.ai === false);
 
 const html = await (await fetch(`${base}/`)).text();
 const scriptMatch = html.match(/src="(\/assets\/index-[A-Za-z0-9]+\.js)"/);
@@ -30,7 +31,7 @@ if (scriptMatch) {
   ok('html.hasProviderUi', js.includes('任务理解提供商') && js.includes('测试连接'));
   ok('html.hasV4', js.includes('deepseek-v4-flash') && !js.includes('DeepSeek Chat（旧版别名）'));
 }
-ok('sw.v7', (await (await fetch(`${base}/sw.js`)).text()).includes('flowmate-v7'));
+ok('sw.v8', (await (await fetch(`${base}/sw.js`)).text()).includes('flowmate-v8'));
 
 ok('sqlite.401', (await fetch(`${base}/api/sqlite/tasks`)).status === 401);
 ok('voice.401', (await fetch(`${base}/api/voice-jobs`)).status === 401);
@@ -110,6 +111,46 @@ ok('auth.login', login.status === 200);
 const settings = await (await fetch(`${base}/api/settings/model`, { headers: { Cookie: a.h() } })).json();
 const ds = settings.presets?.find(p => p.id === 'deepseek');
 ok('settings.deepseekV4', ds?.models?.includes('deepseek-v4-flash') && !ds.models.includes('deepseek-chat'));
+ok('settings.modelAuthed', settings.scope === 'user' || settings.configured !== undefined);
+ok('settings.noSharedKey', settings.requiresUserKey === true && settings.configured === false);
+
+const putModel = await fetch(`${base}/api/settings/model`, {
+  method: 'PUT',
+  headers: { 'Content-Type': 'application/json', Cookie: a.h() },
+  body: JSON.stringify({
+    provider: 'bailian',
+    textApiKey: 'sk-e2e-test-key-not-real-0001',
+    textModel: 'qwen3.7-plus',
+    asrModel: 'qwen3-asr-flash'
+  })
+});
+const modelSaved = await putModel.json();
+ok('settings.modelSaveUser', putModel.status === 200 && modelSaved.textConfigured === true);
+const settingsB = await (await fetch(`${base}/api/settings/model`, { headers: { Cookie: b.h() } })).json();
+ok('settings.modelIsolate', settingsB.configured === false);
+
+const jobsAnon = await fetch(`${base}/api/settings/jobs`);
+ok('settings.jobsRequireAuth', jobsAnon.status === 401);
+
+const avatarA = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+const putProfile = await fetch(`${base}/api/settings/profile`, {
+  method: 'PUT',
+  headers: { 'Content-Type': 'application/json', Cookie: a.h() },
+  body: JSON.stringify({ avatar: avatarA })
+});
+const profileA = await putProfile.json();
+ok('profile.avatarSave', putProfile.status === 200 && profileA.avatar?.startsWith('data:image/'));
+const profileB = await (await fetch(`${base}/api/settings/profile`, { headers: { Cookie: b.h() } })).json();
+ok('profile.avatarIsolate', !profileB.avatar || profileB.avatar !== avatarA);
+
+const putJobsA = await fetch(`${base}/api/settings/jobs`, {
+  method: 'PUT',
+  headers: { 'Content-Type': 'application/json', Cookie: a.h() },
+  body: JSON.stringify({ voiceRetention: { enabled: true, retentionDays: 3, times: ['04:00'] } })
+});
+const jobsA = await putJobsA.json();
+const jobsB = await (await fetch(`${base}/api/settings/jobs`, { headers: { Cookie: b.h() } })).json();
+ok('settings.jobsIsolate', putJobsA.status === 200 && jobsA.voiceRetention?.retentionDays === 3 && jobsB.voiceRetention?.retentionDays !== 3);
 
 const vj = await fetch(`${base}/api/voice-jobs/text`, {
   method: 'POST',

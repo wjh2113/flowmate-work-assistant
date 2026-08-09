@@ -1,4 +1,4 @@
-const CACHE = 'flowmate-v7-multiprovider';
+const CACHE = 'flowmate-v8-user-prefs';
 const APP_SHELL = ['/manifest.webmanifest', '/icon.svg'];
 
 self.addEventListener('install', event => {

@@ -1,3 +1,5 @@
+import { migrateLegacyStorageKey, readUserStorage, writeUserStorage, userStorageKey } from './userStorage';
+
 export type TimeHM = `${string}:${string}`;
 
 export type DailySchedule = { enabled:boolean; times:TimeHM[] };
@@ -13,7 +15,8 @@ export const DEFAULT_AUTO_SCHEDULE: AutoSchedule = {
   voiceRetention: { enabled: true, retentionDays: 7, times: ['03:00'] }
 };
 
-const SCHEDULE_KEY = 'flowmate.autoSchedule';
+const SCHEDULE_SUFFIX = 'autoSchedule';
+const LEGACY_SCHEDULE_KEY = 'flowmate.autoSchedule';
 
 export function localDateKey(date = new Date()) {
   const y = date.getFullYear();
@@ -104,7 +107,8 @@ function normalizeVoiceRetention(raw: any): VoiceRetentionSchedule {
 
 export function loadAutoSchedule(): AutoSchedule {
   try {
-    const raw = JSON.parse(localStorage.getItem(SCHEDULE_KEY) || 'null');
+    const migrated = migrateLegacyStorageKey(LEGACY_SCHEDULE_KEY, SCHEDULE_SUFFIX);
+    const raw = JSON.parse(migrated || readUserStorage(SCHEDULE_SUFFIX) || 'null');
     if (!raw || typeof raw !== 'object') return structuredClone(DEFAULT_AUTO_SCHEDULE);
     return {
       daily: normalizeDaily(raw.daily),
@@ -124,12 +128,12 @@ export function saveAutoSchedule(schedule: AutoSchedule) {
     monthly: normalizeMonthly(schedule.monthly),
     voiceRetention: normalizeVoiceRetention(schedule.voiceRetention)
   };
-  localStorage.setItem(SCHEDULE_KEY, JSON.stringify(next));
+  writeUserStorage(SCHEDULE_SUFFIX, JSON.stringify(next));
   return next;
 }
 
 export function voiceRetentionSlotStorageKey(dateKey: string, time: string) {
-  return `flowmate.voiceRetentionSlot:${dateKey}-${time.replace(':', '')}`;
+  return userStorageKey(`voiceRetentionSlot:${dateKey}-${time.replace(':', '')}`);
 }
 
 export function latestDueVoiceRetentionSlot(now = new Date(), schedule: VoiceRetentionSchedule = loadAutoSchedule().voiceRetention) {
@@ -160,7 +164,7 @@ export function latestDueTimeSlot(times: string[], now = new Date()) {
 }
 
 export function dailySlotStorageKey(dateKey: string, time: string) {
-  return `flowmate.dailySlot:${dateKey}-${time.replace(':', '')}`;
+  return userStorageKey(`dailySlot:${dateKey}-${time.replace(':', '')}`);
 }
 
 /** @deprecated prefer schedule-aware overload via loadAutoSchedule */
@@ -192,7 +196,7 @@ export function suppressAutoSlotsForKind(kind: 'daily' | 'weekly' | 'monthly', n
 }
 
 export function weeklySlotStorageKey(weekKey: string, time: string) {
-  return `flowmate.weeklySlot:${weekKey}-${time.replace(':', '')}`;
+  return userStorageKey(`weeklySlot:${weekKey}-${time.replace(':', '')}`);
 }
 
 export function latestDueWeeklySlot(now = new Date(), schedule: WeeklySchedule = loadAutoSchedule().weekly) {
@@ -210,7 +214,7 @@ export function isLastDayOfMonth(date = new Date()) {
 }
 
 export function monthlySlotStorageKey(month: string, dayLabel: string, time: string) {
-  return `flowmate.monthlySlot:${month}-${dayLabel}-${time.replace(':', '')}`;
+  return userStorageKey(`monthlySlot:${month}-${dayLabel}-${time.replace(':', '')}`);
 }
 
 export function latestDueMonthlySlot(now = new Date(), schedule: MonthlySchedule = loadAutoSchedule().monthly) {

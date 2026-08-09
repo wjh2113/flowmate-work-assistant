@@ -6,6 +6,7 @@ import { deleteFileDailyReport, deleteFilePeriodReport, deleteFileTask, listFile
 import GuidePage from './GuidePage';
 import { toSimplified } from './chinese';
 import { DEFAULT_AUTO_SCHEDULE, WEEKDAY_LABELS, formatPeriodLabel, formatTimeHM, isSlotDone, isoWeekKey, latestDueDailySlot, latestDueMonthlySlot, latestDueVoiceRetentionSlot, latestDueWeeklySlot, loadAutoSchedule, localDateKey, markSlotDone, monthKey, normalizeTimes, parseTimeHM, saveAutoSchedule, shiftIsoWeekKey, shiftMonthKey, suppressAutoSlotsForKind, weekRange, type AutoSchedule, type TimeHM } from './reportUtils';
+import { migrateLegacyStorageKey, readUserStorage, setUserStorageScope, writeUserStorage } from './userStorage';
 
 type Tab = 'home' | 'tasks' | 'team' | 'mine';
 type Status = 'todo' | 'doing' | 'done';
@@ -86,14 +87,25 @@ export default function App(){
   const displayName=String(session?.user.user_metadata?.name||session?.user.email?.split('@')[0]||localUser?.name||localUser?.email?.split('@')[0]||'我');
   const avatarText=displayName.slice(0,1).toUpperCase();
   const signedIn=Boolean(session||localUser);
-  const [avatarUrl,setAvatarUrl]=useState<string>(()=>{try{return localStorage.getItem('flowmate.avatar')||''}catch{return''}});
+  const [avatarUrl,setAvatarUrl]=useState('');
+  const accountScope=session?.user?.id||localUser?.id||'';
   const saveAvatar=async(file:File)=>{
     if(!file.type.startsWith('image/')){notify('请选择图片文件');return}
     if(file.size>8*1024*1024){notify('图片请控制在 8MB 以内');return}
     try{
       const url=await compressAvatar(file);
-      localStorage.setItem('flowmate.avatar',url);setAvatarUrl(url);notify('头像已更新');
-    }catch{notify('头像处理失败，请换一张图片重试')}
+      const response=await apiFetch('/api/settings/profile',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({avatar:url})});
+      const data=await readApiJson<{avatar?:string;message?:string}>(response);
+      if(!response.ok)throw new Error(data.message||'头像保存失败');
+      setAvatarUrl(data.avatar||url);notify('头像已更新');
+    }catch(error){notify(error instanceof Error?error.message:'头像处理失败，请换一张图片重试')}
+  };
+  const refreshAiReady=()=>{
+    apiFetch('/api/settings/model').then(async res=>{
+      if(!res.ok){setAiReady(false);return}
+      const data=await readApiJson<{textConfigured?:boolean;configured?:boolean}>(res);
+      setAiReady(Boolean(data.textConfigured??data.configured));
+    }).catch(()=>setAiReady(false));
   };
 
   useEffect(()=>{tasksRef.current=tasks},[tasks]);
@@ -107,12 +119,81 @@ export default function App(){
   useEffect(()=>{const timer=window.setInterval(()=>setClock(Date.now()),30_000);return()=>window.clearInterval(timer)},[]);
   useEffect(()=>{cloudContext.current={session,teamId}},[session,teamId]);
   useEffect(()=>{const h=(e:Event)=>{e.preventDefault();setInstallEvent(e)};window.addEventListener('beforeinstallprompt',h);return()=>window.removeEventListener('beforeinstallprompt',h)},[]);
-  useEffect(()=>{fetch('/api/health').then(r=>r.json()).then(data=>setAiReady(Boolean(data.ai))).catch(()=>setAiReady(false))},[]);
+  useEffect(()=>{
+    setUserStorageScope(accountScope||'anon');
+    setAutoSchedule(loadAutoSchedule());
+  },[accountScope]);
+  useEffect(()=>{
+    if(!signedIn){setAiReady(null);setAvatarUrl('');return}
+    refreshAiReady();
+    let active=true;
+    apiFetch('/api/settings/profile').then(async res=>{
+      const data=await readApiJson<{avatar?:string;autoSchedule?:AutoSchedule|null;voiceRetention?:AutoSchedule['voiceRetention'];message?:string}>(res);
+      if(!res.ok||!active)return;
+      let avatar=String(data.avatar||'');
+      if(!avatar){
+        const legacy=migrateLegacyStorageKey('flowmate.avatar','avatar');
+        if(legacy&&legacy.startsWith('data:image/')){
+          avatar=legacy;
+          await apiFetch('/api/settings/profile',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({avatar})}).catch(()=>{});
+        }
+      }
+      if(active)setAvatarUrl(avatar);
+      if(data.autoSchedule||data.voiceRetention){
+        const next=saveAutoSchedule({
+          ...(data.autoSchedule||loadAutoSchedule()),
+          voiceRetention:data.voiceRetention||(data.autoSchedule||loadAutoSchedule()).voiceRetention
+        });
+        if(active)setAutoSchedule(next);
+      }
+    }).catch(()=>{});
+    return()=>{active=false};
+  },[signedIn,accountScope]);
   useEffect(()=>{
     if(cloudConfigured)return;
     if(!localUser)return;
     let active=true;let first=true;
-    const refresh=async()=>{try{if(first)setSyncing(true);const [storedTasks,storedReport,storedWeekly,storedMonthly]=await Promise.all([listFileTasks(),loadFileDailyReport<DailyReport>(dateKey),loadFilePeriodReport<PeriodReport>('weekly',weekKey),loadFilePeriodReport<PeriodReport>('monthly',monthKeyValue)]);if(active){const normalized=toSimplified(storedTasks).map(normalizeTask);const ghosts=normalized.filter(t=>!isRealTask(t));if(ghosts.length){for(const g of ghosts){if(g.aiStatus==='pending')localStorage.setItem('flowmate.voiceJobs',JSON.stringify([...new Set([...(JSON.parse(localStorage.getItem('flowmate.voiceJobs')||'[]') as string[]),g.id])]));deleteFileTask(g.id).catch(()=>{})}setVoiceProgress(prev=>{const map=new Map(prev.map(item=>[item.id,item]));for(const g of ghosts){if(!map.has(g.id))map.set(g.id,{id:g.id,title:g.title||'语音指令识别中…',stage:g.due||'AI后台处理中',status:g.aiStatus==='failed'?'failed':'pending',error:g.aiStatus==='failed'?(g.due||'识别失败'):undefined,createdAt:g.createdAt||new Date().toISOString()})}return [...map.values()]})}setTasks(normalized.filter(isRealTask));setReport(storedReport?toSimplified(storedReport):null);setWeeklyReport(storedWeekly?toSimplified(storedWeekly):null);setMonthlyReport(storedMonthly?toSimplified(storedMonthly):null);setReportError('')}}catch(error){if(active)setReportError(error instanceof Error?`SQLite 读取失败：${error.message}`:'SQLite 读取失败')}finally{if(active&&first){first=false;setSyncing(false)}}};
+    const refresh=async()=>{
+      try{
+        if(first)setSyncing(true);
+        const [storedTasks,storedReport,storedWeekly,storedMonthly]=await Promise.all([
+          listFileTasks(),
+          loadFileDailyReport<DailyReport>(dateKey),
+          loadFilePeriodReport<PeriodReport>('weekly',weekKey),
+          loadFilePeriodReport<PeriodReport>('monthly',monthKeyValue)
+        ]);
+        if(!active)return;
+        const normalized=toSimplified(storedTasks).map(normalizeTask);
+        const ghosts=normalized.filter(t=>!isRealTask(t));
+        if(ghosts.length){
+          for(const g of ghosts){
+            if(g.aiStatus==='pending'){
+              try{
+                const ids=JSON.parse(readUserStorage('voiceJobs')||'[]') as string[];
+                writeUserStorage('voiceJobs',JSON.stringify([...new Set([...ids,g.id])]));
+              }catch{/* ignore */}
+            }
+            deleteFileTask(g.id).catch(()=>{});
+          }
+          setVoiceProgress(prev=>{
+            const map=new Map(prev.map(item=>[item.id,item]));
+            for(const g of ghosts){
+              if(!map.has(g.id))map.set(g.id,{id:g.id,title:g.title||'语音指令识别中…',stage:g.due||'AI后台处理中',status:g.aiStatus==='failed'?'failed':'pending',error:g.aiStatus==='failed'?(g.due||'识别失败'):undefined,createdAt:g.createdAt||new Date().toISOString()});
+            }
+            return [...map.values()];
+          });
+        }
+        setTasks(normalized.filter(isRealTask));
+        setReport(storedReport?toSimplified(storedReport):null);
+        setWeeklyReport(storedWeekly?toSimplified(storedWeekly):null);
+        setMonthlyReport(storedMonthly?toSimplified(storedMonthly):null);
+        setReportError('');
+      }catch(error){
+        if(active)setReportError(error instanceof Error?`SQLite 读取失败：${error.message}`:'SQLite 读取失败');
+      }finally{
+        if(active&&first){first=false;setSyncing(false)}
+      }
+    };
     void refresh();const timer=window.setInterval(refresh,5000);
     return()=>{active=false;window.clearInterval(timer)};
   },[localUser,dateKey,weekKey,monthKeyValue]);
@@ -146,8 +227,9 @@ export default function App(){
     return()=>{active=false;if(channel)client.removeChannel(channel)};
   },[session,dateKey,weekKey,monthKeyValue]);
   useEffect(()=>{
+    if(!signedIn)return;
     let active=true;
-    fetch('/api/settings/jobs').then(async res=>{
+    apiFetch('/api/settings/jobs').then(async res=>{
       const data=await readApiJson<{voiceRetention?:AutoSchedule['voiceRetention']}>(res);
       if(!res.ok||!data.voiceRetention||!active)return;
       setAutoSchedule(prev=>{
@@ -156,7 +238,7 @@ export default function App(){
       });
     }).catch(()=>{});
     return()=>{active=false};
-  },[]);
+  },[signedIn,accountScope]);
   useEffect(()=>{
     if(tab!=='home')return;
     const now=new Date(clock);
@@ -188,9 +270,9 @@ export default function App(){
   const askConfirm=(message:string,options?:{title?:string;confirmLabel?:string;cancelLabel?:string;danger?:boolean})=>new Promise<boolean>(resolve=>{setDialog({mode:'confirm',title:options?.title||'请确认',message,confirmLabel:options?.confirmLabel||'确定',cancelLabel:options?.cancelLabel||'取消',danger:options?.danger,resolve})});
   const goTab=(next:Tab)=>{setArchiveKind(null);setVoiceHistoryOpen(false);setTab(next);window.requestAnimationFrame(()=>window.scrollTo({top:0,behavior:'smooth'}))};
 
-  const pendingVoiceIds=()=>{try{return JSON.parse(localStorage.getItem('flowmate.voiceJobs')||'[]') as string[]}catch{return[]}};
-  const rememberVoiceJob=(id:string)=>localStorage.setItem('flowmate.voiceJobs',JSON.stringify([...new Set([...pendingVoiceIds(),id])]));
-  const forgetVoiceJob=(id:string)=>localStorage.setItem('flowmate.voiceJobs',JSON.stringify(pendingVoiceIds().filter(item=>item!==id)));
+  const pendingVoiceIds=()=>{try{migrateLegacyStorageKey('flowmate.voiceJobs','voiceJobs');return JSON.parse(readUserStorage('voiceJobs')||'[]') as string[]}catch{return[]}};
+  const rememberVoiceJob=(id:string)=>writeUserStorage('voiceJobs',JSON.stringify([...new Set([...pendingVoiceIds(),id])]));
+  const forgetVoiceJob=(id:string)=>writeUserStorage('voiceJobs',JSON.stringify(pendingVoiceIds().filter(item=>item!==id)));
   const finishVoicePolling=(id:string)=>{const timer=voicePollTimers.current.get(id);if(timer)window.clearTimeout(timer);voicePollTimers.current.delete(id);voicePolling.current.delete(id);forgetVoiceJob(id)};
   const removeVoiceProgress=(id:string)=>setVoiceProgress(items=>items.filter(item=>item.id!==id));
   const upsertVoiceProgress=(item:VoiceProgress)=>setVoiceProgress(items=>{const rest=items.filter(x=>x.id!==item.id);return [item,...rest]});
@@ -276,9 +358,9 @@ export default function App(){
     return()=>{voicePollTimers.current.forEach(timer=>window.clearTimeout(timer));voicePollTimers.current.clear();voicePolling.current.clear()};
   },[signedIn]);
 
-  const pendingReportEditIds=()=>{try{return JSON.parse(localStorage.getItem('flowmate.reportEditJobs')||'[]') as {id:string;kind:ReportKind}[]}catch{return[]}};
-  const rememberReportEditJob=(id:string,kind:ReportKind)=>localStorage.setItem('flowmate.reportEditJobs',JSON.stringify([...pendingReportEditIds().filter(item=>item.id!==id),{id,kind}]));
-  const forgetReportEditJob=(id:string)=>localStorage.setItem('flowmate.reportEditJobs',JSON.stringify(pendingReportEditIds().filter(item=>item.id!==id)));
+  const pendingReportEditIds=()=>{try{migrateLegacyStorageKey('flowmate.reportEditJobs','reportEditJobs');return JSON.parse(readUserStorage('reportEditJobs')||'[]') as {id:string;kind:ReportKind}[]}catch{return[]}};
+  const rememberReportEditJob=(id:string,kind:ReportKind)=>writeUserStorage('reportEditJobs',JSON.stringify([...pendingReportEditIds().filter(item=>item.id!==id),{id,kind}]));
+  const forgetReportEditJob=(id:string)=>writeUserStorage('reportEditJobs',JSON.stringify(pendingReportEditIds().filter(item=>item.id!==id)));
   const finishReportEditPolling=(id:string)=>{const timer=reportEditPollTimers.current.get(id);if(timer)window.clearTimeout(timer);reportEditPollTimers.current.delete(id);reportEditPolling.current.delete(id);forgetReportEditJob(id)};
   const completeReportEditJob=async(job:ReportEditJob)=>{
     const cleared=job.cleared===true;
@@ -500,7 +582,7 @@ export default function App(){
   const signOut=async()=>{
     if(cloudConfigured){await supabase?.auth.signOut();return}
     try{await logoutLocalUser()}catch{}
-    setLocalUser(null);setTasks([]);setReport(null);setWeeklyReport(null);setMonthlyReport(null);setVoiceProgress([]);setEditPending({});setTeamId('');
+    setLocalUser(null);setTasks([]);setReport(null);setWeeklyReport(null);setMonthlyReport(null);setVoiceProgress([]);setEditPending({});setTeamId('');setAvatarUrl('');setAiReady(null);setUserStorageScope('anon');
   };
 
   if(showGuide)return <GuidePage/>;
@@ -545,7 +627,7 @@ export default function App(){
     <nav aria-label="主导航">{([['home','首页'],['tasks','任务'],['team','团队'],['mine','我的']] as const).map(([id,label])=><button className={tab===id?'active':''} onClick={()=>goTab(id)} key={id} aria-current={tab===id?'page':undefined}><i aria-hidden="true"><NavIcon name={id}/></i><span>{label}</span></button>)}</nav>
     {toast&&<div className="toast" role="status">✓ {toast}</div>}
     {dialog&&<div className="dialog-overlay" role="presentation" onClick={()=>{if(dialog.mode==='alert')closeDialog(true)}}><div className={'dialog-card'+(dialog.danger?' danger':'')} role="alertdialog" aria-modal="true" aria-labelledby="app-dialog-title" onClick={e=>e.stopPropagation()}><div className="dialog-icon" aria-hidden="true">{dialog.danger?'!':'✦'}</div><h3 id="app-dialog-title">{dialog.title}</h3><p className="dialog-body">{dialog.message}</p><div className="dialog-actions">{dialog.mode==='confirm'&&<button type="button" className="dialog-cancel" onClick={()=>closeDialog(false)}>{dialog.cancelLabel}</button>}<button type="button" className="dialog-ok" onClick={()=>closeDialog(true)} autoFocus>{dialog.confirmLabel}</button></div></div></div>}
-    {modal&&<div className="overlay" onClick={()=>{if(recording){cancelRecording();return}if(!processing)setModal(null)}}><section className={'sheet '+(modal==='settings'||modal==='cloud'?'settings-sheet':'')} onClick={e=>e.stopPropagation()}><div className="handle"/>{modal==='voice'?<><h2>{processing?'正在保存录音…':recording?'正在录音…':transcript?'指令待确认':'语音助手'}</h2><p className={'voice-tip '+(recording||processing?'live':'')}>{voiceTip}</p><button className={'record '+(recording?'recording':'')} disabled={processing} onClick={recording?stopRecording:beginRecording}><MicIcon/></button><p className="record-label">{processing?'保存后由 AI 后台整理':recording?'点击麦克风结束录音':'点击开始录音'}</p>{recording&&<button className="record-cancel" type="button" onClick={cancelRecording}>取消录音</button>}<textarea className="input transcript" value={transcript} placeholder="例如：新建两个任务… / 把今日复盘风险删掉… / 周报下周计划加一项演示" onChange={e=>{setTranscript(e.target.value);setParsedTask(null)}}/>{parsedTask&&<div className="ai-understanding"><b>已整理</b><span>任务：{parsedTask.title}</span><span>负责人：{parsedTask.assignee} · 截止：{parsedTask.due} · {parsedTask.priority}优先级</span><span>预计用时：{formatDuration(parsedTask.estimatedMinutes||defaultEstimate(parsedTask.priority))}</span></div>}<button className="primary" disabled={!transcript.trim()||processing||recording} onClick={createTasksFromText}>AI 理解并执行</button></>:modal==='settings'?<AppSettings schedule={autoSchedule} onScheduleSaved={next=>{setAutoSchedule(next);notify('自动作业时间已保存')}} onClose={()=>setModal(null)} onModelSaved={()=>{setAiReady(true);notify('模型设置已保存')}}/>:modal==='cloud'?<CloudSettings onClose={()=>setModal(null)} askConfirm={askConfirm}/>:<><h2>新建任务</h2><label>任务内容</label><input className="input" value={title} onChange={e=>setTitle(e.target.value)} placeholder="例如：完成项目周报"/><label>负责人</label><div className="people"><button className="selected" onClick={()=>setAssignee('我')}>我</button></div><label>预估时间</label><select className="input" value={estimate} onChange={e=>setEstimate(Number(e.target.value))}><option value={15}>15 分钟</option><option value={30}>30 分钟</option><option value={60}>1 小时</option><option value={120}>2 小时</option><option value={240}>4 小时</option></select><button className="primary" disabled={!title.trim()} onClick={()=>addTask()}>创建任务</button></>}</section></div>}
+    {modal&&<div className="overlay" onClick={()=>{if(recording){cancelRecording();return}if(!processing)setModal(null)}}><section className={'sheet '+(modal==='settings'||modal==='cloud'?'settings-sheet':'')} onClick={e=>e.stopPropagation()}><div className="handle"/>{modal==='voice'?<><h2>{processing?'正在保存录音…':recording?'正在录音…':transcript?'指令待确认':'语音助手'}</h2><p className={'voice-tip '+(recording||processing?'live':'')}>{voiceTip}</p><button className={'record '+(recording?'recording':'')} disabled={processing} onClick={recording?stopRecording:beginRecording}><MicIcon/></button><p className="record-label">{processing?'保存后由 AI 后台整理':recording?'点击麦克风结束录音':'点击开始录音'}</p>{recording&&<button className="record-cancel" type="button" onClick={cancelRecording}>取消录音</button>}<textarea className="input transcript" value={transcript} placeholder="例如：新建两个任务… / 把今日复盘风险删掉… / 周报下周计划加一项演示" onChange={e=>{setTranscript(e.target.value);setParsedTask(null)}}/>{parsedTask&&<div className="ai-understanding"><b>已整理</b><span>任务：{parsedTask.title}</span><span>负责人：{parsedTask.assignee} · 截止：{parsedTask.due} · {parsedTask.priority}优先级</span><span>预计用时：{formatDuration(parsedTask.estimatedMinutes||defaultEstimate(parsedTask.priority))}</span></div>}<button className="primary" disabled={!transcript.trim()||processing||recording} onClick={createTasksFromText}>AI 理解并执行</button></>:modal==='settings'?<AppSettings schedule={autoSchedule} onScheduleSaved={next=>{setAutoSchedule(next);notify('自动作业时间已保存')}} onClose={()=>setModal(null)} onModelSaved={()=>{refreshAiReady();notify('模型设置已保存')}}/>:modal==='cloud'?<CloudSettings onClose={()=>setModal(null)} askConfirm={askConfirm}/>:<><h2>新建任务</h2><label>任务内容</label><input className="input" value={title} onChange={e=>setTitle(e.target.value)} placeholder="例如：完成项目周报"/><label>负责人</label><div className="people"><button className="selected" onClick={()=>setAssignee('我')}>我</button></div><label>预估时间</label><select className="input" value={estimate} onChange={e=>setEstimate(Number(e.target.value))}><option value={15}>15 分钟</option><option value={30}>30 分钟</option><option value={60}>1 小时</option><option value={120}>2 小时</option><option value={240}>4 小时</option></select><button className="primary" disabled={!title.trim()} onClick={()=>addTask()}>创建任务</button></>}</section></div>}
   </main></div>;
 }
 
@@ -775,7 +857,7 @@ function ScheduleSettings({schedule,onSaved,onClose}:{schedule:AutoSchedule;onSa
     setSaving(true);setError('');
     try{
       const next=saveAutoSchedule(draft);
-      const response=await fetch('/api/settings/jobs',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({voiceRetention:next.voiceRetention})});
+      const response=await apiFetch('/api/settings/jobs',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({voiceRetention:next.voiceRetention,autoSchedule:next})});
       const data=await readApiJson<{message?:string;voiceRetention?:AutoSchedule['voiceRetention']}>(response);
       if(!response.ok)throw new Error(data.message||'后台作业同步失败');
       const synced=data.voiceRetention?saveAutoSchedule({...next,voiceRetention:data.voiceRetention}):next;
@@ -883,7 +965,7 @@ function ModelSettings({onClose,onSaved}:{onClose:()=>void;onSaved:()=>void}){
   const providerName=currentPreset.label;
   const statusText=configured
     ?`${providerName} · 任务理解 ${maskedTextKey||'已配置'} · 语音识别 ${asrConfigured?maskedAsrKey:(asrUsesTextKey?'沿用任务理解密钥':'未单独配置')}`
-    :'可接入阿里云百炼、DeepSeek 或任意 OpenAI 兼容接口';
+    :'每位用户需单独填写 API Key（不共用服务端 .env）';
   const canTest=Boolean(textConfigured||textApiKey.trim());
   const modelOptions=currentPreset.models;
   return <div className="model-settings-panel">{loading?<div className="settings-loading">正在读取服务端配置…</div>:<><div className={'settings-status '+(configured?'ready':'')}><i>{configured?'✓':'!'}</i><div><b>{configured?'模型服务已配置':'尚未配置模型服务'}</b><span>{statusText}</span></div></div>

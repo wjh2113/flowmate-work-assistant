@@ -34,7 +34,55 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
   CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+  CREATE TABLE IF NOT EXISTS user_model_settings (
+    user_id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL DEFAULT 'bailian',
+    base_url TEXT NOT NULL DEFAULT '',
+    text_api_key TEXT NOT NULL DEFAULT '',
+    asr_api_key TEXT NOT NULL DEFAULT '',
+    text_model TEXT NOT NULL DEFAULT 'qwen3.7-plus',
+    asr_model TEXT NOT NULL DEFAULT 'qwen3-asr-flash',
+    updated_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS user_preferences (
+    user_id TEXT PRIMARY KEY,
+    avatar TEXT NOT NULL DEFAULT '',
+    auto_schedule_json TEXT NOT NULL DEFAULT '',
+    voice_retention_json TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS app_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+  );
 `);
+
+// Drop FK if an earlier schema linked user_model_settings to users (blocks cloud-shared ids).
+(() => {
+  try {
+    const fks = db.prepare('PRAGMA foreign_key_list(user_model_settings)').all();
+    if (!fks.length) return;
+    db.exec(`
+      PRAGMA foreign_keys=OFF;
+      CREATE TABLE user_model_settings_mig (
+        user_id TEXT PRIMARY KEY,
+        provider TEXT NOT NULL DEFAULT 'bailian',
+        base_url TEXT NOT NULL DEFAULT '',
+        text_api_key TEXT NOT NULL DEFAULT '',
+        asr_api_key TEXT NOT NULL DEFAULT '',
+        text_model TEXT NOT NULL DEFAULT 'qwen3.7-plus',
+        asr_model TEXT NOT NULL DEFAULT 'qwen3-asr-flash',
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO user_model_settings_mig(user_id,provider,base_url,text_api_key,asr_api_key,text_model,asr_model,updated_at)
+        SELECT user_id,provider,base_url,text_api_key,asr_api_key,text_model,asr_model,updated_at FROM user_model_settings;
+      DROP TABLE user_model_settings;
+      ALTER TABLE user_model_settings_mig RENAME TO user_model_settings;
+      PRAGMA foreign_keys=ON;
+    `);
+  } catch {}
+})();
 
 function tableColumns(name){
   return db.prepare(`PRAGMA table_info(${name})`).all().map(row=>String(row.name));
@@ -199,6 +247,18 @@ function requireUserId(userId){
   return id;
 }
 
+function withSqliteTransaction(fn){
+  db.exec('BEGIN');
+  try{
+    const result=fn();
+    db.exec('COMMIT');
+    return result;
+  }catch(error){
+    try{db.exec('ROLLBACK')}catch{}
+    throw error;
+  }
+}
+
 function toTask(row){
   if(!row)return null;
   return {id:row.id,title:row.title,assignee:row.assignee,due:row.due_label,status:row.status,priority:row.priority,progress:Number(row.progress),estimatedMinutes:Number(row.estimated_minutes),createdAt:row.created_at,startedAt:row.started_at||undefined,completedAt:row.completed_at||undefined,aiStatus:row.ai_status||undefined};
@@ -348,6 +408,208 @@ export function deleteSqliteSession(sessionId){
 
 export function deleteSqliteUserSessions(userId){
   return Number(deleteUserSessions.run(requireUserId(userId)).changes);
+}
+
+const selectUserModelSettings=db.prepare('SELECT * FROM user_model_settings WHERE user_id=?');
+const upsertUserModelSettings=db.prepare(`
+  INSERT INTO user_model_settings(user_id,provider,base_url,text_api_key,asr_api_key,text_model,asr_model,updated_at)
+  VALUES(?,?,?,?,?,?,?,?)
+  ON CONFLICT(user_id) DO UPDATE SET
+    provider=excluded.provider,
+    base_url=excluded.base_url,
+    text_api_key=excluded.text_api_key,
+    asr_api_key=excluded.asr_api_key,
+    text_model=excluded.text_model,
+    asr_model=excluded.asr_model,
+    updated_at=excluded.updated_at
+`);
+
+function toUserModelSettings(row){
+  if(!row)return null;
+  return {
+    userId:row.user_id,
+    provider:row.provider||'bailian',
+    baseURL:row.base_url||'',
+    textApiKey:row.text_api_key||'',
+    asrApiKey:row.asr_api_key||'',
+    textModel:row.text_model||'qwen3.7-plus',
+    asrModel:row.asr_model||'qwen3-asr-flash',
+    updatedAt:row.updated_at
+  };
+}
+
+export function getSqliteUserModelSettings(userId){
+  return toUserModelSettings(selectUserModelSettings.get(requireUserId(userId)));
+}
+
+export function saveSqliteUserModelSettings(userId,settings){
+  const uid=requireUserId(userId);
+  const current=getSqliteUserModelSettings(uid)||{};
+  const next={
+    provider:String(settings?.provider||current.provider||'bailian'),
+    baseURL:String(settings?.baseURL??current.baseURL??''),
+    textApiKey:Object.prototype.hasOwnProperty.call(settings||{},'textApiKey')?String(settings.textApiKey||''):String(current.textApiKey||''),
+    asrApiKey:Object.prototype.hasOwnProperty.call(settings||{},'asrApiKey')?String(settings.asrApiKey||''):String(current.asrApiKey||''),
+    textModel:String(settings?.textModel||current.textModel||'qwen3.7-plus'),
+    asrModel:String(settings?.asrModel||current.asrModel||'qwen3-asr-flash'),
+    updatedAt:new Date().toISOString()
+  };
+  upsertUserModelSettings.run(uid,next.provider,next.baseURL,next.textApiKey,next.asrApiKey,next.textModel,next.asrModel,next.updatedAt);
+  return getSqliteUserModelSettings(uid);
+}
+
+const selectUserPreferences=db.prepare('SELECT * FROM user_preferences WHERE user_id=?');
+const upsertUserPreferences=db.prepare(`
+  INSERT INTO user_preferences(user_id,avatar,auto_schedule_json,voice_retention_json,updated_at)
+  VALUES(?,?,?,?,?)
+  ON CONFLICT(user_id) DO UPDATE SET
+    avatar=excluded.avatar,
+    auto_schedule_json=excluded.auto_schedule_json,
+    voice_retention_json=excluded.voice_retention_json,
+    updated_at=excluded.updated_at
+`);
+const selectAllUserPreferences=db.prepare('SELECT user_id,avatar,auto_schedule_json,voice_retention_json,updated_at FROM user_preferences');
+
+function parseJsonField(raw,fallback=null){
+  if(!raw)return fallback;
+  try{return JSON.parse(String(raw))}catch{return fallback}
+}
+
+function toUserPreferences(row){
+  if(!row)return null;
+  return {
+    userId:row.user_id,
+    avatar:String(row.avatar||''),
+    autoSchedule:parseJsonField(row.auto_schedule_json,null),
+    voiceRetention:parseJsonField(row.voice_retention_json,null),
+    updatedAt:row.updated_at
+  };
+}
+
+export function getSqliteUserPreferences(userId){
+  return toUserPreferences(selectUserPreferences.get(requireUserId(userId)));
+}
+
+export function saveSqliteUserPreferences(userId,patch={}){
+  const uid=requireUserId(userId);
+  const current=getSqliteUserPreferences(uid)||{avatar:'',autoSchedule:null,voiceRetention:null};
+  const next={
+    avatar:Object.prototype.hasOwnProperty.call(patch,'avatar')?String(patch.avatar||''):String(current.avatar||''),
+    autoSchedule:Object.prototype.hasOwnProperty.call(patch,'autoSchedule')?patch.autoSchedule:current.autoSchedule,
+    voiceRetention:Object.prototype.hasOwnProperty.call(patch,'voiceRetention')?patch.voiceRetention:current.voiceRetention,
+    updatedAt:new Date().toISOString()
+  };
+  if(typeof next.avatar==='string'&&next.avatar.length>1_500_000)throw new Error('头像过大，请压缩后再试');
+  upsertUserPreferences.run(
+    uid,
+    next.avatar,
+    next.autoSchedule==null?'':JSON.stringify(next.autoSchedule),
+    next.voiceRetention==null?'':JSON.stringify(next.voiceRetention),
+    next.updatedAt
+  );
+  return getSqliteUserPreferences(uid);
+}
+
+export function listSqliteUserPreferences(){
+  return selectAllUserPreferences.all().map(toUserPreferences).filter(Boolean);
+}
+
+const selectAppMeta=db.prepare('SELECT value FROM app_meta WHERE key=?');
+const upsertAppMeta=db.prepare(`
+  INSERT INTO app_meta(key,value,updated_at) VALUES(?,?,?)
+  ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+`);
+const countLegacyTasks=db.prepare('SELECT COUNT(*) AS n FROM tasks WHERE user_id=?');
+const countLegacyDaily=db.prepare('SELECT COUNT(*) AS n FROM daily_reports WHERE user_id=?');
+const countLegacyPeriod=db.prepare('SELECT COUNT(*) AS n FROM period_reports WHERE user_id=?');
+const countRealUsers=db.prepare('SELECT COUNT(*) AS n FROM users WHERE id<>?');
+const selectOldestRealUser=db.prepare('SELECT id FROM users WHERE id<>? ORDER BY created_at ASC LIMIT 1');
+
+function getAppMeta(key){
+  const row=selectAppMeta.get(String(key));
+  return row?String(row.value||''):'';
+}
+
+function setAppMeta(key,value){
+  upsertAppMeta.run(String(key),String(value??''),new Date().toISOString());
+}
+
+export function getSqliteLegacyClaimStatus(){
+  return {
+    claimedBy:getAppMeta('legacy_claimed_by')||'',
+    pendingTasks:Number(countLegacyTasks.get(LEGACY_USER_ID)?.n||0),
+    pendingDaily:Number(countLegacyDaily.get(LEGACY_USER_ID)?.n||0),
+    pendingPeriod:Number(countLegacyPeriod.get(LEGACY_USER_ID)?.n||0)
+  };
+}
+
+/** Move pre-auth shared data out of local-legacy into one real user (once). */
+export function claimSqliteLegacyData(userId,{forceOwner=false}={}){
+  const uid=requireUserId(userId);
+  if(uid===LEGACY_USER_ID)return {claimed:false,reason:'invalid_user'};
+  const existing=getAppMeta('legacy_claimed_by');
+  if(existing&&existing!==uid)return {claimed:false,reason:'already',by:existing};
+  if(existing===uid){
+    const leftover=getSqliteLegacyClaimStatus();
+    if(!leftover.pendingTasks&&!leftover.pendingDaily&&!leftover.pendingPeriod)return {claimed:false,reason:'already',by:uid};
+  }
+
+  ensureLegacyUser();
+  const before={
+    tasks:Number(countLegacyTasks.get(LEGACY_USER_ID)?.n||0),
+    daily:Number(countLegacyDaily.get(LEGACY_USER_ID)?.n||0),
+    period:Number(countLegacyPeriod.get(LEGACY_USER_ID)?.n||0)
+  };
+  if(!before.tasks&&!before.daily&&!before.period){
+    setAppMeta('legacy_claimed_by',uid);
+    return {claimed:false,reason:'empty',by:uid,moved:before};
+  }
+
+  if(!forceOwner){
+    const realUsers=Number(countRealUsers.get(LEGACY_USER_ID)?.n||0);
+    if(realUsers>1){
+      const oldest=selectOldestRealUser.get(LEGACY_USER_ID)?.id;
+      if(oldest&&oldest!==uid)return {claimed:false,reason:'not_owner',by:oldest,moved:before};
+    }
+  }
+
+  const listLegacyDaily=db.prepare('SELECT report_date FROM daily_reports WHERE user_id=?');
+  const hasDaily=db.prepare('SELECT 1 AS ok FROM daily_reports WHERE user_id=? AND report_date=?');
+  const reassignDaily=db.prepare('UPDATE daily_reports SET user_id=? WHERE user_id=? AND report_date=?');
+  const deleteDaily=db.prepare('DELETE FROM daily_reports WHERE user_id=? AND report_date=?');
+  const listLegacyPeriod=db.prepare('SELECT kind, period_key FROM period_reports WHERE user_id=?');
+  const hasPeriod=db.prepare('SELECT 1 AS ok FROM period_reports WHERE user_id=? AND kind=? AND period_key=?');
+  const reassignPeriod=db.prepare('UPDATE period_reports SET user_id=? WHERE user_id=? AND kind=? AND period_key=?');
+  const deletePeriod=db.prepare('DELETE FROM period_reports WHERE user_id=? AND kind=? AND period_key=?');
+  const moveTasks=db.prepare('UPDATE tasks SET user_id=? WHERE user_id=?');
+
+  const moved=withSqliteTransaction(()=>{
+    let dailyMoved=0;
+    for(const row of listLegacyDaily.all(LEGACY_USER_ID)){
+      if(hasDaily.get(uid,row.report_date))deleteDaily.run(LEGACY_USER_ID,row.report_date);
+      else{reassignDaily.run(uid,LEGACY_USER_ID,row.report_date);dailyMoved+=1}
+    }
+    let periodMoved=0;
+    for(const row of listLegacyPeriod.all(LEGACY_USER_ID)){
+      if(hasPeriod.get(uid,row.kind,row.period_key))deletePeriod.run(LEGACY_USER_ID,row.kind,row.period_key);
+      else{reassignPeriod.run(uid,LEGACY_USER_ID,row.kind,row.period_key);periodMoved+=1}
+    }
+    const tasksMoved=Number(moveTasks.run(uid,LEGACY_USER_ID).changes||0);
+    setAppMeta('legacy_claimed_by',uid);
+    return {tasks:tasksMoved,daily:dailyMoved,period:periodMoved};
+  });
+  return {claimed:true,by:uid,moved,before};
+}
+
+/** If exactly one real account exists, attach leftover legacy data to that account. */
+export function autoClaimSqliteLegacyData(){
+  const status=getSqliteLegacyClaimStatus();
+  if(status.claimedBy&&!status.pendingTasks&&!status.pendingDaily&&!status.pendingPeriod)return {claimed:false,reason:'already',by:status.claimedBy};
+  const realUsers=Number(countRealUsers.get(LEGACY_USER_ID)?.n||0);
+  if(realUsers!==1)return {claimed:false,reason:realUsers===0?'no_users':'multi_user',pending:status};
+  const oldest=selectOldestRealUser.get(LEGACY_USER_ID)?.id;
+  if(!oldest)return {claimed:false,reason:'no_users'};
+  return claimSqliteLegacyData(oldest,{forceOwner:true});
 }
 
 export function closeSqlite(){db.close()}
