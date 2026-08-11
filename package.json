@@ -9,7 +9,9 @@
     "start": "node server/index.mjs",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --host 0.0.0.0",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "setup:postgres": "node scripts/setup-postgres.mjs",
+    "migrate:sqlite-to-pg": "node scripts/migrate-sqlite-to-pg.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.4",
@@ -17,6 +19,7 @@
     "express": "^5.1.0",
     "multer": "^2.0.2",
     "opencc-js": "^1.4.1",
+    "pg": "^8.23.0",
     "react": "^19.1.1",
     "react-dom": "^19.1.1"
   },

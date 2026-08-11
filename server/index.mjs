@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { Converter } from 'opencc-js/t2cn';
-import { authenticateSqliteUser, autoClaimSqliteLegacyData, claimSqliteLegacyData, closeSqlite, createSqliteSession, createSqliteUser, deleteSqlitePeriodReport, deleteSqliteReport, deleteSqliteSession, deleteSqliteTask, getSqliteSession, getSqliteTask, getSqliteUser, getSqliteUserModelSettings, getSqliteUserPreferences, LEGACY_USER_ID, listSqlitePeriodReports, listSqliteTasks, loadSqlitePeriodReport, loadSqliteReport, patchSqliteTask, saveSqlitePeriodReport, saveSqliteReport, saveSqliteTask, saveSqliteUserModelSettings, saveSqliteUserPreferences, sqliteDisplayPath } from './sqlite-store.mjs';
+import { authenticateSqliteUser, autoClaimSqliteLegacyData, claimSqliteLegacyData, closeSqlite, createSqliteSession, createSqliteUser, deleteSqlitePeriodReport, deleteSqliteReport, deleteSqliteSession, deleteSqliteTask, getSqliteSession, getSqliteTask, getSqliteUserModelSettings, getSqliteUserPreferences, initStore, LEGACY_USER_ID, listSqlitePeriodReports, listSqliteTasks, loadSqlitePeriodReport, loadSqliteReport, patchSqliteTask, saveSqlitePeriodReport, saveSqliteReport, saveSqliteTask, saveSqliteUserModelSettings, saveSqliteUserPreferences, storageDisplay, storageMode } from './store.mjs';
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -51,8 +51,8 @@ function emptyAiConfig(overrides = {}) {
 }
 
 /** Per-user keys only — server .env keys are never used for AI calls. */
-function resolveAiConfig(userId) {
-  const stored = userId ? getSqliteUserModelSettings(userId) : null;
+async function resolveAiConfig(userId) {
+  const stored = userId ? await getSqliteUserModelSettings(userId) : null;
   if (!stored) return emptyAiConfig();
   const provider = normalizeTextProvider(stored.provider);
   const baseURL = resolveProviderBaseURL(provider, stored.baseURL);
@@ -107,16 +107,15 @@ async function adoptLegacyVoiceDirs(userId) {
 }
 
 function applyLegacyClaim(userId) {
-  try {
-    const result = claimSqliteLegacyData(userId);
+  return claimSqliteLegacyData(userId).then((result) => {
     if (result?.claimed || result?.reason === 'empty' || result?.by === userId) {
       void adoptLegacyVoiceDirs(userId);
     }
     return result;
-  } catch (error) {
+  }).catch((error) => {
     console.error('认领历史数据失败', error);
     return { claimed: false, reason: 'error', message: error?.message };
-  }
+  });
 }
 
 function normalizeTextProvider(value) {
@@ -226,26 +225,47 @@ function requireUser(req, res, next) {
     req.user = { id: 'cloud-shared', email: '', name: '云端' };
     return next();
   }
-  const session = getSqliteSession(parseCookies(req)[SESSION_COOKIE]);
-  if (!session?.user) return res.status(401).json({ error: 'UNAUTHORIZED', message: '请先登录' });
-  req.user = session.user;
-  req.sessionId = session.id;
-  next();
+  Promise.resolve()
+    .then(async () => {
+      const session = await getSqliteSession(parseCookies(req)[SESSION_COOKIE]);
+      if (!session?.user) return res.status(401).json({ error: 'UNAUTHORIZED', message: '请先登录' });
+      req.user = session.user;
+      req.sessionId = session.id;
+      next();
+    })
+    .catch((error) => {
+      console.error(error);
+      res.status(500).json({ message: '登录状态校验失败' });
+    });
 }
 
 function requireTextAi(req, res, next) {
-  const ai = resolveAiConfig(req.user?.id);
-  if (!ai.textApiKey) return res.status(503).json({ error: 'AI_NOT_CONFIGURED', message: '请先在「设置 → 大模型」配置任务理解 API Key' });
-  req.ai = ai;
-  next();
+  Promise.resolve()
+    .then(async () => {
+      const ai = await resolveAiConfig(req.user?.id);
+      if (!ai.textApiKey) return res.status(503).json({ error: 'AI_NOT_CONFIGURED', message: '请先在「设置 → 大模型」配置任务理解 API Key' });
+      req.ai = ai;
+      next();
+    })
+    .catch((error) => {
+      console.error(error);
+      res.status(500).json({ message: '读取模型配置失败' });
+    });
 }
 
 function requireVoiceAi(req, res, next) {
-  const ai = resolveAiConfig(req.user?.id);
-  if (!ai.textApiKey) return res.status(503).json({ error: 'AI_NOT_CONFIGURED', message: '请先在「设置 → 大模型」配置任务理解 API Key' });
-  if (!ai.resolveAsrKey()) return res.status(503).json({ error: 'ASR_NOT_CONFIGURED', message: '请先在「设置 → 大模型」配置语音识别 API Key' });
-  req.ai = ai;
-  next();
+  Promise.resolve()
+    .then(async () => {
+      const ai = await resolveAiConfig(req.user?.id);
+      if (!ai.textApiKey) return res.status(503).json({ error: 'AI_NOT_CONFIGURED', message: '请先在「设置 → 大模型」配置任务理解 API Key' });
+      if (!ai.resolveAsrKey()) return res.status(503).json({ error: 'ASR_NOT_CONFIGURED', message: '请先在「设置 → 大模型」配置语音识别 API Key' });
+      req.ai = ai;
+      next();
+    })
+    .catch((error) => {
+      console.error(error);
+      res.status(500).json({ message: '读取模型配置失败' });
+    });
 }
 
 /** @deprecated prefer requireTextAi / requireVoiceAi */
@@ -711,7 +731,7 @@ async function purgeExpiredVoiceJobs(retentionDays = jobSettings.voiceRetention.
     const full = path.join(voiceJobsDir, entry.name);
     try {
       if (entry.isDirectory()) {
-        const prefs = getSqliteUserPreferences(entry.name);
+        const prefs = await getSqliteUserPreferences(entry.name);
         const userDays = prefs?.voiceRetention?.retentionDays || days;
         removed += await purgeExpiredVoiceJobsInDir(full, userDays);
         continue;
@@ -733,15 +753,15 @@ async function purgeExpiredVoiceJobs(retentionDays = jobSettings.voiceRetention.
   return { removed, retentionDays: days };
 }
 
-function userVoiceRetention(userId) {
-  const prefs = userId ? getSqliteUserPreferences(userId) : null;
+async function userVoiceRetention(userId) {
+  const prefs = userId ? await getSqliteUserPreferences(userId) : null;
   if (prefs?.voiceRetention) return normalizeVoiceRetentionSettings(prefs.voiceRetention);
   return normalizeVoiceRetentionSettings(jobSettings.voiceRetention);
 }
 
 async function runVoiceRetentionJobIfDue(force = false, userId = null) {
   if (userId) {
-    const schedule = userVoiceRetention(userId);
+    const schedule = await userVoiceRetention(userId);
     if (!force && !schedule.enabled) return null;
     const now = new Date();
     const time = force ? (schedule.times[0] || '03:00') : latestDueJobTime(schedule.times, now);
@@ -775,27 +795,30 @@ async function runVoiceRetentionJobIfDue(force = false, userId = null) {
   return { ...result, slotKey, time };
 }
 
-function persistVoiceResultToSqlite(job,result){
+async function persistVoiceResultToSqlite(job,result){
   if(supabaseUrl)return [];
   const userId=job.userId;
   if(!userId)return [];
   const command=result.command;
-  if(command?.action==='edit_report'||command?.action==='clarify'){deleteSqliteTask(userId,job.id);return []}
+  if(command?.action==='edit_report'||command?.action==='clarify'){await deleteSqliteTask(userId,job.id);return []}
   if(command?.action==='update'){
-    deleteSqliteTask(userId,job.id);const requested=command.updates?.length?command.updates:[{targetTaskId:command.targetTaskId,changes:command.changes}];const ids=[];
-    for(const entry of requested){const current=getSqliteTask(userId,entry.targetTaskId);if(!current)continue;const changes={...(entry.changes||{})};const now=new Date().toISOString();
+    await deleteSqliteTask(userId,job.id);const requested=command.updates?.length?command.updates:[{targetTaskId:command.targetTaskId,changes:command.changes}];const ids=[];
+    for(const entry of requested){const current=await getSqliteTask(userId,entry.targetTaskId);if(!current)continue;const changes={...(entry.changes||{})};const now=new Date().toISOString();
       if(changes.status==='doing'){changes.progress=current.progress>0&&current.progress<100?current.progress:50;changes.startedAt=current.startedAt||now;changes.completedAt=null}
       if(changes.status==='done'){changes.progress=100;changes.startedAt=current.startedAt||now;changes.completedAt=now}
       if(changes.status==='todo'){changes.progress=0;changes.startedAt=null;changes.completedAt=null}
-      patchSqliteTask(userId,current.id,changes);ids.push(current.id)}
+      await patchSqliteTask(userId,current.id,changes);ids.push(current.id)}
     return ids;
   }
   const parsedTasks=(result.tasks?.length?result.tasks:command?.tasks?.length?command.tasks:result.task?[result.task]:[]).slice(0,10);
-  return parsedTasks.map((parsed,index)=>{
+  const ids=[];
+  for(let index=0;index<parsedTasks.length;index+=1){
+    const parsed=parsedTasks[index];
     const id=index===0?job.id:`${job.id}-${index+1}`;
-    saveSqliteTask(userId,{id,title:parsed.title||result.transcript||'语音任务',assignee:parsed.assignee||'我',due:parsed.due||'今天',status:'todo',priority:parsed.priority||'中',progress:0,estimatedMinutes:parsed.estimatedMinutes||60,createdAt:job.createdAt,startedAt:null,completedAt:null,aiStatus:null});
-    return id;
-  });
+    await saveSqliteTask(userId,{id,title:parsed.title||result.transcript||'语音任务',assignee:parsed.assignee||'我',due:parsed.due||'今天',status:'todo',priority:parsed.priority||'中',progress:0,estimatedMinutes:parsed.estimatedMinutes||60,createdAt:job.createdAt,startedAt:null,completedAt:null,aiStatus:null});
+    ids.push(id);
+  }
+  return ids;
 }
 
 async function processVoiceJob(id) {
@@ -803,7 +826,7 @@ async function processVoiceJob(id) {
   if (!job || runningVoiceJobs.has(id) || job.status === 'completed') return;
   runningVoiceJobs.add(id);
   try {
-    const ai = resolveAiConfig(job.userId);
+    const ai = await resolveAiConfig(job.userId);
     if (!ai.textApiKey) throw new Error('请先在「设置 → 大模型」配置任务理解 API Key');
     job.status = 'processing';
     job.error = '';
@@ -844,7 +867,7 @@ async function processVoiceJob(id) {
       job.task = null;
       if (job.cleared) job.command = { ...result.command, message: result.command.message || (kind === 'weekly' ? '周报已清空' : kind === 'monthly' ? '月报已清空' : '今日复盘已清空') };
       await persistVoiceJob(job);
-      try{if(job.userId)deleteSqliteTask(job.userId,job.id);job.persistedTaskIds=[];job.storageError=''}catch(error){job.storageError=error?.message||'清理占位任务失败'}
+      try{if(job.userId)await deleteSqliteTask(job.userId,job.id);job.persistedTaskIds=[];job.storageError=''}catch(error){job.storageError=error?.message||'清理占位任务失败'}
     } else {
       job.stage = 'saving';
       job.tasks = result.tasks || [];
@@ -852,7 +875,7 @@ async function processVoiceJob(id) {
       job.editedReport = null;
       job.reportKind = '';
       await persistVoiceJob(job);
-      try{job.persistedTaskIds=persistVoiceResultToSqlite(job,result);job.storageError=''}catch(error){console.error('语音任务写入 SQLite 失败',error);job.storageError=error?.message||'SQLite 保存失败'}
+      try{job.persistedTaskIds=await persistVoiceResultToSqlite(job,result);job.storageError=''}catch(error){console.error('语音任务写入存储失败',error);job.storageError=error?.message||'任务保存失败'}
     }
     job.status = 'completed';
     job.stage = 'completed';
@@ -969,7 +992,7 @@ async function processReportEditJob(id) {
   if (!job || runningReportEditJobs.has(id) || job.status === 'completed') return;
   runningReportEditJobs.add(id);
   try {
-    const ai = resolveAiConfig(job.userId);
+    const ai = await resolveAiConfig(job.userId);
     if (!ai.textApiKey) throw new Error('请先在「设置 → 大模型」配置任务理解 API Key');
     job.status = 'processing';
     job.stage = job.audioFile ? 'transcribing' : 'understanding';
@@ -1054,118 +1077,118 @@ app.get('/api/health', (_req, res) => {
     textModel: defaults.textModel,
     transcriptionModel: defaults.asrModel,
     modelScope: 'user',
-    storage: { mode: 'sqlite', file: sqliteDisplayPath }
+    storage: { mode: storageMode, file: storageDisplay }
   });
 });
 
-app.post('/api/auth/register', (req, res) => {
+app.post('/api/auth/register', async (req, res) => {
   if (cloudMode()) return res.status(400).json({ message: '当前已启用云端登录，请使用邮箱登录链接' });
   try {
-    const user = createSqliteUser({ email: req.body?.email, password: req.body?.password, name: req.body?.name });
-    const session = createSqliteSession(user.id, SESSION_DAYS);
+    const user = await createSqliteUser({ email: req.body?.email, password: req.body?.password, name: req.body?.name });
+    const session = await createSqliteSession(user.id, SESSION_DAYS);
     setSessionCookie(res, session.id, session.expiresAt, req);
-    const legacy = applyLegacyClaim(user.id);
+    const legacy = await applyLegacyClaim(user.id);
     res.status(201).json({ user, legacy });
   } catch (error) {
     res.status(400).json({ message: error?.message || '注册失败' });
   }
 });
 
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
   if (cloudMode()) return res.status(400).json({ message: '当前已启用云端登录，请使用邮箱登录链接' });
   try {
-    const user = authenticateSqliteUser(req.body?.email, req.body?.password);
-    const session = createSqliteSession(user.id, SESSION_DAYS);
+    const user = await authenticateSqliteUser(req.body?.email, req.body?.password);
+    const session = await createSqliteSession(user.id, SESSION_DAYS);
     setSessionCookie(res, session.id, session.expiresAt, req);
-    const legacy = applyLegacyClaim(user.id);
+    const legacy = await applyLegacyClaim(user.id);
     res.json({ user, legacy });
   } catch (error) {
     res.status(401).json({ message: error?.message || '登录失败' });
   }
 });
 
-app.post('/api/auth/logout', (req, res) => {
+app.post('/api/auth/logout', async (req, res) => {
   const sid = parseCookies(req)[SESSION_COOKIE];
-  if (sid) deleteSqliteSession(sid);
+  if (sid) await deleteSqliteSession(sid);
   clearSessionCookie(res, req);
   res.status(204).end();
 });
 
-app.get('/api/auth/me', (req, res) => {
+app.get('/api/auth/me', async (req, res) => {
   if (cloudMode()) return res.json({ user: null, mode: 'supabase' });
-  const session = getSqliteSession(parseCookies(req)[SESSION_COOKIE]);
+  const session = await getSqliteSession(parseCookies(req)[SESSION_COOKIE]);
   if (!session?.user) return res.status(401).json({ user: null, message: '未登录' });
   res.json({ user: session.user, mode: 'local' });
 });
 
-app.get('/api/sqlite/tasks', requireUser, (req, res) => res.json(listSqliteTasks(req.user.id)));
+app.get('/api/sqlite/tasks', requireUser, async (req, res) => res.json(await listSqliteTasks(req.user.id)));
 
-app.get('/api/sqlite/tasks/:id', requireUser, (req, res) => {
-  const task=getSqliteTask(req.user.id,req.params.id);
+app.get('/api/sqlite/tasks/:id', requireUser, async (req, res) => {
+  const task=await getSqliteTask(req.user.id,req.params.id);
   if(!task)return res.status(404).json({message:'任务不存在'});
   res.json(task);
 });
 
-app.put('/api/sqlite/tasks/:id', requireUser, (req, res) => {
-  try{res.json(saveSqliteTask(req.user.id,{...req.body,id:req.params.id}))}
+app.put('/api/sqlite/tasks/:id', requireUser, async (req, res) => {
+  try{res.json(await saveSqliteTask(req.user.id,{...req.body,id:req.params.id}))}
   catch(error){res.status(400).json({message:error?.message||'任务保存失败'})}
 });
 
-app.patch('/api/sqlite/tasks/:id', requireUser, (req, res) => {
-  try{const task=patchSqliteTask(req.user.id,req.params.id,req.body||{});if(!task)return res.status(404).json({message:'任务不存在'});res.json(task)}
+app.patch('/api/sqlite/tasks/:id', requireUser, async (req, res) => {
+  try{const task=await patchSqliteTask(req.user.id,req.params.id,req.body||{});if(!task)return res.status(404).json({message:'任务不存在'});res.json(task)}
   catch(error){res.status(400).json({message:error?.message||'任务更新失败'})}
 });
 
-app.delete('/api/sqlite/tasks/:id', requireUser, (req, res) => {
-  deleteSqliteTask(req.user.id,req.params.id);res.status(204).end();
+app.delete('/api/sqlite/tasks/:id', requireUser, async (req, res) => {
+  await deleteSqliteTask(req.user.id,req.params.id);res.status(204).end();
 });
 
-app.get('/api/sqlite/reports/:date', requireUser, (req, res) => {
+app.get('/api/sqlite/reports/:date', requireUser, async (req, res) => {
   if(!/^\d{4}-\d{2}-\d{2}$/.test(req.params.date))return res.status(400).json({message:'日期格式不正确'});
-  res.json(loadSqliteReport(req.user.id,req.params.date));
+  res.json(await loadSqliteReport(req.user.id,req.params.date));
 });
 
-app.put('/api/sqlite/reports/:date', requireUser, (req, res) => {
+app.put('/api/sqlite/reports/:date', requireUser, async (req, res) => {
   if(!/^\d{4}-\d{2}-\d{2}$/.test(req.params.date))return res.status(400).json({message:'日期格式不正确'});
   if(!req.body?.report||typeof req.body.report!=='object')return res.status(400).json({message:'日报内容不能为空'});
-  res.json(saveSqliteReport(req.user.id,req.params.date,req.body.report));
+  res.json(await saveSqliteReport(req.user.id,req.params.date,req.body.report));
 });
 
-app.delete('/api/sqlite/reports/:date', requireUser, (req, res) => {
-  deleteSqliteReport(req.user.id,req.params.date);res.status(204).end();
+app.delete('/api/sqlite/reports/:date', requireUser, async (req, res) => {
+  await deleteSqliteReport(req.user.id,req.params.date);res.status(204).end();
 });
 
-app.get('/api/sqlite/period-reports/:kind', requireUser, (req, res) => {
+app.get('/api/sqlite/period-reports/:kind', requireUser, async (req, res) => {
   try {
     if (!['weekly', 'monthly'].includes(req.params.kind)) return res.status(400).json({ message: '周期类型不正确' });
-    res.json(listSqlitePeriodReports(req.user.id,req.params.kind));
+    res.json(await listSqlitePeriodReports(req.user.id,req.params.kind));
   } catch (error) {
     res.status(400).json({ message: error?.message || '读取周期复盘列表失败' });
   }
 });
 
-app.get('/api/sqlite/period-reports/:kind/:key', requireUser, (req, res) => {
+app.get('/api/sqlite/period-reports/:kind/:key', requireUser, async (req, res) => {
   try {
     if (!isPeriodKey(req.params.kind, req.params.key)) return res.status(400).json({ message: '周期键格式不正确' });
-    res.json(loadSqlitePeriodReport(req.user.id,req.params.kind, req.params.key));
+    res.json(await loadSqlitePeriodReport(req.user.id,req.params.kind, req.params.key));
   } catch (error) {
     res.status(400).json({ message: error?.message || '读取周期复盘失败' });
   }
 });
 
-app.put('/api/sqlite/period-reports/:kind/:key', requireUser, (req, res) => {
+app.put('/api/sqlite/period-reports/:kind/:key', requireUser, async (req, res) => {
   try {
     if (!isPeriodKey(req.params.kind, req.params.key)) return res.status(400).json({ message: '周期键格式不正确' });
     if (!req.body?.report || typeof req.body.report !== 'object') return res.status(400).json({ message: '复盘内容不能为空' });
-    res.json(saveSqlitePeriodReport(req.user.id,req.params.kind, req.params.key, req.body.report));
+    res.json(await saveSqlitePeriodReport(req.user.id,req.params.kind, req.params.key, req.body.report));
   } catch (error) {
     res.status(400).json({ message: error?.message || '保存周期复盘失败' });
   }
 });
 
-app.delete('/api/sqlite/period-reports/:kind/:key', requireUser, (req, res) => {
+app.delete('/api/sqlite/period-reports/:kind/:key', requireUser, async (req, res) => {
   try {
-    deleteSqlitePeriodReport(req.user.id,req.params.kind, req.params.key);
+    await deleteSqlitePeriodReport(req.user.id,req.params.kind, req.params.key);
     res.status(204).end();
   } catch (error) {
     res.status(400).json({ message: error?.message || '删除周期复盘失败' });
@@ -1216,8 +1239,8 @@ app.delete('/api/settings/cloud', requireSettingsAccess, async (_req, res) => {
   }
 });
 
-function modelSettingsPublic(userId) {
-  const ai = resolveAiConfig(userId);
+async function modelSettingsPublic(userId) {
+  const ai = await resolveAiConfig(userId);
   const textKey = ai.textApiKey;
   const asrKey = ai.asrApiKey;
   return {
@@ -1246,9 +1269,9 @@ function modelSettingsPublic(userId) {
   };
 }
 
-app.get('/api/settings/model', requireUser, (req, res) => {
+app.get('/api/settings/model', requireUser, async (req, res) => {
   res.set('Cache-Control', 'no-store');
-  res.json(modelSettingsPublic(req.user.id));
+  res.json(await modelSettingsPublic(req.user.id));
 });
 
 async function probeBailianKey(apiKey) {
@@ -1282,7 +1305,7 @@ async function testTextModelConnection(apiKey, model, baseURL) {
   return String(messageText(data) || '').trim().slice(0, 40);
 }
 
-function parseModelSettingsBody(body = {}, currentAi = resolveAiConfig(null)) {
+function parseModelSettingsBody(body = {}, currentAi = emptyAiConfig()) {
   const nextProvider = normalizeTextProvider(body.provider || body.textProvider || currentAi.provider);
   const nextBaseURL = resolveProviderBaseURL(nextProvider, body.baseURL ?? body.textBaseURL ?? (nextProvider === currentAi.provider ? currentAi.baseURL : ''));
   const nextTextKey = String(body.textApiKey || body.apiKey || '').trim();
@@ -1298,7 +1321,7 @@ function parseModelSettingsBody(body = {}, currentAi = resolveAiConfig(null)) {
 
 app.post('/api/settings/model/test', requireUser, async (req, res) => {
   try {
-    const current = resolveAiConfig(req.user.id);
+    const current = await resolveAiConfig(req.user.id);
     const parsed = parseModelSettingsBody(req.body, current);
     const candidateTextKey = parsed.nextTextKey || current.textApiKey;
     const candidateAsrKey = parsed.clearAsrKey ? '' : (parsed.nextAsrKey || current.asrApiKey);
@@ -1336,8 +1359,8 @@ app.post('/api/settings/model/test', requireUser, async (req, res) => {
 
 app.put('/api/settings/model', requireUser, async (req, res) => {
   try {
-    const stored = getSqliteUserModelSettings(req.user.id);
-    const current = resolveAiConfig(req.user.id);
+    const stored = await getSqliteUserModelSettings(req.user.id);
+    const current = await resolveAiConfig(req.user.id);
     const parsed = parseModelSettingsBody(req.body, current);
     const nextTextKey = parsed.nextTextKey || stored?.textApiKey || '';
     if (!nextTextKey) return res.status(400).json({ message: '请填写任务理解 API Key（每位用户需单独配置，不再使用服务端 .env）' });
@@ -1345,7 +1368,7 @@ app.put('/api/settings/model', requireUser, async (req, res) => {
     if (parsed.clearAsrKey) nextAsrKey = '';
     else if (parsed.nextAsrKey) nextAsrKey = parsed.nextAsrKey;
     else nextAsrKey = stored?.asrApiKey || '';
-    saveSqliteUserModelSettings(req.user.id, {
+    await saveSqliteUserModelSettings(req.user.id, {
       provider: parsed.nextProvider,
       baseURL: parsed.nextBaseURL,
       textApiKey: nextTextKey,
@@ -1353,7 +1376,7 @@ app.put('/api/settings/model', requireUser, async (req, res) => {
       textModel: parsed.nextTextModel,
       asrModel: parsed.nextAsrModel
     });
-    res.json({ ...modelSettingsPublic(req.user.id), message: '你的模型配置已保存并立即生效' });
+    res.json({ ...(await modelSettingsPublic(req.user.id)), message: '你的模型配置已保存并立即生效' });
   } catch (error) {
     const status = /不合法|不正确|不能为空|不支持/.test(String(error?.message || '')) ? 400 : 500;
     res.status(status).json({ message: error?.message || '模型设置保存失败' });
@@ -1402,21 +1425,21 @@ app.post('/api/parse-task-text', requireUser, requireTextAi, async (req, res) =>
   }
 });
 
-function publicUserPreferences(userId) {
-  const prefs = getSqliteUserPreferences(userId) || { avatar: '', autoSchedule: null, voiceRetention: null };
+async function publicUserPreferences(userId) {
+  const prefs = (await getSqliteUserPreferences(userId)) || { avatar: '', autoSchedule: null, voiceRetention: null };
   return {
     avatar: prefs.avatar || '',
     autoSchedule: prefs.autoSchedule || null,
-    voiceRetention: prefs.voiceRetention ? normalizeVoiceRetentionSettings(prefs.voiceRetention) : userVoiceRetention(userId)
+    voiceRetention: prefs.voiceRetention ? normalizeVoiceRetentionSettings(prefs.voiceRetention) : await userVoiceRetention(userId)
   };
 }
 
-app.get('/api/settings/profile', requireUser, (req, res) => {
+app.get('/api/settings/profile', requireUser, async (req, res) => {
   res.set('Cache-Control', 'no-store');
-  res.json(publicUserPreferences(req.user.id));
+  res.json(await publicUserPreferences(req.user.id));
 });
 
-app.put('/api/settings/profile', requireUser, (req, res) => {
+app.put('/api/settings/profile', requireUser, async (req, res) => {
   try {
     const patch = {};
     if (Object.prototype.hasOwnProperty.call(req.body || {}, 'avatar')) {
@@ -1429,23 +1452,23 @@ app.put('/api/settings/profile', requireUser, (req, res) => {
     if (Object.prototype.hasOwnProperty.call(req.body || {}, 'autoSchedule')) {
       patch.autoSchedule = req.body.autoSchedule && typeof req.body.autoSchedule === 'object' ? req.body.autoSchedule : null;
     }
-    saveSqliteUserPreferences(req.user.id, patch);
-    res.json({ ...publicUserPreferences(req.user.id), message: '个人设置已保存' });
+    await saveSqliteUserPreferences(req.user.id, patch);
+    res.json({ ...(await publicUserPreferences(req.user.id)), message: '个人设置已保存' });
   } catch (error) {
     res.status(400).json({ message: error?.message || '个人设置保存失败' });
   }
 });
 
-app.get('/api/settings/jobs', requireUser, (req, res) => {
+app.get('/api/settings/jobs', requireUser, async (req, res) => {
   res.set('Cache-Control', 'no-store');
-  res.json({ voiceRetention: userVoiceRetention(req.user.id), scope: 'user' });
+  res.json({ voiceRetention: await userVoiceRetention(req.user.id), scope: 'user' });
 });
 
 app.put('/api/settings/jobs', requireUser, async (req, res) => {
   try {
     const voiceRetention = normalizeVoiceRetentionSettings(req.body?.voiceRetention || req.body);
     const autoSchedule = req.body?.autoSchedule && typeof req.body.autoSchedule === 'object' ? req.body.autoSchedule : undefined;
-    saveSqliteUserPreferences(req.user.id, {
+    await saveSqliteUserPreferences(req.user.id, {
       voiceRetention,
       ...(autoSchedule !== undefined ? { autoSchedule } : {})
     });
@@ -1458,11 +1481,11 @@ app.put('/api/settings/jobs', requireUser, async (req, res) => {
 
 app.post('/api/voice-jobs/purge', requireUser, async (req, res) => {
   try {
-    const schedule = userVoiceRetention(req.user.id);
+    const schedule = await userVoiceRetention(req.user.id);
     const days = Number(req.body?.retentionDays);
     const retentionDays = Number.isInteger(days) && days >= 1 && days <= 90 ? days : schedule.retentionDays;
     if (Number.isInteger(days) && days >= 1 && days <= 90) {
-      saveSqliteUserPreferences(req.user.id, { voiceRetention: { ...schedule, retentionDays } });
+      await saveSqliteUserPreferences(req.user.id, { voiceRetention: { ...schedule, retentionDays } });
     }
     const force = Boolean(req.body?.force);
     const result = force
@@ -1475,7 +1498,7 @@ app.post('/api/voice-jobs/purge', requireUser, async (req, res) => {
           return { ...data, slotKey, time };
         })
       : await runVoiceRetentionJobIfDue(false, req.user.id);
-    const voiceRetention = userVoiceRetention(req.user.id);
+    const voiceRetention = await userVoiceRetention(req.user.id);
     if (!result) return res.json({ skipped: true, message: '当前未到清理作业时间，或本时段已执行', voiceRetention });
     res.json({ skipped: false, ...result, voiceRetention, message: `已清理 ${result.removed} 条过期指令` });
   } catch (error) {
@@ -1486,7 +1509,8 @@ app.post('/api/voice-jobs/purge', requireUser, async (req, res) => {
 
 app.get('/api/voice-jobs', requireUser, async (req, res) => {
   try {
-    const retentionDays = userVoiceRetention(req.user.id).retentionDays;
+    const voiceRetention = await userVoiceRetention(req.user.id);
+    const retentionDays = voiceRetention.retentionDays;
     const cutoff = Date.now() - voiceRetentionMs(retentionDays);
     const userId = req.user.id;
     const items = [...voiceJobs.values()]
@@ -1497,7 +1521,7 @@ app.get('/api/voice-jobs', requireUser, async (req, res) => {
       })
       .sort((a, b) => Date.parse(b.createdAt || b.updatedAt || 0) - Date.parse(a.createdAt || a.updatedAt || 0))
       .map(voiceJobListItem);
-    res.json({ retentionDays, voiceRetention: userVoiceRetention(userId), items });
+    res.json({ retentionDays, voiceRetention, items });
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: '读取语音指令历史失败' });
@@ -1644,7 +1668,7 @@ app.post('/api/voice-jobs/:id/retry', requireUser, async (req, res) => {
   const job = ownedVoiceJob(req, res);
   if (!job) return;
   if (job.status === 'completed') return res.status(409).json({ message: '这条语音任务已经识别完成' });
-  const ai = resolveAiConfig(req.user.id);
+  const ai = await resolveAiConfig(req.user.id);
   if (!ai.textApiKey) return res.status(503).json({ error: 'AI_NOT_CONFIGURED', message: '请先在「设置 → 大模型」配置任务理解 API Key' });
   if (job.audioFile && !ai.resolveAsrKey()) return res.status(503).json({ error: 'ASR_NOT_CONFIGURED', message: '请先在「设置 → 大模型」配置语音识别 API Key' });
   job.status = 'queued';
@@ -1831,14 +1855,14 @@ app.use((req,res,next)=>{if(req.path==='/'||req.path==='/index.html'||req.path==
 app.use(express.static(dist));
 app.get('/{*splat}', (_req, res) => res.set('Cache-Control','no-store').sendFile(path.join(dist, 'index.html')));
 let sqliteClosed=false;
-const closeDatabase=()=>{if(sqliteClosed)return;sqliteClosed=true;closeSqlite()};
+const closeDatabase=()=>{if(sqliteClosed)return;sqliteClosed=true;void closeSqlite()};
 process.once('SIGINT',()=>{closeDatabase();process.exit(0)});
 process.once('SIGTERM',()=>{closeDatabase();process.exit(0)});
 process.once('exit',closeDatabase);
-Promise.all([loadJobSettings(), recoverVoiceJobs(), recoverReportEditJobs()])
-  .then(() => {
+Promise.all([initStore(), loadJobSettings(), recoverVoiceJobs(), recoverReportEditJobs()])
+  .then(async () => {
     try {
-      const legacy = autoClaimSqliteLegacyData();
+      const legacy = await autoClaimSqliteLegacyData();
       if (legacy?.claimed) {
         console.log(`已将 local-legacy 历史数据归属用户 ${legacy.by}`, legacy.moved);
         void adoptLegacyVoiceDirs(legacy.by);
@@ -1847,9 +1871,9 @@ Promise.all([loadJobSettings(), recoverVoiceJobs(), recoverReportEditJobs()])
       console.error('自动认领历史数据失败', error);
     }
     setInterval(() => { void runVoiceRetentionJobIfDue(false).catch(console.error); }, 60 * 1000);
-    app.listen(port, '0.0.0.0', () => console.log(`FlowMate Qwen server: http://localhost:${port}`));
+    app.listen(port, '0.0.0.0', () => console.log(`FlowMate Qwen server: http://localhost:${port} [${storageMode}: ${storageDisplay}]`));
   })
   .catch(error => {
-    console.error('语音任务队列初始化失败', error);
+    console.error('服务初始化失败', error);
     process.exitCode = 1;
   });

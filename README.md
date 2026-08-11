@@ -29,23 +29,36 @@ AI 语音流程：浏览器录音 → 服务端发送 Base64 音频给 `qwen3-as
 
 AI 工作复盘每天自动生成一次并缓存在本机，也可以手动重新生成；建议的明日事项可一键加入任务列表。
 
-## 京东云 SQLite 文件存储（默认）
+## 本地存储：SQLite（默认）或 PostgreSQL
 
-未配置 Supabase 时，应用默认把任务和日报保存到服务器 SQLite 文件：
+未配置 `DATABASE_URL` 且未配置 Supabase 时，应用默认把任务、复盘与账号数据保存到服务器 SQLite 文件：
 
 ```env
 SQLITE_PATH=data/flowmate.db
 ```
 
-数据库使用 WAL 模式，默认文件为 `data/flowmate.db`。手机、iPhone 和电脑只要访问同一个京东云地址，就会读写同一份数据；页面每 5 秒检查其他设备产生的变化。
+数据库使用 WAL 模式，默认文件为 `data/flowmate.db`。手机、iPhone 和电脑只要访问同一个服务地址，就会读写同一份数据；页面每 5 秒检查其他设备产生的变化。
 
 部署要求 Node.js 22.13 或更高版本，推荐 Node.js 24。升级、重启或重新发布时必须保留整个 `data/` 目录。备份时建议同时备份 `flowmate.db`、`flowmate.db-wal` 和 `flowmate.db-shm`，或者先停止服务再复制 `flowmate.db`。
 
 如果使用 Docker，请把数据目录挂载到持久卷，例如：`-v /opt/flowmate-data:/app/data`。不要把 SQLite 文件提交到 Git，项目已默认忽略这些文件。
 
-SQLite 模式适合一台京东云服务器运行一个 Node 进程。若以后采用多实例负载均衡，再切换到 Supabase/PostgreSQL。
+### 可选：切换到本机 / 服务器 PostgreSQL
 
-SQLite 模式是共享工作区，不自带账号隔离。正式暴露到公网时，请在京东云安全组和 Nginx 中启用 HTTPS 与访问认证；不要直接把 Node 端口开放给整个互联网。
+1. 确保 PostgreSQL 已启动，并能用超级用户连接（Windows 常需带密码）。
+2. 建库与角色：`npm run setup:postgres`（可用 `PG_ADMIN_URL`、`FLOWMATE_DB_PASSWORD` 覆盖默认值）。
+3. 把脚本打印的 `DATABASE_URL=...` 写入 `.env`。
+4. 一次性导入现有 SQLite 数据：`npm run migrate:sqlite-to-pg`（可重复执行，默认 upsert；**不会删除** `data/flowmate.db`）。
+5. 重启服务；`GET /api/health` 中 `storage.mode` 应为 `postgres`。
+
+```env
+DATABASE_URL=postgres://flowmate:CHANGE_ME@127.0.0.1:5432/flowmate
+# PG_ADMIN_URL=postgres://postgres:ADMIN_PASS@127.0.0.1:5432/postgres
+# FLOWMATE_DB_PASSWORD=CHANGE_ME
+SQLITE_PATH=data/flowmate.db
+```
+
+本地账号仍按用户隔离。正式暴露到公网时，请在安全组和 Nginx 中启用 HTTPS；不要直接把 Node 端口开放给整个互联网。
 
 ## 可选：Supabase 云端存储
 
