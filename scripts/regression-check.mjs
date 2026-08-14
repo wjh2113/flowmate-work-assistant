@@ -1,6 +1,6 @@
 /**
- * Broader API regression after per-user isolation / model / legacy claim changes.
- * Usage: E2E_BASE=http://127.0.0.1:8799 node scripts/regression-check.mjs
+ * Broader API regression after builtin models / points / admin changes.
+ * Usage: E2E_BASE=http://127.0.0.1:8790 node scripts/regression-check.mjs
  */
 const base = process.env.E2E_BASE || 'http://127.0.0.1:8790';
 const results = [];
@@ -36,15 +36,14 @@ const b = jar();
 const ea = `reg_a_${stamp}@t.local`;
 const eb = `reg_b_${stamp}@t.local`;
 
-// --- health / unauth ---
 const health = await json(await fetch(`${base}/api/health`));
-ok('health.requiresUserModel', health.requiresUserModel === true && health.ai === false, JSON.stringify(health));
+ok('health.builtinScope', health.modelScope === 'builtin' && health.requiresUserModel === false && health.ai === false, JSON.stringify(health));
 ok('jobs.unauth', (await fetch(`${base}/api/settings/jobs`)).status === 401);
 ok('model.unauth', (await fetch(`${base}/api/settings/model`)).status === 401);
 ok('profile.unauth', (await fetch(`${base}/api/settings/profile`)).status === 401);
 ok('daily.unauth', (await fetch(`${base}/api/daily-plan`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status === 401);
+ok('admin.unauth', (await fetch(`${base}/api/admin/dashboard`)).status === 401);
 
-// --- register ---
 const ra = await fetch(`${base}/api/auth/register`, {
   method: 'POST', headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({ email: ea, password: 'secret12', name: 'RegA' })
@@ -52,6 +51,7 @@ const ra = await fetch(`${base}/api/auth/register`, {
 a.store(ra);
 const ua = await json(ra);
 ok('register.A', ra.status === 201 && ua.user?.id, ua.message || ua.user?.id);
+ok('register.points', typeof ua.user?.pointsBalance === 'number' && ua.user.pointsBalance > 0, String(ua.user?.pointsBalance));
 
 const rb = await fetch(`${base}/api/auth/register`, {
   method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -61,58 +61,40 @@ b.store(rb);
 const ub = await json(rb);
 ok('register.B', rb.status === 201 && ub.user?.id, ub.message || ub.user?.id);
 
-// --- model: no env fallback; isolation ---
 const modelA0 = await json(await fetch(`${base}/api/settings/model`, { headers: { Cookie: a.h() } }));
-ok('model.A.empty', modelA0.configured === false && modelA0.requiresUserKey === true, JSON.stringify({ configured: modelA0.configured, requiresUserKey: modelA0.requiresUserKey }));
-
-const aiBlocked = await fetch(`${base}/api/daily-plan`, {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json', Cookie: a.h() },
-  body: JSON.stringify({ tasks: [], date: '2099-06-01', user: 'A' })
-});
-const aiBlockedBody = await json(aiBlocked);
-ok('ai.blockedWithoutKey', aiBlocked.status === 503 && aiBlockedBody.error === 'AI_NOT_CONFIGURED', `${aiBlocked.status} ${aiBlockedBody.error}`);
+ok('model.builtin', modelA0.mode === 'builtin' && modelA0.requiresUserKey === false && Array.isArray(modelA0.models) && modelA0.models.length > 0, JSON.stringify({ mode: modelA0.mode, n: modelA0.models?.length }));
+const pickFlash = modelA0.models.find(m => m.id === 'deepseek-v4-flash') || modelA0.models[0];
+const pickPro = modelA0.models.find(m => m.id === 'deepseek-v4-pro') || modelA0.models[1] || pickFlash;
 
 const putModelA = await fetch(`${base}/api/settings/model`, {
   method: 'PUT',
   headers: { 'Content-Type': 'application/json', Cookie: a.h() },
-  body: JSON.stringify({
-    provider: 'deepseek',
-    baseURL: 'https://api.deepseek.com',
-    textApiKey: 'sk-reg-test-key-aaaa1111',
-    textModel: 'deepseek-v4-flash',
-    asrModel: 'qwen3-asr-flash',
-    asrApiKey: 'sk-reg-asr-key-bbbb2222'
-  })
+  body: JSON.stringify({ modelId: pickFlash.id })
 });
 const modelA1 = await json(putModelA);
-ok('model.A.save', putModelA.status === 200 && modelA1.textConfigured && modelA1.provider === 'deepseek', modelA1.message || modelA1.provider);
+ok('model.A.select', putModelA.status === 200 && modelA1.selectedModelId === pickFlash.id, modelA1.message || modelA1.selectedModelId);
 
 const modelB0 = await json(await fetch(`${base}/api/settings/model`, { headers: { Cookie: b.h() } }));
-ok('model.B.stillEmpty', modelB0.configured === false, JSON.stringify({ configured: modelB0.configured, provider: modelB0.provider }));
+ok('model.B.canList', Array.isArray(modelB0.models) && modelB0.models.length > 0, String(modelB0.models?.length));
 
-const putModelEmpty = await fetch(`${base}/api/settings/model`, {
+const putModelB = await fetch(`${base}/api/settings/model`, {
   method: 'PUT',
   headers: { 'Content-Type': 'application/json', Cookie: b.h() },
-  body: JSON.stringify({ provider: 'bailian', textModel: 'qwen3.7-plus', asrModel: 'qwen3-asr-flash' })
+  body: JSON.stringify({ modelId: pickPro.id })
 });
-ok('model.B.requireKey', putModelEmpty.status === 400, (await json(putModelEmpty)).message);
+const modelB1 = await json(putModelB);
+ok('model.B.select', putModelB.status === 200 && modelB1.selectedModelId === pickPro.id, modelB1.selectedModelId);
 
-// keep key on update without retyping
 const putModelKeep = await fetch(`${base}/api/settings/model`, {
   method: 'PUT',
   headers: { 'Content-Type': 'application/json', Cookie: a.h() },
-  body: JSON.stringify({
-    provider: 'deepseek',
-    baseURL: 'https://api.deepseek.com',
-    textModel: 'deepseek-v4-pro',
-    asrModel: 'qwen3-asr-flash'
-  })
+  body: JSON.stringify({ modelId: pickPro.id })
 });
 const modelA2 = await json(putModelKeep);
-ok('model.A.keepKey', putModelKeep.status === 200 && modelA2.textConfigured && modelA2.textModel === 'deepseek-v4-pro' && modelA2.maskedTextKey, modelA2.message || modelA2.textModel);
+ok('model.A.switch', putModelKeep.status === 200 && modelA2.selectedModelId === pickPro.id, modelA2.selectedModelId);
 
-// --- tasks / reports isolation ---
+ok('admin.forbidden', (await fetch(`${base}/api/admin/dashboard`, { headers: { Cookie: a.h() } })).status === 403);
+
 const taskId = crypto.randomUUID();
 const putTask = await fetch(`${base}/api/sqlite/tasks/${taskId}`, {
   method: 'PUT',
@@ -149,7 +131,6 @@ const perA = await json(await fetch(`${base}/api/sqlite/period-reports/weekly/20
 const perB = await json(await fetch(`${base}/api/sqlite/period-reports/weekly/2099-W01`, { headers: { Cookie: b.h() } }));
 ok('period.isolate', perA?.headline === '回归周报' && perB == null);
 
-// --- profile / avatar / jobs ---
 const avatar = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
 const putAvatar = await fetch(`${base}/api/settings/profile`, {
   method: 'PUT', headers: { 'Content-Type': 'application/json', Cookie: a.h() },
@@ -169,7 +150,6 @@ const jobsA = await json(putJobsA);
 const jobsB = await json(await fetch(`${base}/api/settings/jobs`, { headers: { Cookie: b.h() } }));
 ok('jobs.isolate', putJobsA.status === 200 && jobsA.voiceRetention?.retentionDays === 2 && jobsB.voiceRetention?.retentionDays !== 2, `${jobsA.voiceRetention?.retentionDays}/${jobsB.voiceRetention?.retentionDays}`);
 
-// --- voice jobs ownership ---
 const vj = await fetch(`${base}/api/voice-jobs/text`, {
   method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: a.h() },
   body: JSON.stringify({ transcript: '创建一个任务：回归语音', tasks: [], reports: {} })
@@ -185,11 +165,8 @@ if (vjBody.id) {
     if (job.status === 'completed' || job.status === 'failed') break;
   }
   ok('voice.terminal', job && (job.status === 'completed' || job.status === 'failed'), `${job?.status}:${job?.error || ''}`);
-  // with fake key should fail AI, not hang forever
-  ok('voice.usesUserKey', job?.status === 'failed' && /API key|密钥|配置|401|Incorrect/i.test(String(job?.error || '')), job?.error || '');
 }
 
-// --- report edit job ownership ---
 const rej = await fetch(`${base}/api/report-edit-jobs`, {
   method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: a.h() },
   body: JSON.stringify({ kind: 'daily', report, instruction: '把标题改成测试' })
@@ -207,15 +184,13 @@ if (rejBody.id) {
   ok('reportEdit.terminal', job && (job.status === 'completed' || job.status === 'failed'), `${job?.status}:${job?.error || ''}`);
 }
 
-// B without model cannot create voice job
 const vjB = await fetch(`${base}/api/voice-jobs/text`, {
   method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: b.h() },
-  body: JSON.stringify({ transcript: 'B无', tasks: [], reports: {} })
+  body: JSON.stringify({ transcript: 'B创建', tasks: [], reports: {} })
 });
 const vjBBody = await json(vjB);
-ok('voice.B.needsModel', vjB.status === 503 && vjBBody.error === 'AI_NOT_CONFIGURED', `${vjB.status} ${vjBBody.error}`);
+ok('voice.B.allowed', vjB.status === 202 && vjBBody.id, `${vjB.status} ${vjBBody.error || vjBBody.id || ''}`);
 
-// --- session logout ---
 ok('logout.A', (await fetch(`${base}/api/auth/logout`, { method: 'POST', headers: { Cookie: a.h() } })).status === 204);
 ok('afterLogout.401', (await fetch(`${base}/api/sqlite/tasks`, { headers: { Cookie: a.h() } })).status === 401);
 
@@ -226,7 +201,7 @@ const login = await fetch(`${base}/api/auth/login`, {
 a.store(login);
 ok('login.A', login.status === 200);
 const modelAfterLogin = await json(await fetch(`${base}/api/settings/model`, { headers: { Cookie: a.h() } }));
-ok('model.persists', modelAfterLogin.textConfigured === true && modelAfterLogin.textModel === 'deepseek-v4-pro', modelAfterLogin.textModel);
+ok('model.persists', modelAfterLogin.selectedModelId === pickPro.id, modelAfterLogin.selectedModelId);
 const profAfterLogin = await json(await fetch(`${base}/api/settings/profile`, { headers: { Cookie: a.h() } }));
 ok('avatar.persists', profAfterLogin.avatar?.startsWith('data:image/'));
 

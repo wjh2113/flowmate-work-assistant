@@ -21,20 +21,22 @@ const ok = (name, cond, detail = '') => results.push({ name, ok: Boolean(cond), 
 
 const health = await (await fetch(`${base}/api/health`)).json();
 ok('health.localAuth', health.auth === 'local', health.auth);
-ok('health.noEnvAiFallback', health.requiresUserModel === true && health.ai === false);
+ok('health.builtinScope', health.modelScope === 'builtin' && health.requiresUserModel === false, JSON.stringify({ modelScope: health.modelScope, requiresUserModel: health.requiresUserModel }));
 
 const html = await (await fetch(`${base}/`)).text();
-const scriptMatch = html.match(/src="(\/assets\/index-[A-Za-z0-9]+\.js)"/);
+const scriptMatch = html.match(/src="(\/assets\/index-[A-Za-z0-9_-]+\.js)"/);
 ok('html.hasBundle', Boolean(scriptMatch), scriptMatch?.[1] || '');
 if (scriptMatch) {
   const js = await (await fetch(`${base}${scriptMatch[1]}`)).text();
-  ok('html.hasProviderUi', js.includes('任务理解提供商') && js.includes('测试连接'));
-  ok('html.hasV4', js.includes('deepseek-v4-flash') && !js.includes('DeepSeek Chat（旧版别名）'));
+  ok('html.hasBuiltinPicker', js.includes('内置大模型') || js.includes('积分余额') || js.includes('model-picker'));
+  ok('html.hasAdmin', js.includes('管理后台') || js.includes('/api/admin/'));
+  ok('html.hasWeights', /0\.0\dx|积分\s*=\s*Token|weight/.test(js) || js.includes('Deepseek') || js.includes('deepseek'));
 }
 ok('sw.v8', (await (await fetch(`${base}/sw.js`)).text()).includes('flowmate-v8'));
 
 ok('sqlite.401', (await fetch(`${base}/api/sqlite/tasks`)).status === 401);
 ok('voice.401', (await fetch(`${base}/api/voice-jobs`)).status === 401);
+ok('admin.401', (await fetch(`${base}/api/admin/dashboard`)).status === 401);
 
 const a = jar();
 const b = jar();
@@ -55,6 +57,7 @@ const rb = await fetch(`${base}/api/auth/register`, {
 b.store(rb);
 ok('register.A', ra.status === 201 && ua.user?.email === ea);
 ok('register.B', rb.status === 201);
+ok('register.points', typeof ua.user?.pointsBalance === 'number' && ua.user.pointsBalance > 0, String(ua.user?.pointsBalance));
 
 const taskId = crypto.randomUUID();
 const task = {
@@ -96,7 +99,7 @@ const getRB = await (await fetch(`${base}/api/sqlite/reports/2099-01-02`, { head
 ok('report.isolate', getRA?.headline === 'E2E' && getRB == null);
 
 const me = await (await fetch(`${base}/api/auth/me`, { headers: { Cookie: a.h() } })).json();
-ok('auth.me', me.user?.email === ea);
+ok('auth.me', me.user?.email === ea && typeof me.user?.pointsBalance === 'number');
 const logout = await fetch(`${base}/api/auth/logout`, { method: 'POST', headers: { Cookie: a.h() } });
 ok('auth.logout', logout.status === 204);
 ok('auth.afterLogout', (await fetch(`${base}/api/sqlite/tasks`, { headers: { Cookie: a.h() } })).status === 401);
@@ -109,25 +112,18 @@ a.store(login);
 ok('auth.login', login.status === 200);
 
 const settings = await (await fetch(`${base}/api/settings/model`, { headers: { Cookie: a.h() } })).json();
-const ds = settings.presets?.find(p => p.id === 'deepseek');
-ok('settings.deepseekV4', ds?.models?.includes('deepseek-v4-flash') && !ds.models.includes('deepseek-chat'));
-ok('settings.modelAuthed', settings.scope === 'user' || settings.configured !== undefined);
-ok('settings.noSharedKey', settings.requiresUserKey === true && settings.configured === false);
-
+ok('settings.builtinMode', settings.mode === 'builtin' && settings.requiresUserKey === false, JSON.stringify({ mode: settings.mode, requiresUserKey: settings.requiresUserKey }));
+ok('settings.hasModels', Array.isArray(settings.models) && settings.models.length > 0 && settings.models.some(m => typeof m.weight === 'number'));
+const pick = settings.models.find(m => m.id === 'deepseek-v4-flash') || settings.models[0];
 const putModel = await fetch(`${base}/api/settings/model`, {
   method: 'PUT',
   headers: { 'Content-Type': 'application/json', Cookie: a.h() },
-  body: JSON.stringify({
-    provider: 'bailian',
-    textApiKey: 'sk-e2e-test-key-not-real-0001',
-    textModel: 'qwen3.7-plus',
-    asrModel: 'qwen3-asr-flash'
-  })
+  body: JSON.stringify({ modelId: pick.id })
 });
 const modelSaved = await putModel.json();
-ok('settings.modelSaveUser', putModel.status === 200 && modelSaved.textConfigured === true);
+ok('settings.selectModel', putModel.status === 200 && modelSaved.selectedModelId === pick.id, modelSaved.message || modelSaved.selectedModelId);
 const settingsB = await (await fetch(`${base}/api/settings/model`, { headers: { Cookie: b.h() } })).json();
-ok('settings.modelIsolate', settingsB.configured === false);
+ok('settings.BcanList', Array.isArray(settingsB.models) && settingsB.models.length > 0);
 
 const jobsAnon = await fetch(`${base}/api/settings/jobs`);
 ok('settings.jobsRequireAuth', jobsAnon.status === 401);
@@ -152,6 +148,8 @@ const jobsA = await putJobsA.json();
 const jobsB = await (await fetch(`${base}/api/settings/jobs`, { headers: { Cookie: b.h() } })).json();
 ok('settings.jobsIsolate', putJobsA.status === 200 && jobsA.voiceRetention?.retentionDays === 3 && jobsB.voiceRetention?.retentionDays !== 3);
 
+ok('admin.forbiddenForUser', (await fetch(`${base}/api/admin/dashboard`, { headers: { Cookie: a.h() } })).status === 403);
+
 const vj = await fetch(`${base}/api/voice-jobs/text`, {
   method: 'POST',
   headers: { 'Content-Type': 'application/json', Cookie: a.h() },
@@ -166,7 +164,6 @@ if (vjBody.id) {
     job = await (await fetch(`${base}/api/voice-jobs/${vjBody.id}`, { headers: { Cookie: a.h() } })).json();
     if (job.status === 'completed' || job.status === 'failed') break;
   }
-  // Job pipeline itself is healthy even when upstream API key is invalid.
   ok('voice.jobTerminal', job && (job.status === 'completed' || job.status === 'failed'), `${job?.status}:${job?.error || ''}`);
   const hist = await (await fetch(`${base}/api/voice-jobs`, { headers: { Cookie: a.h() } })).json();
   ok('voice.history', Array.isArray(hist.items) && hist.items.some(x => x.id === vjBody.id));

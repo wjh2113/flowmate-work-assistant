@@ -6,7 +6,23 @@ import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { Converter } from 'opencc-js/t2cn';
-import { authenticateSqliteUser, autoClaimSqliteLegacyData, claimSqliteLegacyData, closeSqlite, createSqliteSession, createSqliteUser, deleteSqlitePeriodReport, deleteSqliteReport, deleteSqliteSession, deleteSqliteTask, getSqliteSession, getSqliteTask, getSqliteUserModelSettings, getSqliteUserPreferences, initStore, LEGACY_USER_ID, listSqlitePeriodReports, listSqliteTasks, loadSqlitePeriodReport, loadSqliteReport, patchSqliteTask, saveSqlitePeriodReport, saveSqliteReport, saveSqliteTask, saveSqliteUserModelSettings, saveSqliteUserPreferences, storageDisplay, storageMode } from './store.mjs';
+import { authenticateSqliteUser, autoClaimSqliteLegacyData, claimSqliteLegacyData, closeSqlite, createSqliteSession, createSqliteUser, deleteSqlitePeriodReport, deleteSqliteReport, deleteSqliteSession, deleteSqliteTask, getSqliteSession, getSqliteTask, getSqliteUserPreferences, initStore, LEGACY_USER_ID, listSqlitePeriodReports, listSqliteTasks, loadSqlitePeriodReport, loadSqliteReport, patchSqliteTask, saveSqlitePeriodReport, saveSqliteReport, saveSqliteTask, saveSqliteUserPreferences, storageDisplay, storageMode } from './store.mjs';
+import {
+  adminDashboardStats,
+  assertEnoughPoints,
+  chargeUsage,
+  deleteBuiltinModel,
+  ensureUserBillingDefaults,
+  getUserAccount,
+  initBilling,
+  listBuiltinModels,
+  listUsageLogs,
+  listUsersAdmin,
+  resolveBuiltinAiConfig,
+  saveBuiltinModel,
+  setUserSelectedModel,
+  updateUserAdmin
+} from './billing.mjs';
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -50,24 +66,21 @@ function emptyAiConfig(overrides = {}) {
   };
 }
 
-/** Per-user keys only — server .env keys are never used for AI calls. */
+/** Built-in models + admin API keys; users only select a model. */
 async function resolveAiConfig(userId) {
-  const stored = userId ? await getSqliteUserModelSettings(userId) : null;
-  if (!stored) return emptyAiConfig();
-  const provider = normalizeTextProvider(stored.provider);
-  const baseURL = resolveProviderBaseURL(provider, stored.baseURL);
-  const textKey = String(stored.textApiKey || '');
-  const asrStored = String(stored.asrApiKey || '');
-  const asrKey = asrStored || (provider === 'bailian' ? textKey : '');
+  const ai = await resolveBuiltinAiConfig(userId);
+  return { ...ai, userId: userId || '' };
+}
+
+async function enrichUser(user) {
+  if (!user?.id) return user;
+  const account = await ensureUserBillingDefaults(user.id, user.email);
+  if (!account) return user;
   return {
-    source: 'user',
-    provider,
-    baseURL,
-    textApiKey: textKey,
-    asrApiKey: asrStored,
-    textModel: stored.textModel || (provider === 'deepseek' ? 'deepseek-v4-flash' : 'qwen3.7-plus'),
-    asrModel: stored.asrModel || 'qwen3-asr-flash',
-    resolveAsrKey: () => asrKey
+    ...user,
+    role: account.role,
+    pointsBalance: account.pointsBalance,
+    selectedModelId: account.selectedModelId
   };
 }
 
@@ -229,7 +242,7 @@ function requireUser(req, res, next) {
     .then(async () => {
       const session = await getSqliteSession(parseCookies(req)[SESSION_COOKIE]);
       if (!session?.user) return res.status(401).json({ error: 'UNAUTHORIZED', message: '请先登录' });
-      req.user = session.user;
+      req.user = await enrichUser(session.user);
       req.sessionId = session.id;
       next();
     })
@@ -239,17 +252,27 @@ function requireUser(req, res, next) {
     });
 }
 
+function requireAdmin(req, res, next) {
+  requireUser(req, res, () => {
+    if (req.user?.role !== 'admin') return res.status(403).json({ error: 'FORBIDDEN', message: '需要管理员权限' });
+    next();
+  });
+}
+
 function requireTextAi(req, res, next) {
   Promise.resolve()
     .then(async () => {
       const ai = await resolveAiConfig(req.user?.id);
-      if (!ai.textApiKey) return res.status(503).json({ error: 'AI_NOT_CONFIGURED', message: '请先在「设置 → 大模型」配置任务理解 API Key' });
+      if (!ai.textApiKey) return res.status(503).json({ error: 'AI_NOT_CONFIGURED', message: '管理员尚未配置内置大模型 API Key' });
+      await assertEnoughPoints(req.user.id);
       req.ai = ai;
       next();
     })
     .catch((error) => {
+      const msg = error?.message || '读取模型配置失败';
+      const status = /积分不足/.test(msg) ? 402 : 500;
       console.error(error);
-      res.status(500).json({ message: '读取模型配置失败' });
+      res.status(status).json({ message: msg });
     });
 }
 
@@ -257,14 +280,17 @@ function requireVoiceAi(req, res, next) {
   Promise.resolve()
     .then(async () => {
       const ai = await resolveAiConfig(req.user?.id);
-      if (!ai.textApiKey) return res.status(503).json({ error: 'AI_NOT_CONFIGURED', message: '请先在「设置 → 大模型」配置任务理解 API Key' });
-      if (!ai.resolveAsrKey()) return res.status(503).json({ error: 'ASR_NOT_CONFIGURED', message: '请先在「设置 → 大模型」配置语音识别 API Key' });
+      if (!ai.textApiKey) return res.status(503).json({ error: 'AI_NOT_CONFIGURED', message: '管理员尚未配置内置大模型 API Key' });
+      if (!ai.resolveAsrKey()) return res.status(503).json({ error: 'ASR_NOT_CONFIGURED', message: '管理员尚未配置语音识别 API Key' });
+      await assertEnoughPoints(req.user.id);
       req.ai = ai;
       next();
     })
     .catch((error) => {
+      const msg = error?.message || '读取模型配置失败';
+      const status = /积分不足/.test(msg) ? 402 : 500;
       console.error(error);
-      res.status(500).json({ message: '读取模型配置失败' });
+      res.status(status).json({ message: msg });
     });
 }
 
@@ -434,14 +460,29 @@ function withAi(ai, opts = {}) {
   };
 }
 
+async function qwenChatForAi(ai, opts = {}, action = 'chat') {
+  if (ai?.userId) await assertEnoughPoints(ai.userId);
+  const data = await qwenChat(withAi(ai, opts));
+  if (ai?.userId) {
+    await chargeUsage(ai.userId, {
+      modelId: ai.modelId,
+      modelName: ai.modelName,
+      weight: ai.weight,
+      action,
+      usage: data?.usage
+    });
+  }
+  return data;
+}
+
 async function parseTasks(transcript, ai) {
-  const data = await qwenChat(withAi(ai, {
+  const data = await qwenChatForAi(ai, {
     messages: [
       { role: 'system', content: '你是中文工作任务拆解助手。把一段口语整理为一个或多个独立可执行任务。一句话中出现多个并列目标、不同课程、不同交付物或先后要完成的事项时，必须拆成多项；例如“学习日语直播课、英语雅思和AI练习”应拆成3项。不要把同一个目标的普通操作步骤过度拆分。最多10项，不要虚构信息；未提负责人时写“我”，未提日期时写“今天”。每个标题只保留一个动作和一个清晰对象。根据各任务复杂度分别估算时长。只输出合法 JSON，不要 Markdown。JSON结构：tasks为数组，每项包含title字符串、assignee字符串、due简短中文、priority为高/中/低、confidence为0到1数字、estimatedMinutes为15到480之间的整数分钟数。' },
       { role: 'user', content: `当前日期：${new Date().toLocaleDateString('zh-CN')}\n当前用户：我\n语音内容：${transcript}` }
     ],
     responseFormat: { type: 'json_object' }
-  }));
+  }, 'parse_tasks');
   const parsed = parseJSON(messageText(data));
   return normalizeParsedTasks(parsed, transcript);
 }
@@ -458,13 +499,13 @@ async function parseVoiceCommand(transcript, availableTasks = [], reports = {}, 
     weekly: Boolean(reports?.weekly),
     monthly: Boolean(reports?.monthly)
   };
-  const data = await qwenChat(withAi(ai, {
+  const data = await qwenChatForAi(ai, {
     messages: [
       { role: 'system', content: '你是中文工作助手的统一语音指令解析器。先判断用户意图属于哪一类：1) edit_report：修改今日复盘/日报、本周周报、本月月报（含小结、亮点、风险、明日/下周/下月计划等表述）；2) create：新建待办任务；3) update：修改已有任务；4) clarify：目标不明确。提及“今日复盘/今日小结/日报/明天建议”→reportKind=daily；“周报/本周复盘/下周计划”→weekly；“月报/本月复盘/下月计划”→monthly。若同时像任务又像复盘，优先看是否明确点名复盘/周报/月报。edit_report 时 instruction 写清具体修改意见。修改任务时只能使用候选任务真实 id，不明确则 clarify。新建任务最多10项。只输出合法JSON，不要Markdown。JSON字段：action为create/update/clarify/edit_report；reportKind为daily/weekly/monthly或空；instruction字符串；updates数组(targetTaskId,changes)；tasks新建数组；message简短中文；confidence为0到1。' },
       { role: 'user', content: `当前日期：${new Date().toLocaleDateString('zh-CN')}\n当前用户：我\n已有复盘：${JSON.stringify(reportMeta)}\n候选任务：${JSON.stringify(tasks)}\n语音指令：${transcript}` }
     ],
     responseFormat: { type: 'json_object' }
-  }));
+  }, 'parse_command');
   const parsed = parseJSON(messageText(data));
   if (parsed.action === 'edit_report') {
     const reportKind = ['daily', 'weekly', 'monthly'].includes(parsed.reportKind) ? parsed.reportKind : '';
@@ -503,15 +544,23 @@ async function transcribeAudio(buffer, mime = 'audio/webm', availableTasks = [],
   const apiKey = ai.resolveAsrKey();
   if (!apiKey) throw new Error('尚未配置语音识别 API Key（非百炼文本提供商时需单独填写百炼 ASR 密钥）');
   const audio = `data:${mime};base64,${buffer.toString('base64')}`;
-  const data = await qwenChat({
+  const data = await qwenChatForAi({
+    ...ai,
+    textApiKey: apiKey,
+    textModel: ai.asrModel,
+    baseURL: BAILIAN_BASE_URL
+  }, {
+    model: ai.asrModel,
     apiKey,
     baseURL: BAILIAN_BASE_URL,
-    model: ai.asrModel,
     messages: [
       { role: 'user', content: [{ type: 'input_audio', input_audio: { data: audio } }] }
     ],
     extra: { stream: false, asr_options: { language: 'zh', enable_itn: true } }
-  });
+  }, 'asr');
+  if (ai?.userId && data?.usage) {
+    // already charged in qwenChatForAi
+  }
   const transcript = convertToSimplified(messageText(data).trim());
   if (!transcript) throw new Error('语音模型没有返回转写内容');
   await onStage('understanding',{transcript});
@@ -827,12 +876,12 @@ async function processVoiceJob(id) {
   runningVoiceJobs.add(id);
   try {
     const ai = await resolveAiConfig(job.userId);
-    if (!ai.textApiKey) throw new Error('请先在「设置 → 大模型」配置任务理解 API Key');
+    if (!ai.textApiKey) throw new Error('管理员尚未配置内置大模型 API Key');
     job.status = 'processing';
     job.error = '';
     let result;
     if (job.audioFile) {
-      if (!ai.resolveAsrKey()) throw new Error('请先在「设置 → 大模型」配置语音识别 API Key');
+      if (!ai.resolveAsrKey()) throw new Error('管理员尚未配置语音识别 API Key');
       job.stage = 'transcribing';
       await persistVoiceJob(job);
       const buffer = await readFile(voiceAudioPath(job));
@@ -960,13 +1009,13 @@ async function editReportContent(kind, report, instruction, ai) {
   const schema = kind === 'daily'
     ? '保持日报结构：headline、summary、completed字符串数组、risks字符串数组、tomorrow对象数组(title,reason,priority高/中/低,suggestedTime)。若用户要求清空/删除整份复盘，输出 {"cleared":true}。'
     : '保持周/月报结构：headline、summary、highlights字符串数组、risks字符串数组、next对象数组(title,reason,priority高/中/低,suggestedTime)。若用户要求清空/删除整份复盘，输出 {"cleared":true}。';
-  const data = await qwenChat(withAi(ai, {
+  const data = await qwenChatForAi(ai, {
     messages: [
       { role: 'system', content: `你是中文工作复盘编辑助手。根据用户修改意见，在现有复盘 JSON 上做最小必要修改，保留未提及内容。不要虚构成果。只输出合法 JSON，不要 Markdown。${schema}` },
       { role: 'user', content: `复盘类型：${kind}\n现有复盘：${JSON.stringify(report)}\n修改意见：${instruction}` }
     ],
     responseFormat: { type: 'json_object' }
-  }));
+  }, 'edit_report');
   const edited = parseJSON(messageText(data));
   if (edited?.cleared === true) return null;
   return kind === 'daily' ? normalizeDailyReport(edited) : normalizePeriodReport(edited, 8);
@@ -974,14 +1023,19 @@ async function editReportContent(kind, report, instruction, ai) {
 
 async function asrTranscript(buffer, mime = 'audio/webm', ai) {
   const apiKey = ai.resolveAsrKey();
-  if (!apiKey) throw new Error('尚未配置语音识别 API Key（非百炼文本提供商时需单独填写百炼 ASR 密钥）');
-  const data = await qwenChat({
+  if (!apiKey) throw new Error('尚未配置语音识别 API Key');
+  const data = await qwenChatForAi({
+    ...ai,
+    textApiKey: apiKey,
+    textModel: ai.asrModel,
+    baseURL: BAILIAN_BASE_URL
+  }, {
+    model: ai.asrModel,
     apiKey,
     baseURL: BAILIAN_BASE_URL,
-    model: ai.asrModel,
     messages: [{ role: 'user', content: [{ type: 'input_audio', input_audio: { data: `data:${mime};base64,${buffer.toString('base64')}` } }] }],
     extra: { stream: false, asr_options: { language: 'zh', enable_itn: true } }
-  });
+  }, 'asr');
   const transcript = convertToSimplified(messageText(data).trim());
   if (!transcript) throw new Error('语音模型没有返回转写内容');
   return transcript;
@@ -993,14 +1047,14 @@ async function processReportEditJob(id) {
   runningReportEditJobs.add(id);
   try {
     const ai = await resolveAiConfig(job.userId);
-    if (!ai.textApiKey) throw new Error('请先在「设置 → 大模型」配置任务理解 API Key');
+    if (!ai.textApiKey) throw new Error('管理员尚未配置内置大模型 API Key');
     job.status = 'processing';
     job.stage = job.audioFile ? 'transcribing' : 'understanding';
     job.error = '';
     await persistReportEditJob(job);
     let instruction = String(job.instruction || '').trim();
     if (job.audioFile) {
-      if (!ai.resolveAsrKey()) throw new Error('请先在「设置 → 大模型」配置语音识别 API Key');
+      if (!ai.resolveAsrKey()) throw new Error('管理员尚未配置语音识别 API Key');
       const buffer = await readFile(reportEditAudioPath(job));
       const spoken = await asrTranscript(buffer, job.mime || 'audio/webm', ai);
       if (job.cancelled) return;
@@ -1069,14 +1123,14 @@ app.get('/api/health', (_req, res) => {
     textConfigured: false,
     asrConfigured: false,
     asrUsesTextKey: false,
-    requiresUserModel: true,
+    requiresUserModel: false,
+    modelScope: 'builtin',
     auth: cloudMode() ? 'supabase' : 'local',
     provider: providerLabel(defaults.provider),
     textProvider: defaults.provider,
     baseURL: defaults.baseURL,
     textModel: defaults.textModel,
     transcriptionModel: defaults.asrModel,
-    modelScope: 'user',
     storage: { mode: storageMode, file: storageDisplay }
   });
 });
@@ -1084,7 +1138,7 @@ app.get('/api/health', (_req, res) => {
 app.post('/api/auth/register', async (req, res) => {
   if (cloudMode()) return res.status(400).json({ message: '当前已启用云端登录，请使用邮箱登录链接' });
   try {
-    const user = await createSqliteUser({ email: req.body?.email, password: req.body?.password, name: req.body?.name });
+    const user = await enrichUser(await createSqliteUser({ email: req.body?.email, password: req.body?.password, name: req.body?.name }));
     const session = await createSqliteSession(user.id, SESSION_DAYS);
     setSessionCookie(res, session.id, session.expiresAt, req);
     const legacy = await applyLegacyClaim(user.id);
@@ -1097,7 +1151,7 @@ app.post('/api/auth/register', async (req, res) => {
 app.post('/api/auth/login', async (req, res) => {
   if (cloudMode()) return res.status(400).json({ message: '当前已启用云端登录，请使用邮箱登录链接' });
   try {
-    const user = await authenticateSqliteUser(req.body?.email, req.body?.password);
+    const user = await enrichUser(await authenticateSqliteUser(req.body?.email, req.body?.password));
     const session = await createSqliteSession(user.id, SESSION_DAYS);
     setSessionCookie(res, session.id, session.expiresAt, req);
     const legacy = await applyLegacyClaim(user.id);
@@ -1118,7 +1172,7 @@ app.get('/api/auth/me', async (req, res) => {
   if (cloudMode()) return res.json({ user: null, mode: 'supabase' });
   const session = await getSqliteSession(parseCookies(req)[SESSION_COOKIE]);
   if (!session?.user) return res.status(401).json({ user: null, message: '未登录' });
-  res.json({ user: session.user, mode: 'local' });
+  res.json({ user: await enrichUser(session.user), mode: 'local' });
 });
 
 app.get('/api/sqlite/tasks', requireUser, async (req, res) => res.json(await listSqliteTasks(req.user.id)));
@@ -1240,38 +1294,66 @@ app.delete('/api/settings/cloud', requireSettingsAccess, async (_req, res) => {
 });
 
 async function modelSettingsPublic(userId) {
+  const account = await getUserAccount(userId);
   const ai = await resolveAiConfig(userId);
-  const textKey = ai.textApiKey;
-  const asrKey = ai.asrApiKey;
+  const models = await listBuiltinModels({ enabledOnly: true });
   return {
-    configured: Boolean(textKey),
-    textConfigured: Boolean(textKey),
-    asrConfigured: Boolean(asrKey),
-    asrUsesTextKey: Boolean(!asrKey && ai.provider === 'bailian' && textKey),
-    maskedTextKey: maskKey(textKey),
-    maskedAsrKey: maskKey(asrKey),
-    maskedKey: maskKey(textKey),
-    provider: ai.provider,
-    providerLabel: providerLabel(ai.provider),
-    baseURL: ai.baseURL,
-    textModel: ai.textModel,
-    asrModel: ai.asrModel,
-    scope: 'user',
-    source: 'user',
-    requiresUserKey: true,
-    presets: Object.values(PROVIDER_PRESETS).map(item => ({
-      id: item.id,
-      label: item.label,
-      baseURL: item.baseURL,
-      models: PRESET_TEXT_MODELS[item.id] || []
-    })),
-    asrModels: ALLOWED_ASR_MODELS
+    mode: 'builtin',
+    configured: Boolean(ai.textApiKey),
+    textConfigured: Boolean(ai.textApiKey),
+    asrConfigured: Boolean(ai.resolveAsrKey?.()),
+    requiresUserKey: false,
+    scope: 'builtin',
+    source: 'builtin',
+    selectedModelId: account?.selectedModelId || ai.modelId || '',
+    pointsBalance: account?.pointsBalance ?? 0,
+    role: account?.role || 'user',
+    current: {
+      id: ai.modelId,
+      name: ai.modelName,
+      provider: ai.provider,
+      textModel: ai.textModel,
+      weight: ai.weight
+    },
+    models: models.filter((m) => m.kind !== 'asr').map((m) => ({
+      id: m.id,
+      name: m.name,
+      provider: m.provider,
+      textModel: m.textModel,
+      weight: m.weight,
+      badge: m.badge,
+      sortOrder: m.sortOrder,
+      enabled: m.enabled
+    }))
   };
 }
 
 app.get('/api/settings/model', requireUser, async (req, res) => {
   res.set('Cache-Control', 'no-store');
   res.json(await modelSettingsPublic(req.user.id));
+});
+
+app.put('/api/settings/model', requireUser, async (req, res) => {
+  try {
+    const modelId = String(req.body?.modelId || req.body?.selectedModelId || '').trim();
+    if (!modelId) return res.status(400).json({ message: '请选择内置模型' });
+    await setUserSelectedModel(req.user.id, modelId);
+    res.json({ ...(await modelSettingsPublic(req.user.id)), message: '已切换模型' });
+  } catch (error) {
+    res.status(400).json({ message: error?.message || '切换模型失败' });
+  }
+});
+
+app.post('/api/settings/model/test', requireUser, async (req, res) => {
+  try {
+    const ai = await resolveAiConfig(req.user.id);
+    if (!ai.textApiKey) return res.status(400).json({ message: '管理员尚未配置该模型的 API Key' });
+    const reply = await testTextModelConnection(ai.textApiKey, ai.textModel, ai.baseURL);
+    res.json({ ok: true, message: `连接成功：${ai.modelName || ai.textModel}${reply ? `（回复：${reply}）` : ''}`, sample: reply });
+  } catch (error) {
+    console.error(error);
+    res.status(400).json({ message: error?.message || '模型连接测试失败' });
+  }
 });
 
 async function probeBailianKey(apiKey) {
@@ -1305,82 +1387,63 @@ async function testTextModelConnection(apiKey, model, baseURL) {
   return String(messageText(data) || '').trim().slice(0, 40);
 }
 
-function parseModelSettingsBody(body = {}, currentAi = emptyAiConfig()) {
-  const nextProvider = normalizeTextProvider(body.provider || body.textProvider || currentAi.provider);
-  const nextBaseURL = resolveProviderBaseURL(nextProvider, body.baseURL ?? body.textBaseURL ?? (nextProvider === currentAi.provider ? currentAi.baseURL : ''));
-  const nextTextKey = String(body.textApiKey || body.apiKey || '').trim();
-  const nextAsrKey = String(body.asrApiKey || '').trim();
-  const clearAsrKey = Boolean(body.clearAsrKey);
-  const nextTextModel = normalizeTextModelName(body.textModel || currentAi.textModel);
-  const nextAsrModel = String(body.asrModel || currentAi.asrModel).trim();
-  if (!ALLOWED_ASR_MODELS.includes(nextAsrModel)) throw new Error('不支持所选语音识别模型');
-  if (nextTextKey && !isValidApiKey(nextTextKey)) throw new Error('任务理解 API Key 格式不正确');
-  if (nextAsrKey && !isValidApiKey(nextAsrKey)) throw new Error('语音识别 API Key 格式不正确');
-  return { nextProvider, nextBaseURL, nextTextKey, nextAsrKey, clearAsrKey, nextTextModel, nextAsrModel };
-}
+app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
+  res.json(await adminDashboardStats());
+});
 
-app.post('/api/settings/model/test', requireUser, async (req, res) => {
+app.get('/api/admin/models', requireAdmin, async (_req, res) => {
+  res.json({ models: await listBuiltinModels({ includeSecrets: true }) });
+});
+
+app.put('/api/admin/models/:id', requireAdmin, async (req, res) => {
   try {
-    const current = await resolveAiConfig(req.user.id);
-    const parsed = parseModelSettingsBody(req.body, current);
-    const candidateTextKey = parsed.nextTextKey || current.textApiKey;
-    const candidateAsrKey = parsed.clearAsrKey ? '' : (parsed.nextAsrKey || current.asrApiKey);
-    if (!candidateTextKey) return res.status(400).json({ message: '请先填写任务理解 API Key，或保存后再测试' });
-
-    const reply = await testTextModelConnection(candidateTextKey, parsed.nextTextModel, parsed.nextBaseURL);
-    let asrNote = '未校验语音识别';
-    if (parsed.nextProvider === 'bailian') {
-      const effectiveAsrKey = candidateAsrKey || candidateTextKey;
-      if (candidateAsrKey && candidateAsrKey !== candidateTextKey) {
-        await probeBailianKey(candidateAsrKey);
-        asrNote = '独立语音密钥校验通过';
-      } else if (effectiveAsrKey) {
-        asrNote = candidateAsrKey ? '独立语音密钥与任务理解密钥相同' : '语音识别将沿用任务理解密钥';
-      }
-    } else if (candidateAsrKey) {
-      await probeBailianKey(candidateAsrKey);
-      asrNote = '百炼语音密钥校验通过';
-    } else {
-      asrNote = '非百炼文本提供商：语音识别需单独配置百炼 ASR 密钥';
-    }
-    res.json({
-      ok: true,
-      message: `连接成功：${providerLabel(parsed.nextProvider)} / ${parsed.nextTextModel} 可用${reply ? `（回复：${reply}）` : ''}；${asrNote}`,
-      provider: parsed.nextProvider,
-      baseURL: parsed.nextBaseURL,
-      textModel: parsed.nextTextModel,
-      sample: reply
-    });
+    const model = await saveBuiltinModel({ ...req.body, id: req.params.id });
+    res.json({ model, message: '模型已保存' });
   } catch (error) {
-    console.error(error);
-    res.status(400).json({ message: error?.message || '模型连接测试失败' });
+    res.status(400).json({ message: error?.message || '保存模型失败' });
   }
 });
 
-app.put('/api/settings/model', requireUser, async (req, res) => {
+app.post('/api/admin/models', requireAdmin, async (req, res) => {
   try {
-    const stored = await getSqliteUserModelSettings(req.user.id);
-    const current = await resolveAiConfig(req.user.id);
-    const parsed = parseModelSettingsBody(req.body, current);
-    const nextTextKey = parsed.nextTextKey || stored?.textApiKey || '';
-    if (!nextTextKey) return res.status(400).json({ message: '请填写任务理解 API Key（每位用户需单独配置，不再使用服务端 .env）' });
-    let nextAsrKey = '';
-    if (parsed.clearAsrKey) nextAsrKey = '';
-    else if (parsed.nextAsrKey) nextAsrKey = parsed.nextAsrKey;
-    else nextAsrKey = stored?.asrApiKey || '';
-    await saveSqliteUserModelSettings(req.user.id, {
-      provider: parsed.nextProvider,
-      baseURL: parsed.nextBaseURL,
-      textApiKey: nextTextKey,
-      asrApiKey: nextAsrKey,
-      textModel: parsed.nextTextModel,
-      asrModel: parsed.nextAsrModel
-    });
-    res.json({ ...(await modelSettingsPublic(req.user.id)), message: '你的模型配置已保存并立即生效' });
+    const model = await saveBuiltinModel(req.body || {});
+    res.status(201).json({ model, message: '模型已创建' });
   } catch (error) {
-    const status = /不合法|不正确|不能为空|不支持/.test(String(error?.message || '')) ? 400 : 500;
-    res.status(status).json({ message: error?.message || '模型设置保存失败' });
+    res.status(400).json({ message: error?.message || '创建模型失败' });
   }
+});
+
+app.delete('/api/admin/models/:id', requireAdmin, async (req, res) => {
+  try {
+    await deleteBuiltinModel(req.params.id);
+    res.status(204).end();
+  } catch (error) {
+    res.status(400).json({ message: error?.message || '删除模型失败' });
+  }
+});
+
+app.get('/api/admin/users', requireAdmin, async (_req, res) => {
+  res.json({ users: await listUsersAdmin() });
+});
+
+app.patch('/api/admin/users/:id', requireAdmin, async (req, res) => {
+  try {
+    const user = await updateUserAdmin(req.params.id, req.body || {});
+    res.json({ user, message: '用户已更新' });
+  } catch (error) {
+    res.status(400).json({ message: error?.message || '更新用户失败' });
+  }
+});
+
+app.get('/api/admin/usage', requireAdmin, async (req, res) => {
+  res.json({ items: await listUsageLogs({ userId: req.query.userId || '', limit: Number(req.query.limit) || 50 }) });
+});
+
+app.get('/api/me/usage', requireUser, async (req, res) => {
+  res.json({
+    account: await getUserAccount(req.user.id),
+    items: await listUsageLogs({ userId: req.user.id, limit: 30 })
+  });
 });
 
 app.post('/api/parse-task-text', requireUser, requireTextAi, async (req, res) => {
@@ -1694,13 +1757,13 @@ app.post('/api/transcribe', upload.single('audio'), requireUser, requireVoiceAi,
 app.post('/api/daily-plan', requireUser, requireTextAi, async (req, res) => {
   try {
     const { tasks = [], date, user = '用户' } = req.body || {};
-    const data = await qwenChat(withAi(req.ai, {
+    const data = await qwenChatForAi(req.ai, {
       messages: [
         { role: 'system', content: '你是务实的中文工作规划助手。根据真实任务数据总结当天完成情况，并规划明天。优先考虑逾期、进行中、高优先级和依赖关系，不要声称未提供的成果。次日计划最多5项，按重要性排序。只输出合法 JSON，不要 Markdown。JSON字段：headline字符串、summary字符串、completed字符串数组、risks字符串数组、tomorrow对象数组；tomorrow每项包含title、reason、priority(高/中/低)、suggestedTime。' },
         { role: 'user', content: `用户：${user}\n日期：${date}\n任务数据：${JSON.stringify(tasks)}` }
       ],
       responseFormat: { type: 'json_object' }
-    }));
+    }, 'daily_plan');
     res.json(normalizeDailyReport(parseJSON(messageText(data))));
   } catch (error) {
     console.error(error);
@@ -1711,13 +1774,13 @@ app.post('/api/daily-plan', requireUser, requireTextAi, async (req, res) => {
 app.post('/api/weekly-plan', requireUser, requireTextAi, async (req, res) => {
   try {
     const { tasks = [], weekStart, weekEnd, user = '用户' } = req.body || {};
-    const data = await qwenChat(withAi(req.ai, {
+    const data = await qwenChatForAi(req.ai, {
       messages: [
         { role: 'system', content: '你是务实的中文周报助手。根据真实任务数据总结本周完成亮点与风险，并规划下周重点。不要虚构未提供的成果。下周计划最多8项，按重要性排序。只输出合法 JSON，不要 Markdown。JSON字段：headline字符串、summary字符串、highlights字符串数组、risks字符串数组、next对象数组；next每项包含title、reason、priority(高/中/低)、suggestedTime。' },
         { role: 'user', content: `用户：${user}\n本周：${weekStart} 至 ${weekEnd}\n任务数据：${JSON.stringify(tasks)}` }
       ],
       responseFormat: { type: 'json_object' }
-    }));
+    }, 'weekly_plan');
     res.json(normalizePeriodReport(parseJSON(messageText(data)), 8));
   } catch (error) {
     console.error(error);
@@ -1728,13 +1791,13 @@ app.post('/api/weekly-plan', requireUser, requireTextAi, async (req, res) => {
 app.post('/api/monthly-plan', requireUser, requireTextAi, async (req, res) => {
   try {
     const { tasks = [], month, user = '用户' } = req.body || {};
-    const data = await qwenChat(withAi(req.ai, {
+    const data = await qwenChatForAi(req.ai, {
       messages: [
         { role: 'system', content: '你是务实的中文月报助手。根据真实任务数据总结本月完成亮点与风险，并规划下月重点。不要虚构未提供的成果。下月计划最多8项，按重要性排序。只输出合法 JSON，不要 Markdown。JSON字段：headline字符串、summary字符串、highlights字符串数组、risks字符串数组、next对象数组；next每项包含title、reason、priority(高/中/低)、suggestedTime。' },
         { role: 'user', content: `用户：${user}\n月份：${month}\n任务数据：${JSON.stringify(tasks)}` }
       ],
       responseFormat: { type: 'json_object' }
-    }));
+    }, 'monthly_plan');
     res.json(normalizePeriodReport(parseJSON(messageText(data)), 8));
   } catch (error) {
     console.error(error);
@@ -1859,7 +1922,7 @@ const closeDatabase=()=>{if(sqliteClosed)return;sqliteClosed=true;void closeSqli
 process.once('SIGINT',()=>{closeDatabase();process.exit(0)});
 process.once('SIGTERM',()=>{closeDatabase();process.exit(0)});
 process.once('exit',closeDatabase);
-Promise.all([initStore(), loadJobSettings(), recoverVoiceJobs(), recoverReportEditJobs()])
+Promise.all([initStore(), initBilling(), loadJobSettings(), recoverVoiceJobs(), recoverReportEditJobs()])
   .then(async () => {
     try {
       const legacy = await autoClaimSqliteLegacyData();

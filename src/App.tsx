@@ -6,6 +6,7 @@ import { deleteFileDailyReport, deleteFilePeriodReport, deleteFileTask, listFile
 import GuidePage from './GuidePage';
 import { toSimplified } from './chinese';
 import { DEFAULT_AUTO_SCHEDULE, WEEKDAY_LABELS, formatPeriodLabel, formatTimeHM, isSlotDone, isoWeekKey, latestDueDailySlot, latestDueMonthlySlot, latestDueVoiceRetentionSlot, latestDueWeeklySlot, loadAutoSchedule, localDateKey, markSlotDone, monthKey, normalizeTimes, parseTimeHM, saveAutoSchedule, shiftIsoWeekKey, shiftMonthKey, suppressAutoSlotsForKind, weekRange, type AutoSchedule, type TimeHM } from './reportUtils';
+import AdminPage from './AdminPage';
 import { migrateLegacyStorageKey, readUserStorage, setUserStorageScope, writeUserStorage } from './userStorage';
 
 type Tab = 'home' | 'tasks' | 'team' | 'mine';
@@ -41,7 +42,7 @@ export default function App(){
   const showGuide=new URLSearchParams(window.location.search).has('guide');
   const [tab,setTab]=useState<Tab>('home');
   const [tasks,setTasks]=useState<Task[]>([]);
-  const [modal,setModal]=useState<'voice'|'add'|'settings'|'cloud'|null>(null);
+  const [modal,setModal]=useState<'voice'|'add'|'settings'|'cloud'|'admin'|null>(null);
   const [title,setTitle]=useState(''); const [assignee,setAssignee]=useState('我'); const [estimate,setEstimate]=useState(60);
   const [transcript,setTranscript]=useState(''); const [recording,setRecording]=useState(false); const [processing,setProcessing]=useState(false);
   const [voiceTip,setVoiceTip]=useState('可以说任务，也可以改今日复盘/周报/月报'); const [parsedTask,setParsedTask]=useState<ParsedTask|null>(null);
@@ -70,7 +71,7 @@ export default function App(){
   const generateReportRef=useRef<()=>Promise<boolean>>(async()=>false);
   const generateWeeklyReportRef=useRef<()=>Promise<boolean>>(async()=>false);
   const generateMonthlyReportRef=useRef<()=>Promise<boolean>>(async()=>false);
-  const modalRef=useRef<'voice'|'add'|'settings'|'cloud'|null>(null);
+  const modalRef=useRef<'voice'|'add'|'settings'|'cloud'|'admin'|null>(null);
   const [autoSchedule,setAutoSchedule]=useState<AutoSchedule>(()=>loadAutoSchedule());
   const [archiveKind,setArchiveKind]=useState<'weekly'|'monthly'|null>(null);
   const [voiceHistoryOpen,setVoiceHistoryOpen]=useState(false);
@@ -103,8 +104,11 @@ export default function App(){
   const refreshAiReady=()=>{
     apiFetch('/api/settings/model').then(async res=>{
       if(!res.ok){setAiReady(false);return}
-      const data=await readApiJson<{textConfigured?:boolean;configured?:boolean}>(res);
+      const data=await readApiJson<{textConfigured?:boolean;configured?:boolean;pointsBalance?:number;role?:string;selectedModelId?:string}>(res);
       setAiReady(Boolean(data.textConfigured??data.configured));
+      if(typeof data.pointsBalance==='number'){
+        setLocalUser(prev=>prev?{...prev,pointsBalance:data.pointsBalance,role:(data.role==='admin'?'admin':'user'),selectedModelId:data.selectedModelId||prev.selectedModelId}:prev);
+      }
     }).catch(()=>setAiReady(false));
   };
 
@@ -619,7 +623,7 @@ export default function App(){
     </div>}
     {tab==='tasks'&&<ListPage title="我的任务" tasks={realTasks.filter(t=>t.assignee==='我')} cycle={cycle} remove={removeTask} now={clock} voiceProgress={voiceProgress} onRetryVoice={id=>void retryVoiceJob(id)} onDismissVoice={id=>void dismissVoiceJob(id)}/>} 
     {tab==='team'&&<ListPage title="团队任务" tasks={realTasks.filter(t=>t.assignee!=='我')} cycle={cycle} remove={removeTask} now={clock}/>} 
-    {tab==='mine'&&(voiceHistoryOpen?<VoiceHistoryPage onBack={()=>setVoiceHistoryOpen(false)}/>:archiveKind?<PeriodArchivePage kind={archiveKind} session={session} teamId={teamId} currentKey={archiveKind==='weekly'?weekKey:monthKeyValue} onBack={()=>setArchiveKind(null)}/>:<Profile avatarText={avatarText} avatarUrl={avatarUrl} onAvatarFile={file=>void saveAvatar(file)} displayName={displayName} accountHint={session?.user.email||localUser?.email||''} tasks={realTasks} install={install} aiReady={aiReady} cloudOnline={Boolean(session)} localOnline={Boolean(localUser)} syncing={syncing} signOut={()=>void signOut()} goTeam={()=>goTab('team')} openSettings={()=>setModal('settings')} openWeeklyArchive={()=>setArchiveKind('weekly')} openMonthlyArchive={()=>setArchiveKind('monthly')} openVoiceHistory={()=>setVoiceHistoryOpen(true)}/>)} 
+    {tab==='mine'&&(voiceHistoryOpen?<VoiceHistoryPage onBack={()=>setVoiceHistoryOpen(false)}/>:archiveKind?<PeriodArchivePage kind={archiveKind} session={session} teamId={teamId} currentKey={archiveKind==='weekly'?weekKey:monthKeyValue} onBack={()=>setArchiveKind(null)}/>:<Profile avatarText={avatarText} avatarUrl={avatarUrl} onAvatarFile={file=>void saveAvatar(file)} displayName={displayName} accountHint={session?.user.email||localUser?.email||''} pointsBalance={localUser?.pointsBalance} isAdmin={localUser?.role==='admin'} tasks={realTasks} install={install} aiReady={aiReady} cloudOnline={Boolean(session)} localOnline={Boolean(localUser)} syncing={syncing} signOut={()=>void signOut()} goTeam={()=>goTab('team')} openSettings={()=>setModal('settings')} openAdmin={()=>setModal('admin')} openWeeklyArchive={()=>setArchiveKind('weekly')} openMonthlyArchive={()=>setArchiveKind('monthly')} openVoiceHistory={()=>setVoiceHistoryOpen(true)}/>)}
     <div className="quick-create" role="group" aria-label="新建任务">
       <button className="quick-voice" type="button" onClick={()=>{setVoiceTip('可以说任务，也可以改今日复盘/周报/月报');setModal('voice')}} aria-label="语音创建任务或修改复盘"><MicIcon/><span>语音</span></button>
       <button className="quick-add" type="button" onClick={()=>setModal('add')} aria-label="手动新建任务">＋</button>
@@ -627,7 +631,7 @@ export default function App(){
     <nav aria-label="主导航">{([['home','首页'],['tasks','任务'],['team','团队'],['mine','我的']] as const).map(([id,label])=><button className={tab===id?'active':''} onClick={()=>goTab(id)} key={id} aria-current={tab===id?'page':undefined}><i aria-hidden="true"><NavIcon name={id}/></i><span>{label}</span></button>)}</nav>
     {toast&&<div className="toast" role="status">✓ {toast}</div>}
     {dialog&&<div className="dialog-overlay" role="presentation" onClick={()=>{if(dialog.mode==='alert')closeDialog(true)}}><div className={'dialog-card'+(dialog.danger?' danger':'')} role="alertdialog" aria-modal="true" aria-labelledby="app-dialog-title" onClick={e=>e.stopPropagation()}><div className="dialog-icon" aria-hidden="true">{dialog.danger?'!':'✦'}</div><h3 id="app-dialog-title">{dialog.title}</h3><p className="dialog-body">{dialog.message}</p><div className="dialog-actions">{dialog.mode==='confirm'&&<button type="button" className="dialog-cancel" onClick={()=>closeDialog(false)}>{dialog.cancelLabel}</button>}<button type="button" className="dialog-ok" onClick={()=>closeDialog(true)} autoFocus>{dialog.confirmLabel}</button></div></div></div>}
-    {modal&&<div className="overlay" onClick={()=>{if(recording){cancelRecording();return}if(!processing)setModal(null)}}><section className={'sheet '+(modal==='settings'||modal==='cloud'?'settings-sheet':'')} onClick={e=>e.stopPropagation()}><div className="handle"/>{modal==='voice'?<><h2>{processing?'正在保存录音…':recording?'正在录音…':transcript?'指令待确认':'语音助手'}</h2><p className={'voice-tip '+(recording||processing?'live':'')}>{voiceTip}</p><button className={'record '+(recording?'recording':'')} disabled={processing} onClick={recording?stopRecording:beginRecording}><MicIcon/></button><p className="record-label">{processing?'保存后由 AI 后台整理':recording?'点击麦克风结束录音':'点击开始录音'}</p>{recording&&<button className="record-cancel" type="button" onClick={cancelRecording}>取消录音</button>}<textarea className="input transcript" value={transcript} placeholder="例如：新建两个任务… / 把今日复盘风险删掉… / 周报下周计划加一项演示" onChange={e=>{setTranscript(e.target.value);setParsedTask(null)}}/>{parsedTask&&<div className="ai-understanding"><b>已整理</b><span>任务：{parsedTask.title}</span><span>负责人：{parsedTask.assignee} · 截止：{parsedTask.due} · {parsedTask.priority}优先级</span><span>预计用时：{formatDuration(parsedTask.estimatedMinutes||defaultEstimate(parsedTask.priority))}</span></div>}<button className="primary" disabled={!transcript.trim()||processing||recording} onClick={createTasksFromText}>AI 理解并执行</button></>:modal==='settings'?<AppSettings schedule={autoSchedule} onScheduleSaved={next=>{setAutoSchedule(next);notify('自动作业时间已保存')}} onClose={()=>setModal(null)} onModelSaved={()=>{refreshAiReady();notify('模型设置已保存')}}/>:modal==='cloud'?<CloudSettings onClose={()=>setModal(null)} askConfirm={askConfirm}/>:<><h2>新建任务</h2><label>任务内容</label><input className="input" value={title} onChange={e=>setTitle(e.target.value)} placeholder="例如：完成项目周报"/><label>负责人</label><div className="people"><button className="selected" onClick={()=>setAssignee('我')}>我</button></div><label>预估时间</label><select className="input" value={estimate} onChange={e=>setEstimate(Number(e.target.value))}><option value={15}>15 分钟</option><option value={30}>30 分钟</option><option value={60}>1 小时</option><option value={120}>2 小时</option><option value={240}>4 小时</option></select><button className="primary" disabled={!title.trim()} onClick={()=>addTask()}>创建任务</button></>}</section></div>}
+    {modal&&<div className="overlay" onClick={()=>{if(recording){cancelRecording();return}if(!processing)setModal(null)}}><section className={'sheet '+(modal==='settings'||modal==='cloud'||modal==='admin'?'settings-sheet':'')} onClick={e=>e.stopPropagation()}><div className="handle"/>{modal==='voice'?<><h2>{processing?'正在保存录音…':recording?'正在录音…':transcript?'指令待确认':'语音助手'}</h2><p className={'voice-tip '+(recording||processing?'live':'')}>{voiceTip}</p><button className={'record '+(recording?'recording':'')} disabled={processing} onClick={recording?stopRecording:beginRecording}><MicIcon/></button><p className="record-label">{processing?'保存后由 AI 后台整理':recording?'点击麦克风结束录音':'点击开始录音'}</p>{recording&&<button className="record-cancel" type="button" onClick={cancelRecording}>取消录音</button>}<textarea className="input transcript" value={transcript} placeholder="例如：新建两个任务… / 把今日复盘风险删掉… / 周报下周计划加一项演示" onChange={e=>{setTranscript(e.target.value);setParsedTask(null)}}/>{parsedTask&&<div className="ai-understanding"><b>已整理</b><span>任务：{parsedTask.title}</span><span>负责人：{parsedTask.assignee} · 截止：{parsedTask.due} · {parsedTask.priority}优先级</span><span>预计用时：{formatDuration(parsedTask.estimatedMinutes||defaultEstimate(parsedTask.priority))}</span></div>}<button className="primary" disabled={!transcript.trim()||processing||recording} onClick={createTasksFromText}>AI 理解并执行</button></>:modal==='settings'?<AppSettings schedule={autoSchedule} onScheduleSaved={next=>{setAutoSchedule(next);notify('自动作业时间已保存')}} onClose={()=>setModal(null)} onModelSaved={()=>{refreshAiReady();notify('模型已切换')}}/>:modal==='admin'?<AdminPage onClose={()=>setModal(null)}/>:modal==='cloud'?<CloudSettings onClose={()=>setModal(null)} askConfirm={askConfirm}/>:<><h2>新建任务</h2><label>任务内容</label><input className="input" value={title} onChange={e=>setTitle(e.target.value)} placeholder="例如：完成项目周报"/><label>负责人</label><div className="people"><button className="selected" onClick={()=>setAssignee('我')}>我</button></div><label>预估时间</label><select className="input" value={estimate} onChange={e=>setEstimate(Number(e.target.value))}><option value={15}>15 分钟</option><option value={30}>30 分钟</option><option value={60}>1 小时</option><option value={120}>2 小时</option><option value={240}>4 小时</option></select><button className="primary" disabled={!title.trim()} onClick={()=>addTask()}>创建任务</button></>}</section></div>}
   </main></div>;
 }
 
@@ -671,15 +675,22 @@ function taskElapsed(task:Task,now:number){if(!task.startedAt)return 0;const sta
 function TrashIcon(){return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m-9 0 1 13h10l1-13M10 11v5m4-5v5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/></svg>}
 function TaskItem({task,cycle,remove,now}:{task:Task;cycle:(id:string)=>void;remove:(id:string,title:string)=>void;now:number}){const elapsed=taskElapsed(task,now);const priorityClass=task.priority==='高'?'priority-high':task.priority==='低'?'priority-low':'priority-mid';return <div className={'task-wrap '+priorityClass}><button className="task" onClick={()=>cycle(task.id)}><i className={`task-status ${task.status}`}>{task.status==='done'?'✓':''}</i><div><strong className={task.status==='done'?'done':''}>{task.title}</strong><p><b className={task.priority==='高'?'high':''}>{task.priority}优先级</b> · {task.due} · {task.assignee}</p><div className="task-time"><span>预计 {formatDuration(task.estimatedMinutes)}</span><span>已进行 {formatDuration(elapsed)}</span></div>{task.assignee!=='我'&&task.status!=='done'&&<span className="progress"><em style={{width:`${task.progress}%`}}/></span>}</div></button><button className="task-delete" type="button" onClick={()=>remove(task.id,task.title)} aria-label={`删除任务：${task.title}`}><TrashIcon/></button></div>}
 function ListPage({title,tasks,cycle,remove,now,voiceProgress,onRetryVoice,onDismissVoice}:{title:string;tasks:Task[];cycle:(id:string)=>void;remove:(id:string,title:string)=>void;now:number;voiceProgress?:VoiceProgress[];onRetryVoice?:(id:string)=>void;onDismissVoice?:(id:string)=>void}){const [filter,setFilter]=useState('全部');const list=tasks.filter(t=>filter==='全部'||(filter==='已完成'?t.status==='done':t.status!=='done'));return <div className="page"><h1 className="page-title">{title}</h1><p className="page-sub">轻点任务切换状态，右侧按钮可删除任务</p>{voiceProgress&&voiceProgress.length>0&&onRetryVoice&&onDismissVoice&&<VoiceProgressPanel items={voiceProgress} onRetry={onRetryVoice} onDismiss={onDismissVoice}/>}<div className="filters">{['全部','进行中','已完成'].map(f=><button key={f} className={f===filter?'active':''} onClick={()=>setFilter(f)}>{f}</button>)}</div>{list.map(t=><TaskItem key={t.id} task={t} cycle={cycle} remove={remove} now={now}/>)}{!list.length&&<div className="empty">还没有任务，点下方语音或加号开始</div>}</div>}
-function Profile({avatarText,avatarUrl,onAvatarFile,displayName,accountHint,tasks,install,aiReady,cloudOnline,localOnline,syncing,signOut,goTeam,openSettings,openWeeklyArchive,openMonthlyArchive,openVoiceHistory}:{avatarText:string;avatarUrl:string;onAvatarFile:(file:File)=>void;displayName:string;accountHint:string;tasks:Task[];install:()=>void;aiReady:boolean|null;cloudOnline:boolean;localOnline:boolean;syncing:boolean;signOut:()=>void;goTeam:()=>void;openSettings:()=>void;openWeeklyArchive:()=>void;openMonthlyArchive:()=>void;openVoiceHistory:()=>void}){
+function Profile({avatarText,avatarUrl,onAvatarFile,displayName,accountHint,pointsBalance,isAdmin,tasks,install,aiReady,cloudOnline,localOnline,syncing,signOut,goTeam,openSettings,openAdmin,openWeeklyArchive,openMonthlyArchive,openVoiceHistory}:{avatarText:string;avatarUrl:string;onAvatarFile:(file:File)=>void;displayName:string;accountHint:string;pointsBalance?:number;isAdmin?:boolean;tasks:Task[];install:()=>void;aiReady:boolean|null;cloudOnline:boolean;localOnline:boolean;syncing:boolean;signOut:()=>void;goTeam:()=>void;openSettings:()=>void;openAdmin:()=>void;openWeeklyArchive:()=>void;openMonthlyArchive:()=>void;openVoiceHistory:()=>void}){
   const fileRef=useRef<HTMLInputElement|null>(null);
   const rate=Math.round(tasks.filter(t=>t.status==='done').length/Math.max(tasks.length,1)*100);
-  const menus=[{i:'◷',t:'周报查询',action:openWeeklyArchive},{i:'◫',t:'月报查询',action:openMonthlyArchive},{i:'♪',t:'语音指令记录',action:openVoiceHistory},{i:'◎',t:'成员管理',action:goTeam},{i:'⚙',t:'设置',action:openSettings}];
+  const menus=[
+    {i:'◷',t:'周报查询',action:openWeeklyArchive},
+    {i:'◫',t:'月报查询',action:openMonthlyArchive},
+    {i:'♪',t:'语音指令记录',action:openVoiceHistory},
+    {i:'◎',t:'成员管理',action:goTeam},
+    {i:'⚙',t:'设置',action:openSettings},
+    ...(isAdmin?[{i:'▣',t:'管理后台',action:openAdmin}]:[])
+  ];
   return <div className="page"><h1 className="page-title">我的</h1>
     <section className="profile">
       <button type="button" className="big-avatar uploadable" onClick={()=>fileRef.current?.click()} aria-label="上传头像">{avatarUrl?<img src={avatarUrl} alt="头像"/>:avatarText}<em>更换</em></button>
       <input ref={fileRef} type="file" accept="image/*" hidden onChange={e=>{const file=e.target.files?.[0];if(file)onAvatarFile(file);e.target.value=''}}/>
-      <div className="profile-identity"><b>{displayName}</b>{accountHint&&<span>{accountHint}</span>}</div>
+      <div className="profile-identity"><b>{displayName}</b>{accountHint&&<span>{accountHint}</span>}{typeof pointsBalance==='number'&&<span className="points-balance">积分 {Math.round(pointsBalance)}</span>}</div>
       <span className={'ai-status '+(aiReady?'online':'')}>● {aiReady?'智能助手已连接':'智能助手待配置'}</span>
       {cloudOnline&&<span className="ai-status online">● {syncing?'云端同步中':'云端数据已同步'}</span>}
       {localOnline&&!cloudOnline&&<span className="ai-status online">● 本机账号已登录</span>}
@@ -893,107 +904,70 @@ const TEXT_MODEL_LABELS:Record<string,string>={
   'deepseek-v4-flash':'DeepSeek V4 Flash（推荐）'
 };
 
+type BuiltinModelOption={id:string;name:string;provider:string;textModel:string;weight:number;badge?:string};
+
 function ModelSettings({onClose,onSaved}:{onClose:()=>void;onSaved:()=>void}){
-  const [loading,setLoading]=useState(true);const [saving,setSaving]=useState(false);const [testing,setTesting]=useState(false);
-  const [textConfigured,setTextConfigured]=useState(false);const [asrConfigured,setAsrConfigured]=useState(false);const [asrUsesTextKey,setAsrUsesTextKey]=useState(false);
-  const [maskedTextKey,setMaskedTextKey]=useState('');const [maskedAsrKey,setMaskedAsrKey]=useState('');
-  const [textApiKey,setTextApiKey]=useState('');const [asrApiKey,setAsrApiKey]=useState('');
-  const [showTextKey,setShowTextKey]=useState(false);const [showAsrKey,setShowAsrKey]=useState(false);
-  const [clearAsrKey,setClearAsrKey]=useState(false);
-  const [provider,setProvider]=useState<ModelProviderId>('bailian');
-  const [baseURL,setBaseURL]=useState(DEFAULT_MODEL_PRESETS[0].baseURL);
-  const [presets,setPresets]=useState<ModelPreset[]>(DEFAULT_MODEL_PRESETS);
-  const [textModel,setTextModel]=useState('qwen3.7-plus');const [customModel,setCustomModel]=useState('');
-  const [useCustomModel,setUseCustomModel]=useState(false);
-  const [asrModel,setAsrModel]=useState('qwen3-asr-flash');
-  const [error,setError]=useState('');const [success,setSuccess]=useState('');
-  const headers=async()=>{const token=(await supabase?.auth.getSession())?.data.session?.access_token;return{'Content-Type':'application/json',...(token?{Authorization:`Bearer ${token}`}:{})}};
-  const applyServerState=(data:any)=>{
-    setTextConfigured(Boolean(data.textConfigured??data.configured));
-    setAsrConfigured(Boolean(data.asrConfigured));
-    setAsrUsesTextKey(Boolean(data.asrUsesTextKey));
-    setMaskedTextKey(data.maskedTextKey||data.maskedKey||'');
-    setMaskedAsrKey(data.maskedAsrKey||'');
-    const nextPresets=Array.isArray(data.presets)&&data.presets.length?data.presets as ModelPreset[]:DEFAULT_MODEL_PRESETS;
-    setPresets(nextPresets);
-    const nextProvider=(['bailian','deepseek','custom'].includes(data.provider)?data.provider:'bailian') as ModelProviderId;
-    setProvider(nextProvider);
-    setBaseURL(String(data.baseURL||nextPresets.find(item=>item.id===nextProvider)?.baseURL||''));
-    const model=String(data.textModel||'qwen3.7-plus');
-    const presetModels=nextPresets.find(item=>item.id===nextProvider)?.models||[];
-    if(presetModels.includes(model)){setUseCustomModel(false);setTextModel(model);setCustomModel('')}
-    else{setUseCustomModel(true);setTextModel('__custom__');setCustomModel(model)}
-    setAsrModel(data.asrModel||'qwen3-asr-flash');
-  };
-  useEffect(()=>{headers().then(h=>fetch('/api/settings/model',{headers:h,credentials:'include'})).then(async response=>{const data=await response.json();if(!response.ok)throw new Error(data.message||'读取配置失败');applyServerState(data)}).catch(e=>setError(e.message)).finally(()=>setLoading(false))},[]);
-  const currentPreset=presets.find(item=>item.id===provider)||DEFAULT_MODEL_PRESETS.find(item=>item.id===provider)||DEFAULT_MODEL_PRESETS[0];
-  const resolvedTextModel=useCustomModel?customModel.trim():textModel;
-  const payload=()=>({provider,baseURL:baseURL.trim(),textApiKey,asrApiKey:clearAsrKey?'':asrApiKey,clearAsrKey,textModel:resolvedTextModel,asrModel});
-  const switchProvider=(next:ModelProviderId)=>{
-    const preset=presets.find(item=>item.id===next)||DEFAULT_MODEL_PRESETS.find(item=>item.id===next)||DEFAULT_MODEL_PRESETS[0];
-    setProvider(next);
-    setBaseURL(preset.baseURL||'');
-    setError('');setSuccess('');
-    if(preset.models.length){setUseCustomModel(false);setTextModel(preset.models[0]);setCustomModel('')}
-    else{setUseCustomModel(true);setTextModel('__custom__');setCustomModel('')}
+  const [loading,setLoading]=useState(true);
+  const [saving,setSaving]=useState(false);
+  const [testing,setTesting]=useState(false);
+  const [configured,setConfigured]=useState(false);
+  const [models,setModels]=useState<BuiltinModelOption[]>([]);
+  const [selectedModelId,setSelectedModelId]=useState('');
+  const [pointsBalance,setPointsBalance]=useState(0);
+  const [currentName,setCurrentName]=useState('');
+  const [error,setError]=useState('');
+  const [success,setSuccess]=useState('');
+  useEffect(()=>{
+    apiFetch('/api/settings/model').then(async response=>{
+      const data=await response.json();
+      if(!response.ok)throw new Error(data.message||'读取配置失败');
+      setConfigured(Boolean(data.configured||data.textConfigured));
+      setModels(Array.isArray(data.models)?data.models:[]);
+      setSelectedModelId(String(data.selectedModelId||data.current?.id||''));
+      setPointsBalance(Number(data.pointsBalance||0));
+      setCurrentName(String(data.current?.name||''));
+    }).catch(e=>setError(e.message)).finally(()=>setLoading(false));
+  },[]);
+  const select=async(modelId:string)=>{
+    setSaving(true);setError('');setSuccess('');
+    try{
+      const response=await apiFetch('/api/settings/model',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({modelId})});
+      const data=await response.json();
+      if(!response.ok)throw new Error(data.message||'切换失败');
+      setSelectedModelId(String(data.selectedModelId||modelId));
+      setPointsBalance(Number(data.pointsBalance||0));
+      setCurrentName(String(data.current?.name||''));
+      setConfigured(Boolean(data.configured||data.textConfigured));
+      setSuccess(data.message||'已切换模型');
+      onSaved();
+    }catch(e){setError(e instanceof Error?e.message:'切换失败')}
+    finally{setSaving(false)}
   };
   const test=async()=>{
     setTesting(true);setError('');setSuccess('');
     try{
-      if(!textConfigured&&!textApiKey.trim())throw new Error('请先填写任务理解 API Key');
-      if(provider==='custom'&&!baseURL.trim())throw new Error('自定义提供商需要填写 Base URL');
-      if(!resolvedTextModel)throw new Error('请填写模型名称');
-      const response=await fetch('/api/settings/model/test',{method:'POST',headers:await headers(),credentials:'include',body:JSON.stringify(payload())});
-      const data=await response.json();if(!response.ok)throw new Error(data.message||'连接测试失败');
+      const response=await apiFetch('/api/settings/model/test',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+      const data=await response.json();
+      if(!response.ok)throw new Error(data.message||'测试失败');
       setSuccess(data.message||'连接成功');
-    }catch(e){setError(e instanceof Error?e.message:'连接测试失败')}
+    }catch(e){setError(e instanceof Error?e.message:'测试失败')}
     finally{setTesting(false)}
   };
-  const save=async()=>{
-    setSaving(true);setError('');setSuccess('');
-    try{
-      if(provider==='custom'&&!baseURL.trim())throw new Error('自定义提供商需要填写 Base URL');
-      if(!resolvedTextModel)throw new Error('请填写模型名称');
-      const response=await fetch('/api/settings/model',{method:'PUT',headers:await headers(),credentials:'include',body:JSON.stringify(payload())});
-      const data=await response.json();if(!response.ok)throw new Error(data.message||'保存失败');
-      applyServerState(data);
-      setTextApiKey('');setAsrApiKey('');setClearAsrKey(false);setSuccess(data.message||'模型配置已保存并启用');onSaved();
-    }catch(e){setError(e instanceof Error?e.message:'保存失败')}
-    finally{setSaving(false)}
-  };
-  const configured=textConfigured;
-  const providerName=currentPreset.label;
-  const statusText=configured
-    ?`${providerName} · 任务理解 ${maskedTextKey||'已配置'} · 语音识别 ${asrConfigured?maskedAsrKey:(asrUsesTextKey?'沿用任务理解密钥':'未单独配置')}`
-    :'每位用户需单独填写 API Key（不共用服务端 .env）';
-  const canTest=Boolean(textConfigured||textApiKey.trim());
-  const modelOptions=currentPreset.models;
-  return <div className="model-settings-panel">{loading?<div className="settings-loading">正在读取服务端配置…</div>:<><div className={'settings-status '+(configured?'ready':'')}><i>{configured?'✓':'!'}</i><div><b>{configured?'模型服务已配置':'尚未配置模型服务'}</b><span>{statusText}</span></div></div>
-    <label>任务理解提供商</label>
-    <select className="input model-select" value={provider} onChange={e=>switchProvider(e.target.value as ModelProviderId)}>
-      {presets.map(item=><option key={item.id} value={item.id}>{item.label}</option>)}
-    </select>
-    <label>Base URL</label>
-    <input className="input" value={baseURL} onChange={e=>setBaseURL(e.target.value)} placeholder={provider==='custom'?'https://api.example.com/v1':currentPreset.baseURL} autoCapitalize="off" autoCorrect="off"/>
-    <p className="field-help">任务理解走 OpenAI 兼容接口（/chat/completions）。切换提供商会自动填入推荐地址，也可手动修改。</p>
-    <label>任务理解 API Key</label>
-    <div className="key-field"><input className="input" type={showTextKey?'text':'password'} value={textApiKey} onChange={e=>setTextApiKey(e.target.value)} placeholder={textConfigured?`已配置 ${maskedTextKey}，留空则不修改`:'sk-xxxxxxxxxxxxxxxx'}/><button type="button" onClick={()=>setShowTextKey(v=>!v)}>{showTextKey?'隐藏':'显示'}</button></div>
-    <label>任务理解与复盘模型</label>
-    <select className="input model-select" value={useCustomModel?'__custom__':textModel} onChange={e=>{const value=e.target.value;if(value==='__custom__'){setUseCustomModel(true);setTextModel('__custom__')}else{setUseCustomModel(false);setTextModel(value);setCustomModel('')}}}>
-      {modelOptions.map(model=><option key={model} value={model}>{TEXT_MODEL_LABELS[model]||model}</option>)}
-      <option value="__custom__">自定义模型 ID…</option>
-    </select>
-    {useCustomModel&&<input className="input" value={customModel} onChange={e=>setCustomModel(e.target.value)} placeholder="例如 deepseek-v4-flash / gpt-4o-mini" autoCapitalize="off" autoCorrect="off"/>}
-    <p className="field-help">{provider==='deepseek'?'DeepSeek 官方可选 deepseek-v4-flash / deepseek-v4-pro。':provider==='bailian'?'百炼可选千问，也可选 DeepSeek V4 Flash / Pro（走百炼兼容接口与百炼 Key）。':'可手填任意 OpenAI 兼容模型 ID。'}</p>
-    <label>语音识别 API Key（百炼 ASR）</label>
-    <div className="key-field"><input className="input" type={showAsrKey?'text':'password'} value={clearAsrKey?'':asrApiKey} onChange={e=>{setClearAsrKey(false);setAsrApiKey(e.target.value)}} placeholder={clearAsrKey?'将清除独立密钥':asrConfigured?`已配置 ${maskedAsrKey}，留空则不修改`:provider==='bailian'?'可选；留空则沿用任务理解密钥':'非百炼时请单独填写百炼 ASR 密钥'}/><button type="button" onClick={()=>setShowAsrKey(v=>!v)}>{showAsrKey?'隐藏':'显示'}</button></div>
-    <p className="field-help">语音转写始终走阿里云百炼 ASR。使用 DeepSeek/自定义文本模型时，请单独填写百炼语音密钥。{asrConfigured&&<button type="button" className="linkish" onClick={()=>{setClearAsrKey(true);setAsrApiKey('')}}>清除独立语音密钥</button>}</p>
-    <label>语音识别模型</label>
-    <select className="input model-select" value={asrModel} onChange={e=>setAsrModel(e.target.value)}><option value="qwen3-asr-flash">千问 3 ASR Flash（推荐）</option><option value="qwen3-asr-flash-2026-02-10">千问 3 ASR Flash 2026-02-10</option></select>
+  return <div className="model-settings-panel">{loading?<div className="settings-loading">正在读取内置模型…</div>:<><div className={'settings-status '+(configured?'ready':'')}><i>{configured?'✓':'!'}</i><div><b>{configured?'内置大模型已就绪':'内置模型未配置 API Key'}</b><span>积分余额 {Math.round(pointsBalance)} · 当前 {currentName||'未选择'} · 消耗 = Token × 权重</span></div></div>
+    <div className="model-picker-list">
+      {models.map(model=>{
+        const active=model.id===selectedModelId;
+        return <button type="button" key={model.id} className={'model-picker-item'+(active?' active':'')} disabled={saving} onClick={()=>void select(model.id)}>
+          <div><b>{model.name}</b><span>{model.badge?`${model.badge} · `:''}{model.textModel}</span></div>
+          <em>{Number(model.weight).toFixed(2)}x</em>
+        </button>;
+      })}
+      {!models.length&&<div className="empty">暂无可用模型，请联系管理员在后台配置</div>}
+    </div>
+    <p className="field-help">模型与 API Key 由管理员统一维护；你只需选择权重合适的模型。调用成功后会按返回的 token 自动扣积分。</p>
     {success&&<div className="settings-success">✓ {success}</div>}
     {error&&<div className="settings-error">{error}</div>}
-    <div className="settings-actions cloud-actions"><button type="button" disabled={testing||saving||!canTest} onClick={()=>void test()}>{testing?'正在测试…':'测试连接'}</button><button type="button" disabled={saving||testing||(!configured&&!textApiKey.trim())} onClick={()=>void save()}>{saving?'正在保存…':'保存并启用'}</button></div>
-    <button type="button" className="schedule-close" onClick={onClose}>取消</button>
+    <div className="settings-actions cloud-actions"><button type="button" disabled={testing||saving||!configured} onClick={()=>void test()}>{testing?'正在测试…':'测试当前模型'}</button><button type="button" onClick={onClose}>完成</button></div>
   </>}</div>;
 }
 

@@ -58,7 +58,12 @@ DATABASE_URL=postgres://flowmate:CHANGE_ME@127.0.0.1:5432/flowmate
 SQLITE_PATH=data/flowmate.db
 ```
 
-本地账号仍按用户隔离。正式暴露到公网时，请在安全组和 Nginx 中启用 HTTPS；不要直接把 Node 端口开放给整个互联网。
+### 内置大模型与积分
+
+- 用户在「设置 → 大模型」只选择内置模型（右侧权重如 `0.05x`）；API Key 由管理员在后台维护。
+- 每次调用按接口返回的 token 自动计费：`积分 = Token × 权重`。
+- 「我的 → 管理后台」（仅 admin）：维护模型权重/密钥、用户角色与积分、查看用量。
+- 可用环境变量：`ADMIN_EMAILS=a@b.com,c@d.com`（启动时升为管理员）、`DEFAULT_SIGNUP_POINTS=50000`。
 
 ## 可选：Supabase 云端存储
 

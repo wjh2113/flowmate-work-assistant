@@ -3,6 +3,9 @@ export type LocalUser = {
   email: string;
   name: string;
   createdAt?: string;
+  role?: 'user' | 'admin';
+  pointsBalance?: number;
+  selectedModelId?: string;
 };
 
 export function apiFetch(input: RequestInfo | URL, init?: RequestInit) {
