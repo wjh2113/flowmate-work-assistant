@@ -11,6 +11,7 @@ import {
   adminDashboardStats,
   assertEnoughPoints,
   chargeUsage,
+  closeBilling,
   deleteBuiltinModel,
   ensureUserBillingDefaults,
   getUserAccount,
@@ -1918,11 +1919,14 @@ app.use((req,res,next)=>{if(req.path==='/'||req.path==='/index.html'||req.path==
 app.use(express.static(dist));
 app.get('/{*splat}', (_req, res) => res.set('Cache-Control','no-store').sendFile(path.join(dist, 'index.html')));
 let sqliteClosed=false;
-const closeDatabase=()=>{if(sqliteClosed)return;sqliteClosed=true;void closeSqlite()};
+const closeDatabase=()=>{if(sqliteClosed)return;sqliteClosed=true;void closeSqlite();void closeBilling()};
 process.once('SIGINT',()=>{closeDatabase();process.exit(0)});
 process.once('SIGTERM',()=>{closeDatabase();process.exit(0)});
 process.once('exit',closeDatabase);
-Promise.all([initStore(), initBilling(), loadJobSettings(), recoverVoiceJobs(), recoverReportEditJobs()])
+// Store schema must exist before billing ALTERs users / creates related tables.
+initStore()
+  .then(() => initBilling())
+  .then(() => Promise.all([loadJobSettings(), recoverVoiceJobs(), recoverReportEditJobs()]))
   .then(async () => {
     try {
       const legacy = await autoClaimSqliteLegacyData();

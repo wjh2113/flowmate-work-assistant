@@ -60,9 +60,17 @@ async function main() {
   }
 
   const encodedPass = encodeURIComponent(password);
-  const hostMatch = adminUrl.match(/@([^/]+)/);
-  const hostPort = hostMatch ? hostMatch[1] : '127.0.0.1:5432';
-  const databaseUrl = `postgres://${encodeURIComponent(dbUser)}:${encodedPass}@${hostPort}/${dbName}`;
+  let databaseUrl;
+  try {
+    const parsed = new URL(adminUrl);
+    const hostPort = parsed.host || '127.0.0.1:5432';
+    const search = parsed.search || '';
+    databaseUrl = `postgres://${encodeURIComponent(dbUser)}:${encodedPass}@${hostPort}/${dbName}${search}`;
+  } catch {
+    const hostMatch = adminUrl.match(/@([^/?]+)/);
+    const hostPort = hostMatch ? hostMatch[1] : '127.0.0.1:5432';
+    databaseUrl = `postgres://${encodeURIComponent(dbUser)}:${encodedPass}@${hostPort}/${dbName}`;
+  }
 
   console.log('\nAdd these lines to your .env:\n');
   console.log(`DATABASE_URL=${databaseUrl}`);

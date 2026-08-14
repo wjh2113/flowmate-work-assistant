@@ -63,6 +63,45 @@ async function qOne(text, params = []) {
   return rows[0] || null;
 }
 
+async function withTx(fn) {
+  if (usePostgres) {
+    const client = await getPg().connect();
+    try {
+      await client.query('BEGIN');
+      const txQ = async (text, params = []) => {
+        let i = 0;
+        const sql = text.replace(/\?/g, () => `$${++i}`);
+        return (await client.query(sql, params)).rows;
+      };
+      const result = await fn({ q: txQ, qOne: async (text, params) => (await txQ(text, params))[0] || null });
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+  const db = getSqlite();
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const txQ = async (text, params = []) => {
+      const stmt = db.prepare(text);
+      if (/^\s*(SELECT|WITH)\b/i.test(text)) return stmt.all(...params);
+      if (/\bRETURNING\b/i.test(text)) return stmt.all(...params);
+      stmt.run(...params);
+      return [];
+    };
+    const result = await fn({ q: txQ, qOne: async (text, params) => (await txQ(text, params))[0] || null });
+    db.exec('COMMIT');
+    return result;
+  } catch (error) {
+    try { db.exec('ROLLBACK'); } catch {}
+    throw error;
+  }
+}
+
 function providerBase(provider, baseURL) {
   const id = String(provider || 'bailian');
   if (String(baseURL || '').trim()) return String(baseURL).replace(/\/$/, '');
@@ -111,6 +150,7 @@ export async function initBilling() {
         ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user';
         ALTER TABLE users ADD COLUMN IF NOT EXISTS points_balance DOUBLE PRECISION NOT NULL DEFAULT 0;
         ALTER TABLE users ADD COLUMN IF NOT EXISTS selected_model_id TEXT NOT NULL DEFAULT '';
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS signup_points_granted INTEGER NOT NULL DEFAULT 0;
         CREATE TABLE IF NOT EXISTS builtin_models (
           id TEXT PRIMARY KEY,
           name TEXT NOT NULL,
@@ -149,6 +189,7 @@ export async function initBilling() {
       if (!cols.includes('role')) db.exec(`ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'`);
       if (!cols.includes('points_balance')) db.exec(`ALTER TABLE users ADD COLUMN points_balance REAL NOT NULL DEFAULT 0`);
       if (!cols.includes('selected_model_id')) db.exec(`ALTER TABLE users ADD COLUMN selected_model_id TEXT NOT NULL DEFAULT ''`);
+      if (!cols.includes('signup_points_granted')) db.exec(`ALTER TABLE users ADD COLUMN signup_points_granted INTEGER NOT NULL DEFAULT 0`);
       db.exec(`
         CREATE TABLE IF NOT EXISTS builtin_models (
           id TEXT PRIMARY KEY,
@@ -183,10 +224,25 @@ export async function initBilling() {
         CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_logs(created_at DESC);
       `);
     }
+    // Existing balances/usage mean signup grant already happened (or was migrated).
+    await q(`UPDATE users SET signup_points_granted=1 WHERE signup_points_granted=0 AND (points_balance>0 OR id IN (SELECT DISTINCT user_id FROM usage_logs))`);
     await seedBuiltinModelsIfEmpty();
     await bootstrapAdmins();
   })();
   return ready;
+}
+
+export async function closeBilling() {
+  ready = null;
+  if (pgPool) {
+    const current = pgPool;
+    pgPool = null;
+    await current.end();
+  }
+  if (sqliteDb) {
+    try { sqliteDb.close(); } catch {}
+    sqliteDb = null;
+  }
 }
 
 async function seedBuiltinModelsIfEmpty() {
@@ -207,18 +263,22 @@ async function seedBuiltinModelsIfEmpty() {
 
 async function bootstrapAdmins() {
   if (!ADMIN_EMAILS.length) {
-    const admins = await qOne(usePostgres
-      ? `SELECT COUNT(*)::int AS n FROM users WHERE role='admin' AND id<>'local-legacy'`
-      : `SELECT COUNT(*) AS n FROM users WHERE role='admin' AND id<>'local-legacy'`);
-    if (Number(admins?.n || 0) === 0) {
-      const first = await qOne(`SELECT id FROM users WHERE id<>'local-legacy' ORDER BY created_at ASC LIMIT 1`);
-      if (first?.id) await q(`UPDATE users SET role='admin' WHERE id=?`, [first.id]);
-    }
+    await promoteOldestUserIfNoAdmin();
     return;
   }
   for (const email of ADMIN_EMAILS) {
     await q(`UPDATE users SET role='admin' WHERE lower(email)=?`, [email]);
   }
+}
+
+async function promoteOldestUserIfNoAdmin() {
+  if (ADMIN_EMAILS.length) return;
+  const admins = await qOne(usePostgres
+    ? `SELECT COUNT(*)::int AS n FROM users WHERE role='admin' AND id<>'local-legacy'`
+    : `SELECT COUNT(*) AS n FROM users WHERE role='admin' AND id<>'local-legacy'`);
+  if (Number(admins?.n || 0) > 0) return;
+  const first = await qOne(`SELECT id FROM users WHERE id<>'local-legacy' ORDER BY created_at ASC LIMIT 1`);
+  if (first?.id) await q(`UPDATE users SET role='admin' WHERE id=?`, [first.id]);
 }
 
 export function calcPoints(totalTokens, weight) {
@@ -249,17 +309,20 @@ export async function ensureUserBillingDefaults(userId, email = '') {
   await initBilling();
   const account = await getUserAccount(userId);
   if (!account) return null;
-  const role = ADMIN_EMAILS.includes(String(email || account.email || '').toLowerCase()) ? 'admin' : account.role;
-  let points = account.pointsBalance;
-  // New users often still at 0 — grant signup points once
-  if (points <= 0) {
-    const used = await qOne(
-      usePostgres ? `SELECT COUNT(*)::int AS n FROM usage_logs WHERE user_id=$1` : `SELECT COUNT(*) AS n FROM usage_logs WHERE user_id=?`,
-      [userId]
-    );
-    if (Number(used?.n || 0) === 0) points = DEFAULT_SIGNUP_POINTS;
+  const emailLower = String(email || account.email || '').toLowerCase();
+  if (ADMIN_EMAILS.includes(emailLower) && account.role !== 'admin') {
+    await q(`UPDATE users SET role='admin' WHERE id=?`, [userId]);
   }
-  await q(`UPDATE users SET role=?, points_balance=? WHERE id=?`, [role, points, userId]);
+  // Grant signup points once; never rewrite an existing balance on every request.
+  await q(
+    `UPDATE users SET
+       points_balance=CASE WHEN points_balance=0 THEN ? ELSE points_balance END,
+       signup_points_granted=1
+     WHERE id=? AND signup_points_granted=0`,
+    [DEFAULT_SIGNUP_POINTS, userId]
+  );
+  // First real user becomes admin when ADMIN_EMAILS is empty (covers register-after-boot).
+  await promoteOldestUserIfNoAdmin();
   return getUserAccount(userId);
 }
 
@@ -406,21 +469,32 @@ export async function chargeUsage(userId, {
   const completion = Math.max(0, Number(usage?.completion_tokens || usage?.output_tokens || 0));
   let total = Math.max(0, Number(usage?.total_tokens || 0));
   if (!total) total = prompt + completion;
-  if (!total) return { skipped: true, reason: 'no_tokens' };
+  // Providers that omit usage must not be free — charge a conservative estimate.
+  if (!total) total = 500;
   const points = calcPoints(total, weight);
-  const account = await getUserAccount(userId);
-  if (!account) throw new Error('用户不存在');
-  if (account.pointsBalance < points) throw new Error('积分不足，请联系管理员充值');
   const id = randomUUID();
   const now = new Date().toISOString();
-  const nextBalance = Math.round((account.pointsBalance - points) * 1000) / 1000;
-  await q(`UPDATE users SET points_balance=? WHERE id=?`, [nextBalance, userId]);
-  await q(
-    `INSERT INTO usage_logs(id,user_id,model_id,model_name,action,prompt_tokens,completion_tokens,total_tokens,weight,points,created_at)
-     VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
-    [id, userId, modelId, modelName, action, prompt, completion, total, weight, points, now]
-  );
-  return { id, points, totalTokens: total, promptTokens: prompt, completionTokens: completion, balance: nextBalance, weight };
+  return withTx(async ({ q: txQ, qOne: txOne }) => {
+    const lockSql = usePostgres
+      ? `SELECT id, points_balance FROM users WHERE id=? FOR UPDATE`
+      : `SELECT id, points_balance FROM users WHERE id=?`;
+    const row = await txOne(lockSql, [userId]);
+    if (!row) throw new Error('用户不存在');
+    const updated = await txQ(
+      `UPDATE users SET points_balance = points_balance - ?
+       WHERE id=? AND points_balance >= ?
+       RETURNING points_balance`,
+      [points, userId, points]
+    );
+    if (!updated.length) throw new Error('积分不足，请联系管理员充值');
+    const nextBalance = Math.round(Number(updated[0].points_balance) * 1000) / 1000;
+    await txQ(
+      `INSERT INTO usage_logs(id,user_id,model_id,model_name,action,prompt_tokens,completion_tokens,total_tokens,weight,points,created_at)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+      [id, userId, modelId, modelName, action, prompt, completion, total, weight, points, now]
+    );
+    return { id, points, totalTokens: total, promptTokens: prompt, completionTokens: completion, balance: nextBalance, weight };
+  });
 }
 
 export async function assertEnoughPoints(userId, estimateTokens = 500) {
@@ -457,7 +531,8 @@ export async function updateUserAdmin(userId, patch = {}) {
   const points = Object.prototype.hasOwnProperty.call(patch, 'pointsBalance')
     ? Math.max(0, Number(patch.pointsBalance) || 0)
     : account.pointsBalance;
-  await q(`UPDATE users SET role=?, points_balance=? WHERE id=?`, [role, points, userId]);
+  // Admin edits count as “granted” so a zeroed balance is not refilled on next login.
+  await q(`UPDATE users SET role=?, points_balance=?, signup_points_granted=1 WHERE id=?`, [role, points, userId]);
   return getUserAccount(userId);
 }
 

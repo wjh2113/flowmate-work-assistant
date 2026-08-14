@@ -640,10 +640,31 @@ export async function closeSqlite() {
 /** Used by migrate script to insert raw rows */
 export async function upsertRawUser(row) {
   await initPgStore();
+  const points = Number(row.points_balance || 0);
+  const granted = Number(row.signup_points_granted ?? (points > 0 ? 1 : 0));
   await query(
-    `INSERT INTO users(id,email,password_hash,display_name,created_at) VALUES($1,$2,$3,$4,$5)
-     ON CONFLICT(id) DO UPDATE SET email=EXCLUDED.email,password_hash=EXCLUDED.password_hash,display_name=EXCLUDED.display_name,created_at=EXCLUDED.created_at`,
-    [row.id, row.email, row.password_hash, row.display_name || '', row.created_at]
+    `INSERT INTO users(id,email,password_hash,display_name,created_at,role,points_balance,selected_model_id,signup_points_granted)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
+     ON CONFLICT(id) DO UPDATE SET
+       email=EXCLUDED.email,
+       password_hash=EXCLUDED.password_hash,
+       display_name=EXCLUDED.display_name,
+       created_at=EXCLUDED.created_at,
+       role=EXCLUDED.role,
+       points_balance=EXCLUDED.points_balance,
+       selected_model_id=EXCLUDED.selected_model_id,
+       signup_points_granted=EXCLUDED.signup_points_granted`,
+    [
+      row.id,
+      row.email,
+      row.password_hash,
+      row.display_name || '',
+      row.created_at,
+      row.role || 'user',
+      points,
+      row.selected_model_id || '',
+      granted
+    ]
   );
 }
 
@@ -710,9 +731,43 @@ export async function upsertRawAppMeta(row) {
   await setAppMeta(row.key, row.value);
 }
 
+export async function upsertRawBuiltinModel(row) {
+  await initPgStore();
+  await query(`
+    INSERT INTO builtin_models(id,name,provider,base_url,text_api_key,asr_api_key,text_model,asr_model,weight,badge,sort_order,enabled,kind,updated_at)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+    ON CONFLICT(id) DO UPDATE SET
+      name=EXCLUDED.name,provider=EXCLUDED.provider,base_url=EXCLUDED.base_url,
+      text_api_key=EXCLUDED.text_api_key,asr_api_key=EXCLUDED.asr_api_key,
+      text_model=EXCLUDED.text_model,asr_model=EXCLUDED.asr_model,weight=EXCLUDED.weight,
+      badge=EXCLUDED.badge,sort_order=EXCLUDED.sort_order,enabled=EXCLUDED.enabled,
+      kind=EXCLUDED.kind,updated_at=EXCLUDED.updated_at
+  `, [
+    row.id, row.name, row.provider || 'bailian', row.base_url || '', row.text_api_key || '', row.asr_api_key || '',
+    row.text_model, row.asr_model || 'qwen3-asr-flash', Number(row.weight ?? 1), row.badge || '',
+    Number(row.sort_order || 0), Number(row.enabled ?? 1), row.kind || 'text', row.updated_at
+  ]);
+}
+
+export async function upsertRawUsageLog(row) {
+  await initPgStore();
+  await query(`
+    INSERT INTO usage_logs(id,user_id,model_id,model_name,action,prompt_tokens,completion_tokens,total_tokens,weight,points,created_at)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+    ON CONFLICT(id) DO UPDATE SET
+      user_id=EXCLUDED.user_id,model_id=EXCLUDED.model_id,model_name=EXCLUDED.model_name,action=EXCLUDED.action,
+      prompt_tokens=EXCLUDED.prompt_tokens,completion_tokens=EXCLUDED.completion_tokens,total_tokens=EXCLUDED.total_tokens,
+      weight=EXCLUDED.weight,points=EXCLUDED.points,created_at=EXCLUDED.created_at
+  `, [
+    row.id, row.user_id, row.model_id || '', row.model_name || '', row.action || '',
+    Number(row.prompt_tokens || 0), Number(row.completion_tokens || 0), Number(row.total_tokens || 0),
+    Number(row.weight ?? 1), Number(row.points || 0), row.created_at
+  ]);
+}
+
 export async function countTable(name) {
   await initPgStore();
-  const allowed = new Set(['users', 'sessions', 'tasks', 'daily_reports', 'period_reports', 'user_model_settings', 'user_preferences', 'app_meta']);
+  const allowed = new Set(['users', 'sessions', 'tasks', 'daily_reports', 'period_reports', 'user_model_settings', 'user_preferences', 'app_meta', 'builtin_models', 'usage_logs']);
   if (!allowed.has(name)) throw new Error('invalid table');
   const { rows } = await query(`SELECT COUNT(*)::int AS n FROM ${name}`);
   return Number(rows[0]?.n || 0);

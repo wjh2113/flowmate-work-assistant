@@ -2,17 +2,20 @@ import 'dotenv/config';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
+import { initBilling, closeBilling } from '../server/billing.mjs';
 import {
   closeSqlite,
   countTable,
   initPgStore,
   upsertRawAppMeta,
+  upsertRawBuiltinModel,
   upsertRawDailyReport,
   upsertRawModelSettings,
   upsertRawPeriodReport,
   upsertRawPreferences,
   upsertRawSession,
   upsertRawTask,
+  upsertRawUsageLog,
   upsertRawUser
 } from '../server/pg-store.mjs';
 
@@ -40,6 +43,8 @@ async function migrate() {
   const db = new DatabaseSync(sqlitePath, { readOnly: true });
 
   await initPgStore();
+  // Billing columns/tables must exist before user upserts that include points/role.
+  await initBilling();
 
   const users = allRows(db, 'users');
   for (const row of users) await upsertRawUser(row);
@@ -73,15 +78,27 @@ async function migrate() {
   for (const row of meta) await upsertRawAppMeta(row);
   console.log(`app_meta: ${meta.length}`);
 
+  const builtin = allRows(db, 'builtin_models');
+  for (const row of builtin) await upsertRawBuiltinModel(row);
+  console.log(`builtin_models: ${builtin.length}`);
+
+  const usage = allRows(db, 'usage_logs');
+  for (const row of usage) await upsertRawUsageLog(row);
+  console.log(`usage_logs: ${usage.length}`);
+
   db.close();
 
-  const tables = ['users', 'sessions', 'tasks', 'daily_reports', 'period_reports', 'user_model_settings', 'user_preferences', 'app_meta'];
+  const tables = [
+    'users', 'sessions', 'tasks', 'daily_reports', 'period_reports',
+    'user_model_settings', 'user_preferences', 'app_meta', 'builtin_models', 'usage_logs'
+  ];
   console.log('\nPostgreSQL row counts:');
   for (const name of tables) {
     console.log(`  ${name}: ${await countTable(name)}`);
   }
 
   await closeSqlite();
+  await closeBilling();
   console.log('\nMigration complete. SQLite file was not deleted.');
   console.log('Restart the server with DATABASE_URL set to use PostgreSQL.');
 }
@@ -89,5 +106,6 @@ async function migrate() {
 migrate().catch(async (error) => {
   console.error('Migration failed:', error.message || error);
   try { await closeSqlite(); } catch {}
+  try { await closeBilling(); } catch {}
   process.exit(1);
 });
