@@ -113,8 +113,29 @@ function envTextKey() {
   return String(process.env.DASHSCOPE_TEXT_API_KEY || process.env.DASHSCOPE_API_KEY || process.env.DEEPSEEK_API_KEY || '').trim();
 }
 
+function envDeepseekKey() {
+  return String(process.env.DEEPSEEK_API_KEY || '').trim();
+}
+
 function envAsrKey() {
   return String(process.env.DASHSCOPE_ASR_API_KEY || process.env.DASHSCOPE_API_KEY || '').trim();
+}
+
+function envKeyForProvider(provider) {
+  return provider === 'deepseek' ? envDeepseekKey() : envTextKey();
+}
+
+function resolveModelTextKey(model) {
+  if (!model) return '';
+  const stored = String(model.textApiKey || '').trim();
+  const envKey = envKeyForProvider(model.provider);
+  // Prefer provider-matching env key; avoid using a DashScope key against DeepSeek.
+  if (model.provider === 'deepseek') {
+    if (envKey) return envKey;
+    if (stored && stored !== envTextKey()) return stored;
+    return '';
+  }
+  return stored || envKey;
 }
 
 function toModel(row, { includeSecrets = false } = {}) {
@@ -227,6 +248,7 @@ export async function initBilling() {
     // Existing balances/usage mean signup grant already happened (or was migrated).
     await q(`UPDATE users SET signup_points_granted=1 WHERE signup_points_granted=0 AND (points_balance>0 OR id IN (SELECT DISTINCT user_id FROM usage_logs))`);
     await seedBuiltinModelsIfEmpty();
+    await repairBuiltinModelKeys();
     await bootstrapAdmins();
   })();
   return ready;
@@ -248,16 +270,35 @@ export async function closeBilling() {
 async function seedBuiltinModelsIfEmpty() {
   const countRow = await qOne(usePostgres ? 'SELECT COUNT(*)::int AS n FROM builtin_models' : 'SELECT COUNT(*) AS n FROM builtin_models');
   if (Number(countRow?.n || 0) > 0) return;
-  const textKey = envTextKey();
   const asrKey = envAsrKey();
   const now = new Date().toISOString();
   for (const item of DEFAULT_MODELS) {
     const baseURL = item.provider === 'deepseek' ? DEEPSEEK_BASE : BAILIAN_BASE;
+    const textKey = envKeyForProvider(item.provider);
     await q(
       `INSERT INTO builtin_models(id,name,provider,base_url,text_api_key,asr_api_key,text_model,asr_model,weight,badge,sort_order,enabled,kind,updated_at)
        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [item.id, item.name, item.provider, baseURL, textKey, asrKey, item.textModel, 'qwen3-asr-flash', item.weight, item.badge, item.sortOrder, 1, 'text', now]
+      [item.id, item.name, item.provider, baseURL, textKey, item.provider === 'deepseek' ? '' : asrKey, item.textModel, 'qwen3-asr-flash', item.weight, item.badge, item.sortOrder, 1, 'text', now]
     );
+  }
+}
+
+/** Clear DashScope keys wrongly stored on DeepSeek rows; fill empty provider keys from env. */
+async function repairBuiltinModelKeys() {
+  const dash = envTextKey();
+  const deep = envDeepseekKey();
+  const asr = envAsrKey();
+  if (dash) {
+    await q(`UPDATE builtin_models SET text_api_key='' WHERE provider='deepseek' AND text_api_key=?`, [dash]);
+  }
+  if (deep) {
+    await q(`UPDATE builtin_models SET text_api_key=? WHERE provider='deepseek' AND (text_api_key='' OR text_api_key IS NULL)`, [deep]);
+  }
+  if (dash) {
+    await q(`UPDATE builtin_models SET text_api_key=? WHERE provider<>'deepseek' AND (text_api_key='' OR text_api_key IS NULL)`, [dash]);
+  }
+  if (asr) {
+    await q(`UPDATE builtin_models SET asr_api_key=? WHERE provider<>'deepseek' AND (asr_api_key='' OR asr_api_key IS NULL)`, [asr]);
   }
 }
 
@@ -415,7 +456,12 @@ export async function resolveBuiltinAiConfig(userId) {
   const account = await getUserAccount(userId);
   const models = await listBuiltinModels({ enabledOnly: true, includeSecrets: true });
   const textModels = models.filter((m) => m.kind !== 'asr');
-  let selected = textModels.find((m) => m.id === account?.selectedModelId) || textModels[0] || null;
+  const withKey = (m) => Boolean(resolveModelTextKey(m));
+  let selected = textModels.find((m) => m.id === account?.selectedModelId && withKey(m))
+    || textModels.find((m) => m.id === account?.selectedModelId)
+    || textModels.find(withKey)
+    || textModels[0]
+    || null;
   if (!selected) {
     return {
       source: 'builtin',
@@ -432,20 +478,26 @@ export async function resolveBuiltinAiConfig(userId) {
       resolveAsrKey: () => ''
     };
   }
-  if (account && !account.selectedModelId) {
+  const textKey = resolveModelTextKey(selected);
+  // Selected model has no usable key — fall back to any configured builtin model.
+  if (!textKey) {
+    const fallback = textModels.find((m) => m.id !== selected.id && withKey(m));
+    if (fallback) selected = fallback;
+  }
+  const finalTextKey = resolveModelTextKey(selected);
+  if (account && userId && !account.selectedModelId && selected?.id) {
     await q(`UPDATE users SET selected_model_id=? WHERE id=?`, [selected.id, userId]);
   }
   const asr = models.find((m) => m.kind === 'asr' && m.enabled)
-    || textModels.find((m) => m.provider === 'bailian' && m.hasAsrKey)
+    || textModels.find((m) => m.provider === 'bailian' && (m.asrApiKey || m.textApiKey || envAsrKey()))
     || selected;
-  const textKey = selected.textApiKey || envTextKey();
-  const asrKey = (asr?.asrApiKey || asr?.textApiKey || envAsrKey() || (selected.provider === 'bailian' ? textKey : ''));
+  const asrKey = (asr?.asrApiKey || (asr?.provider === 'bailian' ? asr?.textApiKey : '') || envAsrKey() || (selected.provider === 'bailian' ? finalTextKey : ''));
   return {
     source: 'builtin',
-    configured: Boolean(textKey),
+    configured: Boolean(finalTextKey),
     provider: selected.provider,
     baseURL: providerBase(selected.provider, selected.baseURL),
-    textApiKey: textKey,
+    textApiKey: finalTextKey,
     asrApiKey: asr?.asrApiKey || '',
     textModel: selected.textModel,
     asrModel: asr?.asrModel || 'qwen3-asr-flash',

@@ -37,7 +37,7 @@ const ea = `reg_a_${stamp}@t.local`;
 const eb = `reg_b_${stamp}@t.local`;
 
 const health = await json(await fetch(`${base}/api/health`));
-ok('health.builtinScope', health.modelScope === 'builtin' && health.requiresUserModel === false && health.ai === false, JSON.stringify(health));
+ok('health.builtinScope', health.modelScope === 'builtin' && health.requiresUserModel === false, JSON.stringify(health));
 ok('jobs.unauth', (await fetch(`${base}/api/settings/jobs`)).status === 401);
 ok('model.unauth', (await fetch(`${base}/api/settings/model`)).status === 401);
 ok('profile.unauth', (await fetch(`${base}/api/settings/profile`)).status === 401);

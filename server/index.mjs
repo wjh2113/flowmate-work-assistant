@@ -1116,24 +1116,47 @@ async function recoverReportEditJobs() {
   }
 }
 
-app.get('/api/health', (_req, res) => {
-  const defaults = emptyAiConfig();
-  res.json({
-    ai: false,
-    asr: false,
-    textConfigured: false,
-    asrConfigured: false,
-    asrUsesTextKey: false,
-    requiresUserModel: false,
-    modelScope: 'builtin',
-    auth: cloudMode() ? 'supabase' : 'local',
-    provider: providerLabel(defaults.provider),
-    textProvider: defaults.provider,
-    baseURL: defaults.baseURL,
-    textModel: defaults.textModel,
-    transcriptionModel: defaults.asrModel,
-    storage: { mode: storageMode, file: storageDisplay }
-  });
+app.get('/api/health', async (_req, res) => {
+  try {
+    const ai = await resolveBuiltinAiConfig('');
+    const asrKey = ai.resolveAsrKey?.() || '';
+    res.json({
+      ai: Boolean(ai.textApiKey),
+      asr: Boolean(asrKey),
+      textConfigured: Boolean(ai.textApiKey),
+      asrConfigured: Boolean(asrKey),
+      asrUsesTextKey: Boolean(asrKey) && asrKey === ai.textApiKey,
+      requiresUserModel: false,
+      modelScope: 'builtin',
+      auth: cloudMode() ? 'supabase' : 'local',
+      provider: providerLabel(ai.provider),
+      textProvider: ai.provider,
+      baseURL: ai.baseURL,
+      textModel: ai.textModel,
+      transcriptionModel: ai.asrModel,
+      storage: { mode: storageMode, file: storageDisplay }
+    });
+  } catch (error) {
+    console.error(error);
+    const defaults = emptyAiConfig();
+    res.json({
+      ai: false,
+      asr: false,
+      textConfigured: false,
+      asrConfigured: false,
+      asrUsesTextKey: false,
+      requiresUserModel: false,
+      modelScope: 'builtin',
+      auth: cloudMode() ? 'supabase' : 'local',
+      provider: providerLabel(defaults.provider),
+      textProvider: defaults.provider,
+      baseURL: defaults.baseURL,
+      textModel: defaults.textModel,
+      transcriptionModel: defaults.asrModel,
+      storage: { mode: storageMode, file: storageDisplay },
+      error: error?.message || 'health failed'
+    });
+  }
 });
 
 app.post('/api/auth/register', async (req, res) => {
