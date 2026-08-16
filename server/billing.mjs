@@ -1,12 +1,11 @@
 import 'dotenv/config';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { DatabaseSync } from 'node:sqlite';
 import pg from 'pg';
 
 const { Pool } = pg;
-const usePostgres = Boolean(String(process.env.DATABASE_URL || '').trim());
+if (!String(process.env.DATABASE_URL || '').trim()) {
+  throw new Error('缺少 DATABASE_URL，请先配置本机 PostgreSQL');
+}
 const DEFAULT_SIGNUP_POINTS = Number(process.env.DEFAULT_SIGNUP_POINTS || 50000);
 const ADMIN_EMAILS = String(process.env.ADMIN_EMAILS || '')
   .split(',')
@@ -24,20 +23,8 @@ const DEFAULT_MODELS = [
 const BAILIAN_BASE = 'https://dashscope.aliyuncs.com/compatible-mode/v1';
 const DEEPSEEK_BASE = 'https://api.deepseek.com';
 
-let sqliteDb = null;
 let pgPool = null;
 let ready = null;
-
-function projectSqlitePath() {
-  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-  const configured = String(process.env.SQLITE_PATH || 'data/flowmate.db').trim();
-  return path.isAbsolute(configured) ? configured : path.resolve(root, configured);
-}
-
-function getSqlite() {
-  if (!sqliteDb) sqliteDb = new DatabaseSync(projectSqlitePath());
-  return sqliteDb;
-}
 
 function getPg() {
   if (!pgPool) pgPool = new Pool({ connectionString: process.env.DATABASE_URL, max: 8 });
@@ -45,17 +32,9 @@ function getPg() {
 }
 
 async function q(text, params = []) {
-  let sql = text;
-  if (usePostgres) {
-    let i = 0;
-    sql = text.replace(/\?/g, () => `$${++i}`);
-    return (await getPg().query(sql, params)).rows;
-  }
-  const db = getSqlite();
-  const stmt = db.prepare(sql);
-  if (/^\s*(SELECT|WITH)\b/i.test(sql)) return stmt.all(...params);
-  stmt.run(...params);
-  return [];
+  let i = 0;
+  const sql = text.replace(/\?/g, () => `$${++i}`);
+  return (await getPg().query(sql, params)).rows;
 }
 
 async function qOne(text, params = []) {
@@ -64,41 +43,22 @@ async function qOne(text, params = []) {
 }
 
 async function withTx(fn) {
-  if (usePostgres) {
-    const client = await getPg().connect();
-    try {
-      await client.query('BEGIN');
-      const txQ = async (text, params = []) => {
-        let i = 0;
-        const sql = text.replace(/\?/g, () => `$${++i}`);
-        return (await client.query(sql, params)).rows;
-      };
-      const result = await fn({ q: txQ, qOne: async (text, params) => (await txQ(text, params))[0] || null });
-      await client.query('COMMIT');
-      return result;
-    } catch (error) {
-      try { await client.query('ROLLBACK'); } catch {}
-      throw error;
-    } finally {
-      client.release();
-    }
-  }
-  const db = getSqlite();
-  db.exec('BEGIN IMMEDIATE');
+  const client = await getPg().connect();
   try {
+    await client.query('BEGIN');
     const txQ = async (text, params = []) => {
-      const stmt = db.prepare(text);
-      if (/^\s*(SELECT|WITH)\b/i.test(text)) return stmt.all(...params);
-      if (/\bRETURNING\b/i.test(text)) return stmt.all(...params);
-      stmt.run(...params);
-      return [];
+      let i = 0;
+      const sql = text.replace(/\?/g, () => `$${++i}`);
+      return (await client.query(sql, params)).rows;
     };
     const result = await fn({ q: txQ, qOne: async (text, params) => (await txQ(text, params))[0] || null });
-    db.exec('COMMIT');
+    await client.query('COMMIT');
     return result;
   } catch (error) {
-    try { db.exec('ROLLBACK'); } catch {}
+    try { await client.query('ROLLBACK'); } catch {}
     throw error;
+  } finally {
+    client.release();
   }
 }
 
@@ -166,86 +126,43 @@ function toModel(row, { includeSecrets = false } = {}) {
 export async function initBilling() {
   if (ready) return ready;
   ready = (async () => {
-    if (usePostgres) {
-      await getPg().query(`
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user';
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS points_balance DOUBLE PRECISION NOT NULL DEFAULT 0;
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS selected_model_id TEXT NOT NULL DEFAULT '';
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS signup_points_granted INTEGER NOT NULL DEFAULT 0;
-        CREATE TABLE IF NOT EXISTS builtin_models (
-          id TEXT PRIMARY KEY,
-          name TEXT NOT NULL,
-          provider TEXT NOT NULL DEFAULT 'bailian',
-          base_url TEXT NOT NULL DEFAULT '',
-          text_api_key TEXT NOT NULL DEFAULT '',
-          asr_api_key TEXT NOT NULL DEFAULT '',
-          text_model TEXT NOT NULL,
-          asr_model TEXT NOT NULL DEFAULT 'qwen3-asr-flash',
-          weight DOUBLE PRECISION NOT NULL DEFAULT 1,
-          badge TEXT NOT NULL DEFAULT '',
-          sort_order INTEGER NOT NULL DEFAULT 0,
-          enabled INTEGER NOT NULL DEFAULT 1,
-          kind TEXT NOT NULL DEFAULT 'text',
-          updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS usage_logs (
-          id TEXT PRIMARY KEY,
-          user_id TEXT NOT NULL,
-          model_id TEXT NOT NULL DEFAULT '',
-          model_name TEXT NOT NULL DEFAULT '',
-          action TEXT NOT NULL DEFAULT '',
-          prompt_tokens INTEGER NOT NULL DEFAULT 0,
-          completion_tokens INTEGER NOT NULL DEFAULT 0,
-          total_tokens INTEGER NOT NULL DEFAULT 0,
-          weight DOUBLE PRECISION NOT NULL DEFAULT 1,
-          points DOUBLE PRECISION NOT NULL DEFAULT 0,
-          created_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_usage_user_created ON usage_logs(user_id, created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_logs(created_at DESC);
-      `);
-    } else {
-      const db = getSqlite();
-      const cols = db.prepare('PRAGMA table_info(users)').all().map((r) => r.name);
-      if (!cols.includes('role')) db.exec(`ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'`);
-      if (!cols.includes('points_balance')) db.exec(`ALTER TABLE users ADD COLUMN points_balance REAL NOT NULL DEFAULT 0`);
-      if (!cols.includes('selected_model_id')) db.exec(`ALTER TABLE users ADD COLUMN selected_model_id TEXT NOT NULL DEFAULT ''`);
-      if (!cols.includes('signup_points_granted')) db.exec(`ALTER TABLE users ADD COLUMN signup_points_granted INTEGER NOT NULL DEFAULT 0`);
-      db.exec(`
-        CREATE TABLE IF NOT EXISTS builtin_models (
-          id TEXT PRIMARY KEY,
-          name TEXT NOT NULL,
-          provider TEXT NOT NULL DEFAULT 'bailian',
-          base_url TEXT NOT NULL DEFAULT '',
-          text_api_key TEXT NOT NULL DEFAULT '',
-          asr_api_key TEXT NOT NULL DEFAULT '',
-          text_model TEXT NOT NULL,
-          asr_model TEXT NOT NULL DEFAULT 'qwen3-asr-flash',
-          weight REAL NOT NULL DEFAULT 1,
-          badge TEXT NOT NULL DEFAULT '',
-          sort_order INTEGER NOT NULL DEFAULT 0,
-          enabled INTEGER NOT NULL DEFAULT 1,
-          kind TEXT NOT NULL DEFAULT 'text',
-          updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS usage_logs (
-          id TEXT PRIMARY KEY,
-          user_id TEXT NOT NULL,
-          model_id TEXT NOT NULL DEFAULT '',
-          model_name TEXT NOT NULL DEFAULT '',
-          action TEXT NOT NULL DEFAULT '',
-          prompt_tokens INTEGER NOT NULL DEFAULT 0,
-          completion_tokens INTEGER NOT NULL DEFAULT 0,
-          total_tokens INTEGER NOT NULL DEFAULT 0,
-          weight REAL NOT NULL DEFAULT 1,
-          points REAL NOT NULL DEFAULT 0,
-          created_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_usage_user_created ON usage_logs(user_id, created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_logs(created_at DESC);
-      `);
-    }
-    // Existing balances/usage mean signup grant already happened (or was migrated).
+    await getPg().query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user';
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS points_balance DOUBLE PRECISION NOT NULL DEFAULT 0;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS selected_model_id TEXT NOT NULL DEFAULT '';
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS signup_points_granted INTEGER NOT NULL DEFAULT 0;
+      CREATE TABLE IF NOT EXISTS builtin_models (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        provider TEXT NOT NULL DEFAULT 'bailian',
+        base_url TEXT NOT NULL DEFAULT '',
+        text_api_key TEXT NOT NULL DEFAULT '',
+        asr_api_key TEXT NOT NULL DEFAULT '',
+        text_model TEXT NOT NULL,
+        asr_model TEXT NOT NULL DEFAULT 'qwen3-asr-flash',
+        weight DOUBLE PRECISION NOT NULL DEFAULT 1,
+        badge TEXT NOT NULL DEFAULT '',
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        kind TEXT NOT NULL DEFAULT 'text',
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS usage_logs (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        model_id TEXT NOT NULL DEFAULT '',
+        model_name TEXT NOT NULL DEFAULT '',
+        action TEXT NOT NULL DEFAULT '',
+        prompt_tokens INTEGER NOT NULL DEFAULT 0,
+        completion_tokens INTEGER NOT NULL DEFAULT 0,
+        total_tokens INTEGER NOT NULL DEFAULT 0,
+        weight DOUBLE PRECISION NOT NULL DEFAULT 1,
+        points DOUBLE PRECISION NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_usage_user_created ON usage_logs(user_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_logs(created_at DESC);
+    `);
     await q(`UPDATE users SET signup_points_granted=1 WHERE signup_points_granted=0 AND (points_balance>0 OR id IN (SELECT DISTINCT user_id FROM usage_logs))`);
     await seedBuiltinModelsIfEmpty();
     await repairBuiltinModelKeys();
@@ -261,14 +178,10 @@ export async function closeBilling() {
     pgPool = null;
     await current.end();
   }
-  if (sqliteDb) {
-    try { sqliteDb.close(); } catch {}
-    sqliteDb = null;
-  }
 }
 
 async function seedBuiltinModelsIfEmpty() {
-  const countRow = await qOne(usePostgres ? 'SELECT COUNT(*)::int AS n FROM builtin_models' : 'SELECT COUNT(*) AS n FROM builtin_models');
+  const countRow = await qOne('SELECT COUNT(*)::int AS n FROM builtin_models');
   if (Number(countRow?.n || 0) > 0) return;
   const asrKey = envAsrKey();
   const now = new Date().toISOString();
@@ -314,9 +227,7 @@ async function bootstrapAdmins() {
 
 async function promoteOldestUserIfNoAdmin() {
   if (ADMIN_EMAILS.length) return;
-  const admins = await qOne(usePostgres
-    ? `SELECT COUNT(*)::int AS n FROM users WHERE role='admin' AND id<>'local-legacy'`
-    : `SELECT COUNT(*) AS n FROM users WHERE role='admin' AND id<>'local-legacy'`);
+  const admins = await qOne(`SELECT COUNT(*)::int AS n FROM users WHERE role='admin' AND id<>'local-legacy'`);
   if (Number(admins?.n || 0) > 0) return;
   const first = await qOne(`SELECT id FROM users WHERE id<>'local-legacy' ORDER BY created_at ASC LIMIT 1`);
   if (first?.id) await q(`UPDATE users SET role='admin' WHERE id=?`, [first.id]);
@@ -413,27 +324,15 @@ export async function saveBuiltinModel(input = {}) {
     kind: input.kind === 'asr' ? 'asr' : 'text',
     updatedAt: now
   };
-  if (usePostgres) {
-    await q(
-      `INSERT INTO builtin_models(id,name,provider,base_url,text_api_key,asr_api_key,text_model,asr_model,weight,badge,sort_order,enabled,kind,updated_at)
-       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-       ON CONFLICT(id) DO UPDATE SET
-         name=EXCLUDED.name,provider=EXCLUDED.provider,base_url=EXCLUDED.base_url,text_api_key=EXCLUDED.text_api_key,
-         asr_api_key=EXCLUDED.asr_api_key,text_model=EXCLUDED.text_model,asr_model=EXCLUDED.asr_model,weight=EXCLUDED.weight,
-         badge=EXCLUDED.badge,sort_order=EXCLUDED.sort_order,enabled=EXCLUDED.enabled,kind=EXCLUDED.kind,updated_at=EXCLUDED.updated_at`,
-      [next.id, next.name, next.provider, next.baseURL, next.textApiKey, next.asrApiKey, next.textModel, next.asrModel, next.weight, next.badge, next.sortOrder, next.enabled, next.kind, next.updatedAt]
-    );
-  } else {
-    await q(
-      `INSERT INTO builtin_models(id,name,provider,base_url,text_api_key,asr_api_key,text_model,asr_model,weight,badge,sort_order,enabled,kind,updated_at)
-       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-       ON CONFLICT(id) DO UPDATE SET
-         name=excluded.name,provider=excluded.provider,base_url=excluded.base_url,text_api_key=excluded.text_api_key,
-         asr_api_key=excluded.asr_api_key,text_model=excluded.text_model,asr_model=excluded.asr_model,weight=excluded.weight,
-         badge=excluded.badge,sort_order=excluded.sort_order,enabled=excluded.enabled,kind=excluded.kind,updated_at=excluded.updated_at`,
-      [next.id, next.name, next.provider, next.baseURL, next.textApiKey, next.asrApiKey, next.textModel, next.asrModel, next.weight, next.badge, next.sortOrder, next.enabled, next.kind, next.updatedAt]
-    );
-  }
+  await q(
+    `INSERT INTO builtin_models(id,name,provider,base_url,text_api_key,asr_api_key,text_model,asr_model,weight,badge,sort_order,enabled,kind,updated_at)
+     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+     ON CONFLICT(id) DO UPDATE SET
+       name=EXCLUDED.name,provider=EXCLUDED.provider,base_url=EXCLUDED.base_url,text_api_key=EXCLUDED.text_api_key,
+       asr_api_key=EXCLUDED.asr_api_key,text_model=EXCLUDED.text_model,asr_model=EXCLUDED.asr_model,weight=EXCLUDED.weight,
+       badge=EXCLUDED.badge,sort_order=EXCLUDED.sort_order,enabled=EXCLUDED.enabled,kind=EXCLUDED.kind,updated_at=EXCLUDED.updated_at`,
+    [next.id, next.name, next.provider, next.baseURL, next.textApiKey, next.asrApiKey, next.textModel, next.asrModel, next.weight, next.badge, next.sortOrder, next.enabled, next.kind, next.updatedAt]
+  );
   return getBuiltinModel(id, { includeSecrets: true });
 }
 
@@ -527,10 +426,7 @@ export async function chargeUsage(userId, {
   const id = randomUUID();
   const now = new Date().toISOString();
   return withTx(async ({ q: txQ, qOne: txOne }) => {
-    const lockSql = usePostgres
-      ? `SELECT id, points_balance FROM users WHERE id=? FOR UPDATE`
-      : `SELECT id, points_balance FROM users WHERE id=?`;
-    const row = await txOne(lockSql, [userId]);
+    const row = await txOne(`SELECT id, points_balance FROM users WHERE id=? FOR UPDATE`, [userId]);
     if (!row) throw new Error('用户不存在');
     const updated = await txQ(
       `UPDATE users SET points_balance = points_balance - ?
@@ -614,15 +510,9 @@ export async function listUsageLogs({ userId = '', limit = 50 } = {}) {
 
 export async function adminDashboardStats() {
   await initBilling();
-  const users = await qOne(usePostgres
-    ? `SELECT COUNT(*)::int AS n FROM users WHERE id<>'local-legacy'`
-    : `SELECT COUNT(*) AS n FROM users WHERE id<>'local-legacy'`);
-  const usage = await qOne(usePostgres
-    ? `SELECT COUNT(*)::int AS n, COALESCE(SUM(total_tokens),0)::float AS tokens, COALESCE(SUM(points),0)::float AS points FROM usage_logs`
-    : `SELECT COUNT(*) AS n, COALESCE(SUM(total_tokens),0) AS tokens, COALESCE(SUM(points),0) AS points FROM usage_logs`);
-  const models = await qOne(usePostgres
-    ? `SELECT COUNT(*)::int AS n FROM builtin_models WHERE enabled=1`
-    : `SELECT COUNT(*) AS n FROM builtin_models WHERE enabled=1`);
+  const users = await qOne(`SELECT COUNT(*)::int AS n FROM users WHERE id<>'local-legacy'`);
+  const usage = await qOne(`SELECT COUNT(*)::int AS n, COALESCE(SUM(total_tokens),0)::float AS tokens, COALESCE(SUM(points),0)::float AS points FROM usage_logs`);
+  const models = await qOne(`SELECT COUNT(*)::int AS n FROM builtin_models WHERE enabled=1`);
   return {
     userCount: Number(users?.n || 0),
     enabledModelCount: Number(models?.n || 0),

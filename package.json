@@ -10,8 +10,7 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --host 0.0.0.0",
     "typecheck": "tsc --noEmit",
-    "setup:postgres": "node scripts/setup-postgres.mjs",
-    "migrate:sqlite-to-pg": "node scripts/migrate-sqlite-to-pg.mjs"
+    "setup:postgres": "node scripts/setup-postgres.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.4",

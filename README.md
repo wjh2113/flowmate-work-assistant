@@ -23,47 +23,35 @@ QWEN_ASR_MODEL=qwen3-asr-flash
 
 密钥只由 `server/index.mjs` 读取，绝不能添加 `VITE_` 前缀或放进前端代码。开发环境执行 `npm run dev` 会同时启动 H5 和千问服务；生产环境先执行 `npm run build`，再执行 `npm start`。
 
-也可以在应用中进入“我的 → 设置”，填写百炼 API Key 并选择千问或 DeepSeek 文本模型。浏览器不会保存密钥，服务端只返回末四位掩码。本机访问可直接配置；远程部署后仅团队 owner/admin 可以修改。
+也可以在应用中进入「我的 → 设置」选择管理员配置好的内置模型。API Key 只在独立的 `/admin` 后台填写，不会出现在工作台。
 
 AI 语音流程：浏览器录音 → 服务端发送 Base64 音频给 `qwen3-asr-flash` → `qwen3.7-plus` 提取任务内容、负责人、截止时间和优先级。浏览器原生识别仅作为服务异常时的临时回退。
 
 AI 工作复盘每天自动生成一次并缓存在本机，也可以手动重新生成；建议的明日事项可一键加入任务列表。
 
-## 本地存储：SQLite（默认）或 PostgreSQL
+## 本地存储：PostgreSQL
 
-未配置 `DATABASE_URL` 且未配置 Supabase 时，应用默认把任务、复盘与账号数据保存到服务器 SQLite 文件：
+必须配置 `DATABASE_URL`。先确保 PostgreSQL 已启动，再执行：
 
-```env
-SQLITE_PATH=data/flowmate.db
-```
-
-数据库使用 WAL 模式，默认文件为 `data/flowmate.db`。手机、iPhone 和电脑只要访问同一个服务地址，就会读写同一份数据；页面每 5 秒检查其他设备产生的变化。
-
-部署要求 Node.js 22.13 或更高版本，推荐 Node.js 24。升级、重启或重新发布时必须保留整个 `data/` 目录。备份时建议同时备份 `flowmate.db`、`flowmate.db-wal` 和 `flowmate.db-shm`，或者先停止服务再复制 `flowmate.db`。
-
-如果使用 Docker，请把数据目录挂载到持久卷，例如：`-v /opt/flowmate-data:/app/data`。不要把 SQLite 文件提交到 Git，项目已默认忽略这些文件。
-
-### 可选：切换到本机 / 服务器 PostgreSQL
-
-1. 确保 PostgreSQL 已启动，并能用超级用户连接（Windows 常需带密码）。
-2. 建库与角色：`npm run setup:postgres`（可用 `PG_ADMIN_URL`、`FLOWMATE_DB_PASSWORD` 覆盖默认值）。
-3. 把脚本打印的 `DATABASE_URL=...` 写入 `.env`。
-4. 一次性导入现有 SQLite 数据：`npm run migrate:sqlite-to-pg`（可重复执行，默认 upsert；**不会删除** `data/flowmate.db`）。
-5. 重启服务；`GET /api/health` 中 `storage.mode` 应为 `postgres`。
+1. `npm run setup:postgres`（可用 `PG_ADMIN_URL`、`FLOWMATE_DB_PASSWORD` 覆盖默认值）
+2. 把脚本打印的 `DATABASE_URL=...` 写入 `.env`
+3. `npm start`；`GET /api/health` 中 `storage.mode` 应为 `postgres`
 
 ```env
 DATABASE_URL=postgres://flowmate:CHANGE_ME@127.0.0.1:5432/flowmate
-# PG_ADMIN_URL=postgres://postgres:ADMIN_PASS@127.0.0.1:5432/postgres
+# PG_ADMIN_URL=postgres://jonny@127.0.0.1:5432/postgres
 # FLOWMATE_DB_PASSWORD=CHANGE_ME
-SQLITE_PATH=data/flowmate.db
 ```
 
-### 内置大模型与积分
+部署要求 Node.js 22.13 或更高版本，推荐 Node.js 24。
 
-- 用户在「设置 → 大模型」只选择内置模型（右侧权重如 `0.05x`）；API Key 由管理员在后台维护。
-- 每次调用按接口返回的 token 自动计费：`积分 = Token × 权重`。
-- 「我的 → 管理后台」（仅 admin）：维护模型权重/密钥、用户角色与积分、查看用量。
-- 可用环境变量：`ADMIN_EMAILS=a@b.com,c@d.com`（启动时升为管理员）、`DEFAULT_SIGNUP_POINTS=50000`。
+### 管理后台
+
+管理后台是独立站点，不和工作台共用登录态。打开 `/admin`，使用管理员账号单独登录。
+
+- 用户在「设置 → 大模型」只选择内置模型；API Key 只在 `/admin` 的「模型权重」里配置
+- 每次调用按接口返回的 token 自动计费：`积分 = Token × 权重`
+- 可用环境变量：`ADMIN_EMAILS=a@b.com,c@d.com`（启动时升为管理员）、`DEFAULT_SIGNUP_POINTS=50000`
 
 ## 可选：Supabase 云端存储
 

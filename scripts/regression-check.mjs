@@ -93,10 +93,10 @@ const putModelKeep = await fetch(`${base}/api/settings/model`, {
 const modelA2 = await json(putModelKeep);
 ok('model.A.switch', putModelKeep.status === 200 && modelA2.selectedModelId === pickPro.id, modelA2.selectedModelId);
 
-ok('admin.forbidden', (await fetch(`${base}/api/admin/dashboard`, { headers: { Cookie: a.h() } })).status === 403);
+ok('admin.forbidden', (await fetch(`${base}/api/admin/dashboard`, { headers: { Cookie: a.h() } })).status === 401);
 
 const taskId = crypto.randomUUID();
-const putTask = await fetch(`${base}/api/sqlite/tasks/${taskId}`, {
+const putTask = await fetch(`${base}/api/tasks/${taskId}`, {
   method: 'PUT',
   headers: { 'Content-Type': 'application/json', Cookie: a.h() },
   body: JSON.stringify({
@@ -106,29 +106,29 @@ const putTask = await fetch(`${base}/api/sqlite/tasks/${taskId}`, {
 });
 ok('task.A.save', putTask.status === 200, (await json(putTask)).title);
 
-const listA = await json(await fetch(`${base}/api/sqlite/tasks`, { headers: { Cookie: a.h() } }));
-const listB = await json(await fetch(`${base}/api/sqlite/tasks`, { headers: { Cookie: b.h() } }));
+const listA = await json(await fetch(`${base}/api/tasks`, { headers: { Cookie: a.h() } }));
+const listB = await json(await fetch(`${base}/api/tasks`, { headers: { Cookie: b.h() } }));
 ok('task.isolate', Array.isArray(listA) && listA.some(t => t.id === taskId) && Array.isArray(listB) && !listB.some(t => t.id === taskId), `A=${listA?.length} B=${listB?.length}`);
 
-const getTaskB = await fetch(`${base}/api/sqlite/tasks/${taskId}`, { headers: { Cookie: b.h() } });
+const getTaskB = await fetch(`${base}/api/tasks/${taskId}`, { headers: { Cookie: b.h() } });
 ok('task.B.cannotRead', getTaskB.status === 404);
 
 const report = { headline: '回归日报', summary: 's', completed: ['x'], risks: [], tomorrow: [] };
-await fetch(`${base}/api/sqlite/reports/2099-06-02`, {
+await fetch(`${base}/api/reports/2099-06-02`, {
   method: 'PUT', headers: { 'Content-Type': 'application/json', Cookie: a.h() },
   body: JSON.stringify({ report })
 });
-const repA = await json(await fetch(`${base}/api/sqlite/reports/2099-06-02`, { headers: { Cookie: a.h() } }));
-const repB = await json(await fetch(`${base}/api/sqlite/reports/2099-06-02`, { headers: { Cookie: b.h() } }));
+const repA = await json(await fetch(`${base}/api/reports/2099-06-02`, { headers: { Cookie: a.h() } }));
+const repB = await json(await fetch(`${base}/api/reports/2099-06-02`, { headers: { Cookie: b.h() } }));
 ok('report.isolate', repA?.headline === '回归日报' && repB == null, repB?.headline || '');
 
 const period = { headline: '回归周报', summary: 'w', highlights: [], risks: [], next: [] };
-await fetch(`${base}/api/sqlite/period-reports/weekly/2099-W01`, {
+await fetch(`${base}/api/period-reports/weekly/2099-W01`, {
   method: 'PUT', headers: { 'Content-Type': 'application/json', Cookie: a.h() },
   body: JSON.stringify({ report: period })
 });
-const perA = await json(await fetch(`${base}/api/sqlite/period-reports/weekly/2099-W01`, { headers: { Cookie: a.h() } }));
-const perB = await json(await fetch(`${base}/api/sqlite/period-reports/weekly/2099-W01`, { headers: { Cookie: b.h() } }));
+const perA = await json(await fetch(`${base}/api/period-reports/weekly/2099-W01`, { headers: { Cookie: a.h() } }));
+const perB = await json(await fetch(`${base}/api/period-reports/weekly/2099-W01`, { headers: { Cookie: b.h() } }));
 ok('period.isolate', perA?.headline === '回归周报' && perB == null);
 
 const avatar = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
@@ -192,7 +192,7 @@ const vjBBody = await json(vjB);
 ok('voice.B.allowed', vjB.status === 202 && vjBBody.id, `${vjB.status} ${vjBBody.error || vjBBody.id || ''}`);
 
 ok('logout.A', (await fetch(`${base}/api/auth/logout`, { method: 'POST', headers: { Cookie: a.h() } })).status === 204);
-ok('afterLogout.401', (await fetch(`${base}/api/sqlite/tasks`, { headers: { Cookie: a.h() } })).status === 401);
+ok('afterLogout.401', (await fetch(`${base}/api/tasks`, { headers: { Cookie: a.h() } })).status === 401);
 
 const login = await fetch(`${base}/api/auth/login`, {
   method: 'POST', headers: { 'Content-Type': 'application/json' },

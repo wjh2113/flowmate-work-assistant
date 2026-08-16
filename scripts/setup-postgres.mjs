@@ -77,7 +77,7 @@ async function main() {
   if (!process.env.FLOWMATE_DB_PASSWORD) {
     console.log(`FLOWMATE_DB_PASSWORD=${password}`);
   }
-  console.log('\nNext: npm run migrate:sqlite-to-pg');
+  console.log('\nRestart the server after DATABASE_URL is in .env.');
 }
 
 main().catch((error) => {

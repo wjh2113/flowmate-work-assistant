@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { Converter } from 'opencc-js/t2cn';
-import { authenticateSqliteUser, autoClaimSqliteLegacyData, claimSqliteLegacyData, closeSqlite, createSqliteSession, createSqliteUser, deleteSqlitePeriodReport, deleteSqliteReport, deleteSqliteSession, deleteSqliteTask, getSqliteSession, getSqliteTask, getSqliteUserPreferences, initStore, LEGACY_USER_ID, listSqlitePeriodReports, listSqliteTasks, loadSqlitePeriodReport, loadSqliteReport, patchSqliteTask, saveSqlitePeriodReport, saveSqliteReport, saveSqliteTask, saveSqliteUserPreferences, storageDisplay, storageMode } from './store.mjs';
+import { authenticateUser, autoClaimLegacyData, claimLegacyData, closeStore, createSession, createUser, deletePeriodReport, deleteDailyReport, deleteSession, deleteTask, getSession, getTask, getUserPreferences, initStore, LEGACY_USER_ID, listPeriodReports, listTasks, loadPeriodReport, loadDailyReport, patchTask, savePeriodReport, saveDailyReport, saveTask, saveUserPreferences, storageDisplay, storageMode } from './store.mjs';
 import {
   adminDashboardStats,
   assertEnoughPoints,
@@ -29,6 +29,7 @@ const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 const port = Number(process.env.PORT || 8787);
 const SESSION_COOKIE = 'flowmate_session';
+const ADMIN_SESSION_COOKIE = 'flowmate_admin_session';
 const SESSION_DAYS = 7;
 const BAILIAN_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1';
 const DEEPSEEK_BASE_URL = 'https://api.deepseek.com';
@@ -121,7 +122,7 @@ async function adoptLegacyVoiceDirs(userId) {
 }
 
 function applyLegacyClaim(userId) {
-  return claimSqliteLegacyData(userId).then((result) => {
+  return claimLegacyData(userId).then((result) => {
     if (result?.claimed || result?.reason === 'empty' || result?.by === userId) {
       void adoptLegacyVoiceDirs(userId);
     }
@@ -220,18 +221,33 @@ function requestIsHttps(req) {
   return proto === 'https';
 }
 
-function setSessionCookie(res, sessionId, expiresAt, req) {
+function setNamedCookie(res, name, sessionId, expiresAt, req) {
   const maxAge = Math.max(0, Math.floor((Date.parse(expiresAt) - Date.now()) / 1000));
-  const parts = [`${SESSION_COOKIE}=${encodeURIComponent(sessionId)}`, 'Path=/', 'HttpOnly', 'SameSite=Lax', `Max-Age=${maxAge}`];
-  // Only mark Secure on real HTTPS; NODE_ENV=production over plain HTTP would drop the cookie in browsers.
+  const parts = [`${name}=${encodeURIComponent(sessionId)}`, 'Path=/', 'HttpOnly', 'SameSite=Lax', `Max-Age=${maxAge}`];
   if (requestIsHttps(req)) parts.push('Secure');
   res.append('Set-Cookie', parts.join('; '));
 }
 
-function clearSessionCookie(res, req) {
-  const parts = [`${SESSION_COOKIE}=`, 'Path=/', 'HttpOnly', 'SameSite=Lax', 'Max-Age=0'];
+function clearNamedCookie(res, name, req) {
+  const parts = [`${name}=`, 'Path=/', 'HttpOnly', 'SameSite=Lax', 'Max-Age=0'];
   if (requestIsHttps(req)) parts.push('Secure');
   res.append('Set-Cookie', parts.join('; '));
+}
+
+function setSessionCookie(res, sessionId, expiresAt, req) {
+  setNamedCookie(res, SESSION_COOKIE, sessionId, expiresAt, req);
+}
+
+function clearSessionCookie(res, req) {
+  clearNamedCookie(res, SESSION_COOKIE, req);
+}
+
+function setAdminSessionCookie(res, sessionId, expiresAt, req) {
+  setNamedCookie(res, ADMIN_SESSION_COOKIE, sessionId, expiresAt, req);
+}
+
+function clearAdminSessionCookie(res, req) {
+  clearNamedCookie(res, ADMIN_SESSION_COOKIE, req);
 }
 
 function requireUser(req, res, next) {
@@ -241,7 +257,7 @@ function requireUser(req, res, next) {
   }
   Promise.resolve()
     .then(async () => {
-      const session = await getSqliteSession(parseCookies(req)[SESSION_COOKIE]);
+      const session = await getSession(parseCookies(req)[SESSION_COOKIE]);
       if (!session?.user) return res.status(401).json({ error: 'UNAUTHORIZED', message: '请先登录' });
       req.user = await enrichUser(session.user);
       req.sessionId = session.id;
@@ -254,10 +270,20 @@ function requireUser(req, res, next) {
 }
 
 function requireAdmin(req, res, next) {
-  requireUser(req, res, () => {
-    if (req.user?.role !== 'admin') return res.status(403).json({ error: 'FORBIDDEN', message: '需要管理员权限' });
-    next();
-  });
+  Promise.resolve()
+    .then(async () => {
+      const session = await getSession(parseCookies(req)[ADMIN_SESSION_COOKIE]);
+      if (!session?.user) return res.status(401).json({ error: 'UNAUTHORIZED', message: '请先登录管理后台' });
+      const user = await enrichUser(session.user);
+      if (user?.role !== 'admin') return res.status(403).json({ error: 'FORBIDDEN', message: '需要管理员权限' });
+      req.user = user;
+      req.sessionId = session.id;
+      next();
+    })
+    .catch((error) => {
+      console.error(error);
+      res.status(500).json({ message: '管理员登录状态校验失败' });
+    });
 }
 
 function requireTextAi(req, res, next) {
@@ -781,7 +807,7 @@ async function purgeExpiredVoiceJobs(retentionDays = jobSettings.voiceRetention.
     const full = path.join(voiceJobsDir, entry.name);
     try {
       if (entry.isDirectory()) {
-        const prefs = await getSqliteUserPreferences(entry.name);
+        const prefs = await getUserPreferences(entry.name);
         const userDays = prefs?.voiceRetention?.retentionDays || days;
         removed += await purgeExpiredVoiceJobsInDir(full, userDays);
         continue;
@@ -804,7 +830,7 @@ async function purgeExpiredVoiceJobs(retentionDays = jobSettings.voiceRetention.
 }
 
 async function userVoiceRetention(userId) {
-  const prefs = userId ? await getSqliteUserPreferences(userId) : null;
+  const prefs = userId ? await getUserPreferences(userId) : null;
   if (prefs?.voiceRetention) return normalizeVoiceRetentionSettings(prefs.voiceRetention);
   return normalizeVoiceRetentionSettings(jobSettings.voiceRetention);
 }
@@ -845,19 +871,19 @@ async function runVoiceRetentionJobIfDue(force = false, userId = null) {
   return { ...result, slotKey, time };
 }
 
-async function persistVoiceResultToSqlite(job,result){
+async function persistVoiceResult(job,result){
   if(supabaseUrl)return [];
   const userId=job.userId;
   if(!userId)return [];
   const command=result.command;
-  if(command?.action==='edit_report'||command?.action==='clarify'){await deleteSqliteTask(userId,job.id);return []}
+  if(command?.action==='edit_report'||command?.action==='clarify'){await deleteTask(userId,job.id);return []}
   if(command?.action==='update'){
-    await deleteSqliteTask(userId,job.id);const requested=command.updates?.length?command.updates:[{targetTaskId:command.targetTaskId,changes:command.changes}];const ids=[];
-    for(const entry of requested){const current=await getSqliteTask(userId,entry.targetTaskId);if(!current)continue;const changes={...(entry.changes||{})};const now=new Date().toISOString();
+    await deleteTask(userId,job.id);const requested=command.updates?.length?command.updates:[{targetTaskId:command.targetTaskId,changes:command.changes}];const ids=[];
+    for(const entry of requested){const current=await getTask(userId,entry.targetTaskId);if(!current)continue;const changes={...(entry.changes||{})};const now=new Date().toISOString();
       if(changes.status==='doing'){changes.progress=current.progress>0&&current.progress<100?current.progress:50;changes.startedAt=current.startedAt||now;changes.completedAt=null}
       if(changes.status==='done'){changes.progress=100;changes.startedAt=current.startedAt||now;changes.completedAt=now}
       if(changes.status==='todo'){changes.progress=0;changes.startedAt=null;changes.completedAt=null}
-      await patchSqliteTask(userId,current.id,changes);ids.push(current.id)}
+      await patchTask(userId,current.id,changes);ids.push(current.id)}
     return ids;
   }
   const parsedTasks=(result.tasks?.length?result.tasks:command?.tasks?.length?command.tasks:result.task?[result.task]:[]).slice(0,10);
@@ -865,7 +891,7 @@ async function persistVoiceResultToSqlite(job,result){
   for(let index=0;index<parsedTasks.length;index+=1){
     const parsed=parsedTasks[index];
     const id=index===0?job.id:`${job.id}-${index+1}`;
-    await saveSqliteTask(userId,{id,title:parsed.title||result.transcript||'语音任务',assignee:parsed.assignee||'我',due:parsed.due||'今天',status:'todo',priority:parsed.priority||'中',progress:0,estimatedMinutes:parsed.estimatedMinutes||60,createdAt:job.createdAt,startedAt:null,completedAt:null,aiStatus:null});
+    await saveTask(userId,{id,title:parsed.title||result.transcript||'语音任务',assignee:parsed.assignee||'我',due:parsed.due||'今天',status:'todo',priority:parsed.priority||'中',progress:0,estimatedMinutes:parsed.estimatedMinutes||60,createdAt:job.createdAt,startedAt:null,completedAt:null,aiStatus:null});
     ids.push(id);
   }
   return ids;
@@ -917,7 +943,7 @@ async function processVoiceJob(id) {
       job.task = null;
       if (job.cleared) job.command = { ...result.command, message: result.command.message || (kind === 'weekly' ? '周报已清空' : kind === 'monthly' ? '月报已清空' : '今日复盘已清空') };
       await persistVoiceJob(job);
-      try{if(job.userId)await deleteSqliteTask(job.userId,job.id);job.persistedTaskIds=[];job.storageError=''}catch(error){job.storageError=error?.message||'清理占位任务失败'}
+      try{if(job.userId)await deleteTask(job.userId,job.id);job.persistedTaskIds=[];job.storageError=''}catch(error){job.storageError=error?.message||'清理占位任务失败'}
     } else {
       job.stage = 'saving';
       job.tasks = result.tasks || [];
@@ -925,7 +951,7 @@ async function processVoiceJob(id) {
       job.editedReport = null;
       job.reportKind = '';
       await persistVoiceJob(job);
-      try{job.persistedTaskIds=await persistVoiceResultToSqlite(job,result);job.storageError=''}catch(error){console.error('语音任务写入存储失败',error);job.storageError=error?.message||'任务保存失败'}
+      try{job.persistedTaskIds=await persistVoiceResult(job,result);job.storageError=''}catch(error){console.error('语音任务写入存储失败',error);job.storageError=error?.message||'任务保存失败'}
     }
     job.status = 'completed';
     job.stage = 'completed';
@@ -1134,7 +1160,7 @@ app.get('/api/health', async (_req, res) => {
       baseURL: ai.baseURL,
       textModel: ai.textModel,
       transcriptionModel: ai.asrModel,
-      storage: { mode: storageMode, file: storageDisplay }
+      storage: { mode: storageMode, target: storageDisplay }
     });
   } catch (error) {
     console.error(error);
@@ -1153,7 +1179,7 @@ app.get('/api/health', async (_req, res) => {
       baseURL: defaults.baseURL,
       textModel: defaults.textModel,
       transcriptionModel: defaults.asrModel,
-      storage: { mode: storageMode, file: storageDisplay },
+      storage: { mode: storageMode, target: storageDisplay },
       error: error?.message || 'health failed'
     });
   }
@@ -1162,8 +1188,8 @@ app.get('/api/health', async (_req, res) => {
 app.post('/api/auth/register', async (req, res) => {
   if (cloudMode()) return res.status(400).json({ message: '当前已启用云端登录，请使用邮箱登录链接' });
   try {
-    const user = await enrichUser(await createSqliteUser({ email: req.body?.email, password: req.body?.password, name: req.body?.name }));
-    const session = await createSqliteSession(user.id, SESSION_DAYS);
+    const user = await enrichUser(await createUser({ email: req.body?.email, password: req.body?.password, name: req.body?.name }));
+    const session = await createSession(user.id, SESSION_DAYS);
     setSessionCookie(res, session.id, session.expiresAt, req);
     const legacy = await applyLegacyClaim(user.id);
     res.status(201).json({ user, legacy });
@@ -1175,8 +1201,8 @@ app.post('/api/auth/register', async (req, res) => {
 app.post('/api/auth/login', async (req, res) => {
   if (cloudMode()) return res.status(400).json({ message: '当前已启用云端登录，请使用邮箱登录链接' });
   try {
-    const user = await enrichUser(await authenticateSqliteUser(req.body?.email, req.body?.password));
-    const session = await createSqliteSession(user.id, SESSION_DAYS);
+    const user = await enrichUser(await authenticateUser(req.body?.email, req.body?.password));
+    const session = await createSession(user.id, SESSION_DAYS);
     setSessionCookie(res, session.id, session.expiresAt, req);
     const legacy = await applyLegacyClaim(user.id);
     res.json({ user, legacy });
@@ -1187,86 +1213,113 @@ app.post('/api/auth/login', async (req, res) => {
 
 app.post('/api/auth/logout', async (req, res) => {
   const sid = parseCookies(req)[SESSION_COOKIE];
-  if (sid) await deleteSqliteSession(sid);
+  if (sid) await deleteSession(sid);
   clearSessionCookie(res, req);
   res.status(204).end();
 });
 
+app.post('/api/admin/auth/login', async (req, res) => {
+  try {
+    const user = await enrichUser(await authenticateUser(req.body?.email, req.body?.password));
+    if (user?.role !== 'admin') return res.status(403).json({ message: '该账号不是管理员' });
+    const session = await createSession(user.id, SESSION_DAYS);
+    setAdminSessionCookie(res, session.id, session.expiresAt, req);
+    res.json({ user });
+  } catch (error) {
+    res.status(401).json({ message: error?.message || '管理员登录失败' });
+  }
+});
+
+app.post('/api/admin/auth/logout', async (req, res) => {
+  const sid = parseCookies(req)[ADMIN_SESSION_COOKIE];
+  if (sid) await deleteSession(sid);
+  clearAdminSessionCookie(res, req);
+  res.status(204).end();
+});
+
+app.get('/api/admin/auth/me', async (req, res) => {
+  const session = await getSession(parseCookies(req)[ADMIN_SESSION_COOKIE]);
+  if (!session?.user) return res.status(401).json({ user: null, message: '未登录管理后台' });
+  const user = await enrichUser(session.user);
+  if (user?.role !== 'admin') return res.status(403).json({ user: null, message: '需要管理员权限' });
+  res.json({ user });
+});
+
 app.get('/api/auth/me', async (req, res) => {
   if (cloudMode()) return res.json({ user: null, mode: 'supabase' });
-  const session = await getSqliteSession(parseCookies(req)[SESSION_COOKIE]);
+  const session = await getSession(parseCookies(req)[SESSION_COOKIE]);
   if (!session?.user) return res.status(401).json({ user: null, message: '未登录' });
   res.json({ user: await enrichUser(session.user), mode: 'local' });
 });
 
-app.get('/api/sqlite/tasks', requireUser, async (req, res) => res.json(await listSqliteTasks(req.user.id)));
+app.get('/api/tasks', requireUser, async (req, res) => res.json(await listTasks(req.user.id)));
 
-app.get('/api/sqlite/tasks/:id', requireUser, async (req, res) => {
-  const task=await getSqliteTask(req.user.id,req.params.id);
+app.get('/api/tasks/:id', requireUser, async (req, res) => {
+  const task=await getTask(req.user.id,req.params.id);
   if(!task)return res.status(404).json({message:'任务不存在'});
   res.json(task);
 });
 
-app.put('/api/sqlite/tasks/:id', requireUser, async (req, res) => {
-  try{res.json(await saveSqliteTask(req.user.id,{...req.body,id:req.params.id}))}
+app.put('/api/tasks/:id', requireUser, async (req, res) => {
+  try{res.json(await saveTask(req.user.id,{...req.body,id:req.params.id}))}
   catch(error){res.status(400).json({message:error?.message||'任务保存失败'})}
 });
 
-app.patch('/api/sqlite/tasks/:id', requireUser, async (req, res) => {
-  try{const task=await patchSqliteTask(req.user.id,req.params.id,req.body||{});if(!task)return res.status(404).json({message:'任务不存在'});res.json(task)}
+app.patch('/api/tasks/:id', requireUser, async (req, res) => {
+  try{const task=await patchTask(req.user.id,req.params.id,req.body||{});if(!task)return res.status(404).json({message:'任务不存在'});res.json(task)}
   catch(error){res.status(400).json({message:error?.message||'任务更新失败'})}
 });
 
-app.delete('/api/sqlite/tasks/:id', requireUser, async (req, res) => {
-  await deleteSqliteTask(req.user.id,req.params.id);res.status(204).end();
+app.delete('/api/tasks/:id', requireUser, async (req, res) => {
+  await deleteTask(req.user.id,req.params.id);res.status(204).end();
 });
 
-app.get('/api/sqlite/reports/:date', requireUser, async (req, res) => {
+app.get('/api/reports/:date', requireUser, async (req, res) => {
   if(!/^\d{4}-\d{2}-\d{2}$/.test(req.params.date))return res.status(400).json({message:'日期格式不正确'});
-  res.json(await loadSqliteReport(req.user.id,req.params.date));
+  res.json(await loadDailyReport(req.user.id,req.params.date));
 });
 
-app.put('/api/sqlite/reports/:date', requireUser, async (req, res) => {
+app.put('/api/reports/:date', requireUser, async (req, res) => {
   if(!/^\d{4}-\d{2}-\d{2}$/.test(req.params.date))return res.status(400).json({message:'日期格式不正确'});
   if(!req.body?.report||typeof req.body.report!=='object')return res.status(400).json({message:'日报内容不能为空'});
-  res.json(await saveSqliteReport(req.user.id,req.params.date,req.body.report));
+  res.json(await saveDailyReport(req.user.id,req.params.date,req.body.report));
 });
 
-app.delete('/api/sqlite/reports/:date', requireUser, async (req, res) => {
-  await deleteSqliteReport(req.user.id,req.params.date);res.status(204).end();
+app.delete('/api/reports/:date', requireUser, async (req, res) => {
+  await deleteDailyReport(req.user.id,req.params.date);res.status(204).end();
 });
 
-app.get('/api/sqlite/period-reports/:kind', requireUser, async (req, res) => {
+app.get('/api/period-reports/:kind', requireUser, async (req, res) => {
   try {
     if (!['weekly', 'monthly'].includes(req.params.kind)) return res.status(400).json({ message: '周期类型不正确' });
-    res.json(await listSqlitePeriodReports(req.user.id,req.params.kind));
+    res.json(await listPeriodReports(req.user.id,req.params.kind));
   } catch (error) {
     res.status(400).json({ message: error?.message || '读取周期复盘列表失败' });
   }
 });
 
-app.get('/api/sqlite/period-reports/:kind/:key', requireUser, async (req, res) => {
+app.get('/api/period-reports/:kind/:key', requireUser, async (req, res) => {
   try {
     if (!isPeriodKey(req.params.kind, req.params.key)) return res.status(400).json({ message: '周期键格式不正确' });
-    res.json(await loadSqlitePeriodReport(req.user.id,req.params.kind, req.params.key));
+    res.json(await loadPeriodReport(req.user.id,req.params.kind, req.params.key));
   } catch (error) {
     res.status(400).json({ message: error?.message || '读取周期复盘失败' });
   }
 });
 
-app.put('/api/sqlite/period-reports/:kind/:key', requireUser, async (req, res) => {
+app.put('/api/period-reports/:kind/:key', requireUser, async (req, res) => {
   try {
     if (!isPeriodKey(req.params.kind, req.params.key)) return res.status(400).json({ message: '周期键格式不正确' });
     if (!req.body?.report || typeof req.body.report !== 'object') return res.status(400).json({ message: '复盘内容不能为空' });
-    res.json(await saveSqlitePeriodReport(req.user.id,req.params.kind, req.params.key, req.body.report));
+    res.json(await savePeriodReport(req.user.id,req.params.kind, req.params.key, req.body.report));
   } catch (error) {
     res.status(400).json({ message: error?.message || '保存周期复盘失败' });
   }
 });
 
-app.delete('/api/sqlite/period-reports/:kind/:key', requireUser, async (req, res) => {
+app.delete('/api/period-reports/:kind/:key', requireUser, async (req, res) => {
   try {
-    await deleteSqlitePeriodReport(req.user.id,req.params.kind, req.params.key);
+    await deletePeriodReport(req.user.id,req.params.kind, req.params.key);
     res.status(204).end();
   } catch (error) {
     res.status(400).json({ message: error?.message || '删除周期复盘失败' });
@@ -1513,7 +1566,7 @@ app.post('/api/parse-task-text', requireUser, requireTextAi, async (req, res) =>
 });
 
 async function publicUserPreferences(userId) {
-  const prefs = (await getSqliteUserPreferences(userId)) || { avatar: '', autoSchedule: null, voiceRetention: null };
+  const prefs = (await getUserPreferences(userId)) || { avatar: '', autoSchedule: null, voiceRetention: null };
   return {
     avatar: prefs.avatar || '',
     autoSchedule: prefs.autoSchedule || null,
@@ -1539,7 +1592,7 @@ app.put('/api/settings/profile', requireUser, async (req, res) => {
     if (Object.prototype.hasOwnProperty.call(req.body || {}, 'autoSchedule')) {
       patch.autoSchedule = req.body.autoSchedule && typeof req.body.autoSchedule === 'object' ? req.body.autoSchedule : null;
     }
-    await saveSqliteUserPreferences(req.user.id, patch);
+    await saveUserPreferences(req.user.id, patch);
     res.json({ ...(await publicUserPreferences(req.user.id)), message: '个人设置已保存' });
   } catch (error) {
     res.status(400).json({ message: error?.message || '个人设置保存失败' });
@@ -1555,7 +1608,7 @@ app.put('/api/settings/jobs', requireUser, async (req, res) => {
   try {
     const voiceRetention = normalizeVoiceRetentionSettings(req.body?.voiceRetention || req.body);
     const autoSchedule = req.body?.autoSchedule && typeof req.body.autoSchedule === 'object' ? req.body.autoSchedule : undefined;
-    await saveSqliteUserPreferences(req.user.id, {
+    await saveUserPreferences(req.user.id, {
       voiceRetention,
       ...(autoSchedule !== undefined ? { autoSchedule } : {})
     });
@@ -1572,7 +1625,7 @@ app.post('/api/voice-jobs/purge', requireUser, async (req, res) => {
     const days = Number(req.body?.retentionDays);
     const retentionDays = Number.isInteger(days) && days >= 1 && days <= 90 ? days : schedule.retentionDays;
     if (Number.isInteger(days) && days >= 1 && days <= 90) {
-      await saveSqliteUserPreferences(req.user.id, { voiceRetention: { ...schedule, retentionDays } });
+      await saveUserPreferences(req.user.id, { voiceRetention: { ...schedule, retentionDays } });
     }
     const force = Boolean(req.body?.force);
     const result = force
@@ -1938,11 +1991,17 @@ app.post('/api/report-edit-jobs/:id/retry', requireUser, requireVoiceAi, async (
 });
 
 const dist = path.resolve(__dirname, '../dist');
-app.use((req,res,next)=>{if(req.path==='/'||req.path==='/index.html'||req.path==='/sw.js')res.set('Cache-Control','no-store, no-cache, must-revalidate');next()});
+const sendAdminPage = (_req, res) => res.set('Cache-Control', 'no-store, no-cache, must-revalidate').sendFile(path.join(dist, 'admin.html'));
+app.get('/admin', sendAdminPage);
+app.get('/admin.html', sendAdminPage);
+app.use((req,res,next)=>{if(req.path==='/'||req.path==='/index.html'||req.path==='/sw.js'||req.path==='/admin'||req.path==='/admin.html')res.set('Cache-Control','no-store, no-cache, must-revalidate');next()});
 app.use(express.static(dist));
-app.get('/{*splat}', (_req, res) => res.set('Cache-Control','no-store').sendFile(path.join(dist, 'index.html')));
-let sqliteClosed=false;
-const closeDatabase=()=>{if(sqliteClosed)return;sqliteClosed=true;void closeSqlite();void closeBilling()};
+app.get('/{*splat}', (req, res) => {
+  const admin = req.path === '/admin' || req.path.startsWith('/admin/');
+  res.set('Cache-Control','no-store').sendFile(path.join(dist, admin ? 'admin.html' : 'index.html'));
+});
+let storeClosed=false;
+const closeDatabase=()=>{if(storeClosed)return;storeClosed=true;void closeStore();void closeBilling()};
 process.once('SIGINT',()=>{closeDatabase();process.exit(0)});
 process.once('SIGTERM',()=>{closeDatabase();process.exit(0)});
 process.once('exit',closeDatabase);
@@ -1952,7 +2011,7 @@ initStore()
   .then(() => Promise.all([loadJobSettings(), recoverVoiceJobs(), recoverReportEditJobs()]))
   .then(async () => {
     try {
-      const legacy = await autoClaimSqliteLegacyData();
+      const legacy = await autoClaimLegacyData();
       if (legacy?.claimed) {
         console.log(`已将 local-legacy 历史数据归属用户 ${legacy.by}`, legacy.moved);
         void adoptLegacyVoiceDirs(legacy.by);

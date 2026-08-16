@@ -7,12 +7,6 @@ android/
 .env
 data/**
 !data/.gitkeep
-data/*.db
-data/*.db-shm
-data/*.db-wal
-data/*.sqlite
-data/*.sqlite-shm
-data/*.sqlite-wal
 .vite-preview*.log
 server.out.log
 server.err.log

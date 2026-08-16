@@ -179,22 +179,22 @@ function normalizeTask(raw, current = null) {
   };
 }
 
-export async function listSqliteTasks(userId) {
+export async function listTasks(userId) {
   await initPgStore();
   const { rows } = await query('SELECT * FROM tasks WHERE user_id=$1 ORDER BY created_at DESC', [requireUserId(userId)]);
   return rows.map(toTask);
 }
 
-export async function getSqliteTask(userId, id) {
+export async function getTask(userId, id) {
   await initPgStore();
   const { rows } = await query('SELECT * FROM tasks WHERE user_id=$1 AND id=$2', [requireUserId(userId), String(id)]);
   return toTask(rows[0]);
 }
 
-export async function saveSqliteTask(userId, raw) {
+export async function saveTask(userId, raw) {
   await initPgStore();
   const uid = requireUserId(userId);
-  const current = await getSqliteTask(uid, raw?.id);
+  const current = await getTask(uid, raw?.id);
   const task = normalizeTask(raw, current);
   await query(`
     INSERT INTO tasks(id,user_id,title,assignee,due_label,status,priority,progress,estimated_minutes,created_at,started_at,completed_at,ai_status,updated_at)
@@ -205,31 +205,31 @@ export async function saveSqliteTask(userId, raw) {
       started_at=EXCLUDED.started_at,completed_at=EXCLUDED.completed_at,ai_status=EXCLUDED.ai_status,updated_at=EXCLUDED.updated_at
     WHERE tasks.user_id=EXCLUDED.user_id
   `, [task.id, uid, task.title, task.assignee, task.due, task.status, task.priority, task.progress, task.estimatedMinutes, task.createdAt, task.startedAt, task.completedAt, task.aiStatus, task.updatedAt]);
-  const saved = await getSqliteTask(uid, task.id);
+  const saved = await getTask(uid, task.id);
   if (!saved) throw new Error('无权保存该任务');
   return saved;
 }
 
-export async function patchSqliteTask(userId, id, changes) {
-  const current = await getSqliteTask(userId, id);
+export async function patchTask(userId, id, changes) {
+  const current = await getTask(userId, id);
   if (!current) return null;
-  return saveSqliteTask(userId, { ...current, ...changes, id: current.id, createdAt: current.createdAt });
+  return saveTask(userId, { ...current, ...changes, id: current.id, createdAt: current.createdAt });
 }
 
-export async function deleteSqliteTask(userId, id) {
+export async function deleteTask(userId, id) {
   await initPgStore();
   const result = await query('DELETE FROM tasks WHERE user_id=$1 AND id=$2', [requireUserId(userId), String(id)]);
   return result.rowCount > 0;
 }
 
-export async function loadSqliteReport(userId, date) {
+export async function loadDailyReport(userId, date) {
   await initPgStore();
   const { rows } = await query('SELECT report_json FROM daily_reports WHERE user_id=$1 AND report_date=$2', [requireUserId(userId), String(date)]);
   if (!rows[0]) return null;
   try { return JSON.parse(rows[0].report_json); } catch { return null; }
 }
 
-export async function saveSqliteReport(userId, date, report) {
+export async function saveDailyReport(userId, date, report) {
   await initPgStore();
   await query(`
     INSERT INTO daily_reports(user_id,report_date,report_json,updated_at) VALUES($1,$2,$3,$4)
@@ -238,7 +238,7 @@ export async function saveSqliteReport(userId, date, report) {
   return report;
 }
 
-export async function deleteSqliteReport(userId, date) {
+export async function deleteDailyReport(userId, date) {
   await initPgStore();
   const result = await query('DELETE FROM daily_reports WHERE user_id=$1 AND report_date=$2', [requireUserId(userId), String(date)]);
   return result.rowCount > 0;
@@ -250,7 +250,7 @@ function normalizePeriodKind(kind) {
   return value;
 }
 
-export async function loadSqlitePeriodReport(userId, kind, periodKey) {
+export async function loadPeriodReport(userId, kind, periodKey) {
   await initPgStore();
   const { rows } = await query(
     'SELECT report_json FROM period_reports WHERE user_id=$1 AND kind=$2 AND period_key=$3',
@@ -260,7 +260,7 @@ export async function loadSqlitePeriodReport(userId, kind, periodKey) {
   try { return JSON.parse(rows[0].report_json); } catch { return null; }
 }
 
-export async function listSqlitePeriodReports(userId, kind) {
+export async function listPeriodReports(userId, kind) {
   await initPgStore();
   const { rows } = await query(
     'SELECT kind,period_key,report_json,updated_at FROM period_reports WHERE user_id=$1 AND kind=$2 ORDER BY period_key DESC',
@@ -273,7 +273,7 @@ export async function listSqlitePeriodReports(userId, kind) {
   });
 }
 
-export async function saveSqlitePeriodReport(userId, kind, periodKey, report) {
+export async function savePeriodReport(userId, kind, periodKey, report) {
   await initPgStore();
   const normalized = normalizePeriodKind(kind);
   const key = String(periodKey || '').trim();
@@ -285,7 +285,7 @@ export async function saveSqlitePeriodReport(userId, kind, periodKey, report) {
   return report;
 }
 
-export async function deleteSqlitePeriodReport(userId, kind, periodKey) {
+export async function deletePeriodReport(userId, kind, periodKey) {
   await initPgStore();
   const result = await query(
     'DELETE FROM period_reports WHERE user_id=$1 AND kind=$2 AND period_key=$3',
@@ -333,7 +333,7 @@ async function ensureLegacyUser() {
   );
 }
 
-export async function createSqliteUser({ email, password, name }) {
+export async function createUser({ email, password, name }) {
   await initPgStore();
   const normalized = normalizeEmail(email);
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized)) throw new Error('邮箱格式不正确');
@@ -350,7 +350,7 @@ export async function createSqliteUser({ email, password, name }) {
   return publicUser({ id, email: normalized, display_name: displayName, created_at: now });
 }
 
-export async function authenticateSqliteUser(email, password) {
+export async function authenticateUser(email, password) {
   await initPgStore();
   const { rows } = await query('SELECT * FROM users WHERE email=$1', [normalizeEmail(email)]);
   const row = rows[0];
@@ -359,14 +359,14 @@ export async function authenticateSqliteUser(email, password) {
   return publicUser(row);
 }
 
-export async function getSqliteUser(id) {
+export async function getUser(id) {
   await initPgStore();
   if (String(id) === LEGACY_USER_ID) return null;
   const { rows } = await query('SELECT id,email,display_name,created_at FROM users WHERE id=$1', [String(id)]);
   return publicUser(rows[0]);
 }
 
-export async function createSqliteSession(userId, days = 7) {
+export async function createSession(userId, days = 7) {
   await initPgStore();
   await query('DELETE FROM sessions WHERE expires_at < $1', [new Date().toISOString()]);
   const id = randomUUID();
@@ -379,7 +379,7 @@ export async function createSqliteSession(userId, days = 7) {
   return { id, userId, expiresAt: expires, createdAt };
 }
 
-export async function getSqliteSession(sessionId) {
+export async function getSession(sessionId) {
   await initPgStore();
   if (!sessionId) return null;
   await query('DELETE FROM sessions WHERE expires_at < $1', [new Date().toISOString()]);
@@ -401,14 +401,14 @@ export async function getSqliteSession(sessionId) {
   };
 }
 
-export async function deleteSqliteSession(sessionId) {
+export async function deleteSession(sessionId) {
   await initPgStore();
   if (!sessionId) return false;
   const result = await query('DELETE FROM sessions WHERE id=$1', [String(sessionId)]);
   return result.rowCount > 0;
 }
 
-export async function deleteSqliteUserSessions(userId) {
+export async function deleteUserSessions(userId) {
   await initPgStore();
   const result = await query('DELETE FROM sessions WHERE user_id=$1', [requireUserId(userId)]);
   return result.rowCount;
@@ -428,16 +428,16 @@ function toUserModelSettings(row) {
   };
 }
 
-export async function getSqliteUserModelSettings(userId) {
+export async function getUserModelSettings(userId) {
   await initPgStore();
   const { rows } = await query('SELECT * FROM user_model_settings WHERE user_id=$1', [requireUserId(userId)]);
   return toUserModelSettings(rows[0]);
 }
 
-export async function saveSqliteUserModelSettings(userId, settings) {
+export async function saveUserModelSettings(userId, settings) {
   await initPgStore();
   const uid = requireUserId(userId);
-  const current = (await getSqliteUserModelSettings(uid)) || {};
+  const current = (await getUserModelSettings(uid)) || {};
   const next = {
     provider: String(settings?.provider || current.provider || 'bailian'),
     baseURL: String(settings?.baseURL ?? current.baseURL ?? ''),
@@ -454,7 +454,7 @@ export async function saveSqliteUserModelSettings(userId, settings) {
       provider=EXCLUDED.provider, base_url=EXCLUDED.base_url, text_api_key=EXCLUDED.text_api_key,
       asr_api_key=EXCLUDED.asr_api_key, text_model=EXCLUDED.text_model, asr_model=EXCLUDED.asr_model, updated_at=EXCLUDED.updated_at
   `, [uid, next.provider, next.baseURL, next.textApiKey, next.asrApiKey, next.textModel, next.asrModel, next.updatedAt]);
-  return getSqliteUserModelSettings(uid);
+  return getUserModelSettings(uid);
 }
 
 function parseJsonField(raw, fallback = null) {
@@ -473,16 +473,16 @@ function toUserPreferences(row) {
   };
 }
 
-export async function getSqliteUserPreferences(userId) {
+export async function getUserPreferences(userId) {
   await initPgStore();
   const { rows } = await query('SELECT * FROM user_preferences WHERE user_id=$1', [requireUserId(userId)]);
   return toUserPreferences(rows[0]);
 }
 
-export async function saveSqliteUserPreferences(userId, patch = {}) {
+export async function saveUserPreferences(userId, patch = {}) {
   await initPgStore();
   const uid = requireUserId(userId);
-  const current = (await getSqliteUserPreferences(uid)) || { avatar: '', autoSchedule: null, voiceRetention: null };
+  const current = (await getUserPreferences(uid)) || { avatar: '', autoSchedule: null, voiceRetention: null };
   const next = {
     avatar: Object.prototype.hasOwnProperty.call(patch, 'avatar') ? String(patch.avatar || '') : String(current.avatar || ''),
     autoSchedule: Object.prototype.hasOwnProperty.call(patch, 'autoSchedule') ? patch.autoSchedule : current.autoSchedule,
@@ -503,10 +503,10 @@ export async function saveSqliteUserPreferences(userId, patch = {}) {
     next.voiceRetention == null ? '' : JSON.stringify(next.voiceRetention),
     next.updatedAt
   ]);
-  return getSqliteUserPreferences(uid);
+  return getUserPreferences(uid);
 }
 
-export async function listSqliteUserPreferences() {
+export async function listUserPreferences() {
   await initPgStore();
   const { rows } = await query('SELECT user_id,avatar,auto_schedule_json,voice_retention_json,updated_at FROM user_preferences');
   return rows.map(toUserPreferences).filter(Boolean);
@@ -525,7 +525,7 @@ async function setAppMeta(key, value, client = null) {
   `, [String(key), String(value ?? ''), new Date().toISOString()]);
 }
 
-export async function getSqliteLegacyClaimStatus() {
+export async function getLegacyClaimStatus() {
   await initPgStore();
   const [tasks, daily, period] = await Promise.all([
     query('SELECT COUNT(*)::int AS n FROM tasks WHERE user_id=$1', [LEGACY_USER_ID]),
@@ -540,21 +540,21 @@ export async function getSqliteLegacyClaimStatus() {
   };
 }
 
-export async function claimSqliteLegacyData(userId, { forceOwner = false } = {}) {
+export async function claimLegacyData(userId, { forceOwner = false } = {}) {
   await initPgStore();
   const uid = requireUserId(userId);
   if (uid === LEGACY_USER_ID) return { claimed: false, reason: 'invalid_user' };
   const existing = await getAppMeta('legacy_claimed_by');
   if (existing && existing !== uid) return { claimed: false, reason: 'already', by: existing };
   if (existing === uid) {
-    const leftover = await getSqliteLegacyClaimStatus();
+    const leftover = await getLegacyClaimStatus();
     if (!leftover.pendingTasks && !leftover.pendingDaily && !leftover.pendingPeriod) {
       return { claimed: false, reason: 'already', by: uid };
     }
   }
 
   await ensureLegacyUser();
-  const beforeStatus = await getSqliteLegacyClaimStatus();
+  const beforeStatus = await getLegacyClaimStatus();
   const before = {
     tasks: beforeStatus.pendingTasks,
     daily: beforeStatus.pendingDaily,
@@ -614,9 +614,9 @@ export async function claimSqliteLegacyData(userId, { forceOwner = false } = {})
   return { claimed: true, by: uid, moved, before };
 }
 
-export async function autoClaimSqliteLegacyData() {
+export async function autoClaimLegacyData() {
   await initPgStore();
-  const status = await getSqliteLegacyClaimStatus();
+  const status = await getLegacyClaimStatus();
   if (status.claimedBy && !status.pendingTasks && !status.pendingDaily && !status.pendingPeriod) {
     return { claimed: false, reason: 'already', by: status.claimedBy };
   }
@@ -626,149 +626,13 @@ export async function autoClaimSqliteLegacyData() {
   const { rows: oldestRows } = await query('SELECT id FROM users WHERE id<>$1 ORDER BY created_at ASC LIMIT 1', [LEGACY_USER_ID]);
   const oldest = oldestRows[0]?.id;
   if (!oldest) return { claimed: false, reason: 'no_users' };
-  return claimSqliteLegacyData(oldest, { forceOwner: true });
+  return claimLegacyData(oldest, { forceOwner: true });
 }
 
-export async function closeSqlite() {
+export async function closeStore() {
   if (!pool) return;
   const current = pool;
   pool = null;
   ready = null;
   await current.end();
-}
-
-/** Used by migrate script to insert raw rows */
-export async function upsertRawUser(row) {
-  await initPgStore();
-  const points = Number(row.points_balance || 0);
-  const granted = Number(row.signup_points_granted ?? (points > 0 ? 1 : 0));
-  await query(
-    `INSERT INTO users(id,email,password_hash,display_name,created_at,role,points_balance,selected_model_id,signup_points_granted)
-     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
-     ON CONFLICT(id) DO UPDATE SET
-       email=EXCLUDED.email,
-       password_hash=EXCLUDED.password_hash,
-       display_name=EXCLUDED.display_name,
-       created_at=EXCLUDED.created_at,
-       role=EXCLUDED.role,
-       points_balance=EXCLUDED.points_balance,
-       selected_model_id=EXCLUDED.selected_model_id,
-       signup_points_granted=EXCLUDED.signup_points_granted`,
-    [
-      row.id,
-      row.email,
-      row.password_hash,
-      row.display_name || '',
-      row.created_at,
-      row.role || 'user',
-      points,
-      row.selected_model_id || '',
-      granted
-    ]
-  );
-}
-
-export async function upsertRawSession(row) {
-  await initPgStore();
-  await query(
-    `INSERT INTO sessions(id,user_id,expires_at,created_at) VALUES($1,$2,$3,$4)
-     ON CONFLICT(id) DO UPDATE SET user_id=EXCLUDED.user_id,expires_at=EXCLUDED.expires_at,created_at=EXCLUDED.created_at`,
-    [row.id, row.user_id, row.expires_at, row.created_at]
-  );
-}
-
-export async function upsertRawTask(row) {
-  await initPgStore();
-  await query(`
-    INSERT INTO tasks(id,user_id,title,assignee,due_label,status,priority,progress,estimated_minutes,created_at,started_at,completed_at,ai_status,updated_at)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-    ON CONFLICT(id) DO UPDATE SET
-      user_id=EXCLUDED.user_id,title=EXCLUDED.title,assignee=EXCLUDED.assignee,due_label=EXCLUDED.due_label,status=EXCLUDED.status,
-      priority=EXCLUDED.priority,progress=EXCLUDED.progress,estimated_minutes=EXCLUDED.estimated_minutes,
-      created_at=EXCLUDED.created_at,started_at=EXCLUDED.started_at,completed_at=EXCLUDED.completed_at,ai_status=EXCLUDED.ai_status,updated_at=EXCLUDED.updated_at
-  `, [row.id, row.user_id, row.title, row.assignee, row.due_label, row.status, row.priority, row.progress, row.estimated_minutes, row.created_at, row.started_at, row.completed_at, row.ai_status, row.updated_at]);
-}
-
-export async function upsertRawDailyReport(row) {
-  await initPgStore();
-  await query(`
-    INSERT INTO daily_reports(user_id,report_date,report_json,updated_at) VALUES($1,$2,$3,$4)
-    ON CONFLICT(user_id,report_date) DO UPDATE SET report_json=EXCLUDED.report_json,updated_at=EXCLUDED.updated_at
-  `, [row.user_id, row.report_date, row.report_json, row.updated_at]);
-}
-
-export async function upsertRawPeriodReport(row) {
-  await initPgStore();
-  await query(`
-    INSERT INTO period_reports(user_id,kind,period_key,report_json,updated_at) VALUES($1,$2,$3,$4,$5)
-    ON CONFLICT(user_id,kind,period_key) DO UPDATE SET report_json=EXCLUDED.report_json,updated_at=EXCLUDED.updated_at
-  `, [row.user_id, row.kind, row.period_key, row.report_json, row.updated_at]);
-}
-
-export async function upsertRawModelSettings(row) {
-  await initPgStore();
-  await query(`
-    INSERT INTO user_model_settings(user_id,provider,base_url,text_api_key,asr_api_key,text_model,asr_model,updated_at)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8)
-    ON CONFLICT(user_id) DO UPDATE SET
-      provider=EXCLUDED.provider,base_url=EXCLUDED.base_url,text_api_key=EXCLUDED.text_api_key,asr_api_key=EXCLUDED.asr_api_key,
-      text_model=EXCLUDED.text_model,asr_model=EXCLUDED.asr_model,updated_at=EXCLUDED.updated_at
-  `, [row.user_id, row.provider, row.base_url, row.text_api_key, row.asr_api_key, row.text_model, row.asr_model, row.updated_at]);
-}
-
-export async function upsertRawPreferences(row) {
-  await initPgStore();
-  await query(`
-    INSERT INTO user_preferences(user_id,avatar,auto_schedule_json,voice_retention_json,updated_at)
-    VALUES($1,$2,$3,$4,$5)
-    ON CONFLICT(user_id) DO UPDATE SET
-      avatar=EXCLUDED.avatar,auto_schedule_json=EXCLUDED.auto_schedule_json,voice_retention_json=EXCLUDED.voice_retention_json,updated_at=EXCLUDED.updated_at
-  `, [row.user_id, row.avatar || '', row.auto_schedule_json || '', row.voice_retention_json || '', row.updated_at]);
-}
-
-export async function upsertRawAppMeta(row) {
-  await initPgStore();
-  await setAppMeta(row.key, row.value);
-}
-
-export async function upsertRawBuiltinModel(row) {
-  await initPgStore();
-  await query(`
-    INSERT INTO builtin_models(id,name,provider,base_url,text_api_key,asr_api_key,text_model,asr_model,weight,badge,sort_order,enabled,kind,updated_at)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-    ON CONFLICT(id) DO UPDATE SET
-      name=EXCLUDED.name,provider=EXCLUDED.provider,base_url=EXCLUDED.base_url,
-      text_api_key=EXCLUDED.text_api_key,asr_api_key=EXCLUDED.asr_api_key,
-      text_model=EXCLUDED.text_model,asr_model=EXCLUDED.asr_model,weight=EXCLUDED.weight,
-      badge=EXCLUDED.badge,sort_order=EXCLUDED.sort_order,enabled=EXCLUDED.enabled,
-      kind=EXCLUDED.kind,updated_at=EXCLUDED.updated_at
-  `, [
-    row.id, row.name, row.provider || 'bailian', row.base_url || '', row.text_api_key || '', row.asr_api_key || '',
-    row.text_model, row.asr_model || 'qwen3-asr-flash', Number(row.weight ?? 1), row.badge || '',
-    Number(row.sort_order || 0), Number(row.enabled ?? 1), row.kind || 'text', row.updated_at
-  ]);
-}
-
-export async function upsertRawUsageLog(row) {
-  await initPgStore();
-  await query(`
-    INSERT INTO usage_logs(id,user_id,model_id,model_name,action,prompt_tokens,completion_tokens,total_tokens,weight,points,created_at)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-    ON CONFLICT(id) DO UPDATE SET
-      user_id=EXCLUDED.user_id,model_id=EXCLUDED.model_id,model_name=EXCLUDED.model_name,action=EXCLUDED.action,
-      prompt_tokens=EXCLUDED.prompt_tokens,completion_tokens=EXCLUDED.completion_tokens,total_tokens=EXCLUDED.total_tokens,
-      weight=EXCLUDED.weight,points=EXCLUDED.points,created_at=EXCLUDED.created_at
-  `, [
-    row.id, row.user_id, row.model_id || '', row.model_name || '', row.action || '',
-    Number(row.prompt_tokens || 0), Number(row.completion_tokens || 0), Number(row.total_tokens || 0),
-    Number(row.weight ?? 1), Number(row.points || 0), row.created_at
-  ]);
-}
-
-export async function countTable(name) {
-  await initPgStore();
-  const allowed = new Set(['users', 'sessions', 'tasks', 'daily_reports', 'period_reports', 'user_model_settings', 'user_preferences', 'app_meta', 'builtin_models', 'usage_logs']);
-  if (!allowed.has(name)) throw new Error('invalid table');
-  const { rows } = await query(`SELECT COUNT(*)::int AS n FROM ${name}`);
-  return Number(rows[0]?.n || 0);
 }

@@ -58,8 +58,15 @@ ok('user.register', regUser.status === 201 && userBody.user?.id, userBody.messag
 await initBilling();
 await updateUserAdmin(adminBody.user.id, { role: 'admin', pointsBalance: 88888 });
 
+const adminLogin = await fetch(`${base}/api/admin/auth/login`, {
+  method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ email: adminEmail, password: 'secret12' })
+});
+adminJar.store(adminLogin);
+ok('admin.login', adminLogin.status === 200, (await json(adminLogin)).message);
+
 const dashForbidden = await fetch(`${base}/api/admin/dashboard`, { headers: { Cookie: userJar.h() } });
-ok('admin.userForbidden', dashForbidden.status === 403);
+ok('admin.userForbidden', dashForbidden.status === 401);
 
 const dash = await json(await fetch(`${base}/api/admin/dashboard`, { headers: { Cookie: adminJar.h() } }));
 ok('admin.dashboard', typeof dash.userCount === 'number' && dash.userCount >= 2, JSON.stringify(dash));

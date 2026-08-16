@@ -10,24 +10,4 @@
 .model-picker-item b{font-size:13px;color:#243047}
 .model-picker-item span{margin-top:3px;color:#8590a3;font-size:10px}
 .model-picker-item em{font-style:normal;font-size:13px;font-weight:900;color:#334155}
-.admin-page{padding:0 2px 12px}
-.admin-tabs{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin:0 0 14px;padding:4px;border-radius:14px;background:rgba(241,245,249,.9)}
-.admin-tabs button{height:36px;border-radius:11px;background:transparent;color:#748094;font-size:11px;font-weight:800}
-.admin-tabs button.active{background:#fff;color:var(--primary);box-shadow:0 6px 14px rgba(15,23,42,.06)}
-.admin-stats{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin:8px 0 16px}
-.admin-stats>div{padding:14px;border-radius:14px;background:rgba(255,255,255,.82);border:1px solid rgba(15,23,42,.06)}
-.admin-stats b{display:block;font-size:20px}
-.admin-stats span{display:block;margin-top:4px;color:var(--muted);font-size:11px}
-.admin-add{width:100%;height:42px;margin-bottom:10px;border-radius:12px;background:#ecfeff;color:var(--primary);font-weight:800}
-.admin-model-list .model-picker-item{grid-template-columns:1fr auto auto auto}
-.admin-model-list button{height:32px;padding:0 10px;border-radius:9px;background:#eef0f5;color:#687086;font-size:11px;font-weight:700}
-.admin-model-list button.danger{background:#fff0ed;color:#b85542}
-.admin-editor{margin-top:14px;padding:14px;border-radius:16px;border:1px solid rgba(8,145,178,.14);background:rgba(255,255,255,.9)}
-.admin-editor h3{margin:0 0 8px;font-size:15px}
-.admin-check{display:flex;align-items:center;gap:8px;margin:12px 0;font-size:12px;font-weight:700}
-.admin-user-card{display:grid;gap:8px;margin:0 0 12px;padding:14px;border-radius:14px;background:rgba(255,255,255,.84);border:1px solid rgba(15,23,42,.06)}
-.admin-user-card b,.admin-user-card span{display:block}
-.admin-user-card span{color:var(--muted);font-size:11px;margin-top:2px}
-.admin-usage-row{display:grid;gap:4px;padding:12px 0;border-bottom:1px solid rgba(15,23,42,.06)}
-.admin-usage-row span,.admin-usage-row em{color:var(--muted);font-size:11px;font-style:normal}
 
