@@ -198,8 +198,21 @@ function simplify(value) {
 app.use(express.json({ limit: '2mb' }));
 app.set('trust proxy', 1);
 
+function isRealCloudConfig(url, key) {
+  const u = String(url || '').trim();
+  const k = String(key || '').trim();
+  if (!u || !k) return false;
+  if (/your-project|example\.supabase|your-anon|CHANGE_ME/i.test(`${u} ${k}`)) return false;
+  return true;
+}
+
 function cloudMode() {
-  return Boolean(supabaseUrl && supabaseAnonKey);
+  const authMode = String(process.env.AUTH_MODE || process.env.FLOWMATE_AUTH || '').trim().toLowerCase();
+  if (authMode === 'local') return false;
+  if (authMode === 'supabase') return isRealCloudConfig(supabaseUrl, supabaseAnonKey);
+  // PostgreSQL is the primary store; do not block local password login with leftover Supabase env.
+  if (String(process.env.DATABASE_URL || '').trim()) return false;
+  return isRealCloudConfig(supabaseUrl, supabaseAnonKey);
 }
 
 function parseCookies(req) {
@@ -1328,11 +1341,12 @@ app.delete('/api/period-reports/:kind/:key', requireUser, async (req, res) => {
 
 app.get('/api/settings/cloud', (_req, res) => {
   res.set('Cache-Control', 'no-store');
+  const active = cloudMode();
   res.json({
-    configured: Boolean(supabaseUrl && supabaseAnonKey),
-    url: supabaseUrl,
-    anonKey: supabaseAnonKey,
-    maskedKey: supabaseAnonKey ? `••••••${supabaseAnonKey.slice(-6)}` : ''
+    configured: active,
+    url: active ? supabaseUrl : '',
+    anonKey: active ? supabaseAnonKey : '',
+    maskedKey: active && supabaseAnonKey ? `••••••${supabaseAnonKey.slice(-6)}` : ''
   });
 });
 
