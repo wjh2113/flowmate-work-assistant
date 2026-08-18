@@ -55,6 +55,51 @@ function formatWeightEstimate(weight: number) {
   return `预估：百万 token ≈ ¥${yuan}（按 DeepSeek Flash 闲时单价折算）`;
 }
 
+/** Display-only: Flash 闲时 100万 token = 100万积分 ≈ ¥3 → 1 积分 ≈ ¥0.000003. Does not change billing. */
+const YUAN_PER_POINT = 3 / 1_000_000;
+
+function formatYuanAmount(yuan: number) {
+  if (!Number.isFinite(yuan)) return '0';
+  const fixed = yuan.toFixed(6).replace(/\.?0+$/, '');
+  return fixed || '0';
+}
+
+function AdminUserPointsField({
+  user,
+  onCommit
+}: {
+  user: AdminUser;
+  onCommit: (value: number) => void;
+}) {
+  const [draft, setDraft] = useState(String(user.pointsBalance));
+
+  useEffect(() => {
+    setDraft(String(user.pointsBalance));
+  }, [user.pointsBalance]);
+
+  const points = Number(draft);
+  const balanceYuan = Number.isFinite(points) ? points * YUAN_PER_POINT : 0;
+
+  return (
+    <label className="admin-user-points">
+      积分
+      <input
+        className="input"
+        type="number"
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={() => {
+          const value = Number(draft);
+          if (Number.isFinite(value) && value !== user.pointsBalance) onCommit(value);
+        }}
+      />
+      <span className="admin-points-yuan">
+        约 ¥{formatYuanAmount(YUAN_PER_POINT)} / 积分 · 当前约 ¥{formatYuanAmount(balanceYuan)}
+      </span>
+    </label>
+  );
+}
+
 export default function AdminPage({ initialTab = 'models' }: { initialTab?: 'overview' | 'models' | 'users' | 'usage' } = {}) {
   const [tab, setTab] = useState<'overview' | 'models' | 'users' | 'usage'>(initialTab);
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
@@ -379,17 +424,15 @@ export default function AdminPage({ initialTab = 'models' }: { initialTab?: 'ove
             )}
             {tab === 'users' && (
               <div className="admin-users">
+                <p className="field-help admin-points-rate-hint">折算参考：DeepSeek Flash 闲时百万 token ≈ ¥3（仅展示，不改计费）</p>
                 {users.map((u) => (
                   <div className="admin-user-card" key={u.id}>
                     <div><b>{u.name || u.email}</b><span>{u.email}</span></div>
                     <div className="admin-user-role">{u.role === 'admin' ? '超级管理员' : '普通用户'}</div>
-                    <label>
-                      积分
-                      <input className="input" type="number" defaultValue={u.pointsBalance} onBlur={(e) => {
-                        const value = Number(e.target.value);
-                        if (Number.isFinite(value) && value !== u.pointsBalance) void patchUser(u, { pointsBalance: value });
-                      }} />
-                    </label>
+                    <AdminUserPointsField
+                      user={u}
+                      onCommit={(value) => { void patchUser(u, { pointsBalance: value }); }}
+                    />
                   </div>
                 ))}
               </div>

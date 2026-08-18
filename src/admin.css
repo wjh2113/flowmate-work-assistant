@@ -33,10 +33,13 @@
 .admin-price-refresh{flex:none;height:32px;padding:0 12px;border-radius:9px;background:#eef0f5;color:#687086;font-size:11px;font-weight:700}
 .admin-price-refresh:disabled{opacity:.5}
 .admin-check{display:flex;align-items:center;gap:8px;margin:12px 0;font-size:12px;font-weight:700}
+.admin-users .admin-points-rate-hint{margin:0 0 10px;grid-column:1/-1;color:#8590a3;font-size:11px;line-height:1.45}
 .admin-user-card{display:grid;gap:8px;margin:0 0 12px;padding:14px;border-radius:14px;background:rgba(255,255,255,.84);border:1px solid rgba(15,23,42,.06)}
 .admin-user-card b,.admin-user-card span{display:block}
 .admin-user-card span{color:var(--muted);font-size:11px;margin-top:2px}
 .admin-user-role{font-size:11px;font-weight:700;color:var(--muted)}
+.admin-user-points{display:grid;gap:6px}
+.admin-user-points .admin-points-yuan{margin-top:0;line-height:1.4}
 .admin-usage-row{display:grid;gap:4px;padding:12px 0;border-bottom:1px solid rgba(15,23,42,.06)}
 .admin-usage-row span,.admin-usage-row em{color:var(--muted);font-size:11px;font-style:normal}
 .admin-page .settings-loading{padding:45px 0;text-align:center;color:var(--muted);font-size:12px}
