@@ -1,27 +1,41 @@
 import 'dotenv/config';
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
+import { getAdminBootstrap } from './admin-bootstrap.mjs';
+import { upsertBootstrapAdminUser } from './pg-store.mjs';
 
 const { Pool } = pg;
 if (!String(process.env.DATABASE_URL || '').trim()) {
   throw new Error('缺少 DATABASE_URL，请先配置本机 PostgreSQL');
 }
 const DEFAULT_SIGNUP_POINTS = Number(process.env.DEFAULT_SIGNUP_POINTS || 50000);
-const ADMIN_EMAILS = String(process.env.ADMIN_EMAILS || '')
-  .split(',')
-  .map((s) => s.trim().toLowerCase())
-  .filter(Boolean);
+
+const ALLOWED_PROVIDERS = ['bailian', 'deepseek', 'moonshot', 'custom'];
+
+/** Weights: Flash = 1.0 so 1M tokens = 1M points ≈ ¥3 (idle blended in:out 1:1). */
+export const FLASH_BASELINE_WEIGHT = 1;
 
 const DEFAULT_MODELS = [
-  { id: 'deepseek-v4-flash', name: 'Deepseek-V4-Flash', provider: 'deepseek', textModel: 'deepseek-v4-flash', weight: 0.05, badge: '', sortOrder: 10 },
-  { id: 'deepseek-v4-pro', name: 'Deepseek-V4-Pro', provider: 'deepseek', textModel: 'deepseek-v4-pro', weight: 0.13, badge: '', sortOrder: 20 },
-  { id: 'qwen3.7-plus', name: 'Qwen3.7-Plus', provider: 'bailian', textModel: 'qwen3.7-plus', weight: 0.79, badge: '', sortOrder: 30 },
-  { id: 'qwen3.6-flash', name: 'Qwen3.6-Flash', provider: 'bailian', textModel: 'qwen3.6-flash', weight: 0.25, badge: '', sortOrder: 40 },
-  { id: 'qwen-plus', name: 'Qwen-Plus', provider: 'bailian', textModel: 'qwen-plus', weight: 0.95, badge: '', sortOrder: 50 }
+  { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', provider: 'deepseek', textModel: 'deepseek-v4-flash', weight: 1.000, badge: '', sortOrder: 10 },
+  { id: 'qwen-plus', name: 'Qwen-Plus', provider: 'bailian', textModel: 'qwen-plus', weight: 0.460, badge: '', sortOrder: 20 },
+  { id: 'qwen3.6-flash', name: 'Qwen3.6-Flash', provider: 'bailian', textModel: 'qwen3.6-flash', weight: 1.400, badge: '', sortOrder: 30 },
+  { id: 'qwen3.7-plus', name: 'Qwen3.7-Plus', provider: 'bailian', textModel: 'qwen3.7-plus', weight: 1.660, badge: '', sortOrder: 40 },
+  { id: 'qwen3.8-max', name: 'Qwen3.8-Max', provider: 'bailian', textModel: 'qwen3.8-max', weight: 8.000, badge: '', sortOrder: 50 },
+  { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', provider: 'deepseek', textModel: 'deepseek-v4-pro', weight: 3.000, badge: '', sortOrder: 60 },
+  { id: 'kimi-k2.6', name: 'Kimi K2.6', provider: 'moonshot', textModel: 'kimi-k2.6', weight: 5.580, badge: '', sortOrder: 70 },
+  { id: 'kimi-k2.7-code', name: 'Kimi K2.7 Code', provider: 'moonshot', textModel: 'kimi-k2.7-code', weight: 5.580, badge: '', sortOrder: 80 },
+  { id: 'kimi-k3', name: 'Kimi K3', provider: 'moonshot', textModel: 'kimi-k3', weight: 20.000, badge: '', sortOrder: 90 }
 ];
 
 const BAILIAN_BASE = 'https://dashscope.aliyuncs.com/compatible-mode/v1';
 const DEEPSEEK_BASE = 'https://api.deepseek.com';
+const MOONSHOT_BASE = 'https://api.moonshot.cn/v1';
+const PROVIDER_BASES = {
+  bailian: BAILIAN_BASE,
+  deepseek: DEEPSEEK_BASE,
+  moonshot: MOONSHOT_BASE,
+  custom: ''
+};
 
 let pgPool = null;
 let ready = null;
@@ -65,8 +79,7 @@ async function withTx(fn) {
 function providerBase(provider, baseURL) {
   const id = String(provider || 'bailian');
   if (String(baseURL || '').trim()) return String(baseURL).replace(/\/$/, '');
-  if (id === 'deepseek') return DEEPSEEK_BASE;
-  return BAILIAN_BASE;
+  return PROVIDER_BASES[id] || BAILIAN_BASE;
 }
 
 function envTextKey() {
@@ -77,25 +90,64 @@ function envDeepseekKey() {
   return String(process.env.DEEPSEEK_API_KEY || '').trim();
 }
 
+function envMoonshotKey() {
+  return String(process.env.MOONSHOT_API_KEY || process.env.KIMI_API_KEY || '').trim();
+}
+
 function envAsrKey() {
   return String(process.env.DASHSCOPE_ASR_API_KEY || process.env.DASHSCOPE_API_KEY || '').trim();
 }
 
 function envKeyForProvider(provider) {
-  return provider === 'deepseek' ? envDeepseekKey() : envTextKey();
+  if (provider === 'deepseek') return envDeepseekKey();
+  if (provider === 'moonshot') return envMoonshotKey();
+  if (provider === 'custom') return '';
+  return envTextKey();
 }
 
-function resolveModelTextKey(model) {
+function isForeignProviderKey(stored, provider) {
+  if (!stored) return false;
+  if (provider === 'deepseek' || provider === 'moonshot') {
+    return stored === envTextKey() || (provider === 'deepseek' ? stored === envMoonshotKey() : stored === envDeepseekKey());
+  }
+  return false;
+}
+
+export function resolveModelTextKey(model) {
   if (!model) return '';
   const stored = String(model.textApiKey || '').trim();
   const envKey = envKeyForProvider(model.provider);
-  // Prefer provider-matching env key; avoid using a DashScope key against DeepSeek.
-  if (model.provider === 'deepseek') {
+  if (model.provider === 'deepseek' || model.provider === 'moonshot') {
     if (envKey) return envKey;
-    if (stored && stored !== envTextKey()) return stored;
+    if (stored && !isForeignProviderKey(stored, model.provider)) return stored;
     return '';
   }
   return stored || envKey;
+}
+
+function modelHasUsableKey(model) {
+  if (String(model?.textApiKey || '').trim()) return true;
+  if (model?.hasTextKey) return true;
+  return Boolean(envKeyForProvider(model?.provider));
+}
+
+export function isSelectableBuiltinModel(model) {
+  return Boolean(model && model.enabled && model.kind !== 'asr' && model.lastTestOk && modelHasUsableKey(model));
+}
+
+export function formatModelWeight(weight) {
+  return (Math.round((Number(weight) || 0) * 1000) / 1000).toFixed(3);
+}
+
+export function modelSwitchCostHint(model) {
+  const wLabel = formatModelWeight(model?.weight);
+  return `该模型权重 ${wLabel}（Flash 权重 1.0，约 100 万 token = 100 万积分 ≈ ¥3；当前权重 ${wLabel}，相对 Flash 为 ${wLabel} 倍）`;
+}
+
+export function modelSwitchConfirmMessage(model) {
+  const name = String(model?.name || model?.id || '该模型').trim();
+  const wLabel = formatModelWeight(model?.weight);
+  return `切换到 ${name} 后，积分 = Token × ${wLabel}（Flash 权重 1.0，约 100 万 token = 100 万积分 ≈ ¥3；当前权重 ${wLabel}，相对 Flash 为 ${wLabel} 倍）。确定？`;
 }
 
 function toModel(row, { includeSecrets = false } = {}) {
@@ -114,7 +166,9 @@ function toModel(row, { includeSecrets = false } = {}) {
     kind: row.kind || 'text',
     updatedAt: row.updated_at,
     hasTextKey: Boolean(row.text_api_key),
-    hasAsrKey: Boolean(row.asr_api_key)
+    hasAsrKey: Boolean(row.asr_api_key),
+    lastTestOk: Boolean(Number(row.last_test_ok ?? 0)),
+    keyVerifiedAt: row.key_verified_at || ''
   };
   if (includeSecrets) {
     model.textApiKey = row.text_api_key || '';
@@ -126,6 +180,7 @@ function toModel(row, { includeSecrets = false } = {}) {
 export async function initBilling() {
   if (ready) return ready;
   ready = (async () => {
+    await upsertBootstrapAdminUser();
     await getPg().query(`
       ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user';
       ALTER TABLE users ADD COLUMN IF NOT EXISTS points_balance DOUBLE PRECISION NOT NULL DEFAULT 0;
@@ -162,9 +217,11 @@ export async function initBilling() {
       );
       CREATE INDEX IF NOT EXISTS idx_usage_user_created ON usage_logs(user_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_logs(created_at DESC);
+      ALTER TABLE builtin_models ADD COLUMN IF NOT EXISTS last_test_ok INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE builtin_models ADD COLUMN IF NOT EXISTS key_verified_at TEXT NOT NULL DEFAULT '';
     `);
     await q(`UPDATE users SET signup_points_granted=1 WHERE signup_points_granted=0 AND (points_balance>0 OR id IN (SELECT DISTINCT user_id FROM usage_logs))`);
-    await seedBuiltinModelsIfEmpty();
+    await syncBuiltinModelCatalog();
     await repairBuiltinModelKeys();
     await bootstrapAdmins();
   })();
@@ -180,57 +237,60 @@ export async function closeBilling() {
   }
 }
 
-async function seedBuiltinModelsIfEmpty() {
-  const countRow = await qOne('SELECT COUNT(*)::int AS n FROM builtin_models');
-  if (Number(countRow?.n || 0) > 0) return;
+async function syncBuiltinModelCatalog() {
   const asrKey = envAsrKey();
   const now = new Date().toISOString();
   for (const item of DEFAULT_MODELS) {
-    const baseURL = item.provider === 'deepseek' ? DEEPSEEK_BASE : BAILIAN_BASE;
+    const baseURL = providerBase(item.provider);
     const textKey = envKeyForProvider(item.provider);
+    const asr = item.provider === 'bailian' ? asrKey : '';
     await q(
       `INSERT INTO builtin_models(id,name,provider,base_url,text_api_key,asr_api_key,text_model,asr_model,weight,badge,sort_order,enabled,kind,updated_at)
-       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [item.id, item.name, item.provider, baseURL, textKey, item.provider === 'deepseek' ? '' : asrKey, item.textModel, 'qwen3-asr-flash', item.weight, item.badge, item.sortOrder, 1, 'text', now]
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+       ON CONFLICT(id) DO UPDATE SET
+         name=EXCLUDED.name,provider=EXCLUDED.provider,base_url=EXCLUDED.base_url,text_model=EXCLUDED.text_model,
+         weight=EXCLUDED.weight,sort_order=EXCLUDED.sort_order,kind=EXCLUDED.kind,updated_at=EXCLUDED.updated_at`,
+      [item.id, item.name, item.provider, baseURL, textKey, asr, item.textModel, 'qwen3-asr-flash', item.weight, item.badge, item.sortOrder, 1, 'text', now]
     );
   }
 }
 
-/** Clear DashScope keys wrongly stored on DeepSeek rows; fill empty provider keys from env. */
+/** Clear mismatched provider keys; fill empty provider keys from env. */
 async function repairBuiltinModelKeys() {
   const dash = envTextKey();
   const deep = envDeepseekKey();
+  const moon = envMoonshotKey();
   const asr = envAsrKey();
   if (dash) {
-    await q(`UPDATE builtin_models SET text_api_key='' WHERE provider='deepseek' AND text_api_key=?`, [dash]);
+    await q(`UPDATE builtin_models SET text_api_key='' WHERE provider IN ('deepseek','moonshot') AND text_api_key=?`, [dash]);
   }
   if (deep) {
     await q(`UPDATE builtin_models SET text_api_key=? WHERE provider='deepseek' AND (text_api_key='' OR text_api_key IS NULL)`, [deep]);
   }
+  if (moon) {
+    await q(`UPDATE builtin_models SET text_api_key=? WHERE provider='moonshot' AND (text_api_key='' OR text_api_key IS NULL)`, [moon]);
+  }
   if (dash) {
-    await q(`UPDATE builtin_models SET text_api_key=? WHERE provider<>'deepseek' AND (text_api_key='' OR text_api_key IS NULL)`, [dash]);
+    await q(`UPDATE builtin_models SET text_api_key=? WHERE provider NOT IN ('deepseek','moonshot') AND (text_api_key='' OR text_api_key IS NULL)`, [dash]);
   }
   if (asr) {
-    await q(`UPDATE builtin_models SET asr_api_key=? WHERE provider<>'deepseek' AND (asr_api_key='' OR asr_api_key IS NULL)`, [asr]);
+    await q(`UPDATE builtin_models SET asr_api_key=? WHERE provider NOT IN ('deepseek','moonshot') AND (asr_api_key='' OR asr_api_key IS NULL)`, [asr]);
+  }
+  const bailianDonor = await qOne(`SELECT text_api_key, asr_api_key FROM builtin_models WHERE provider='bailian' AND text_api_key<>'' ORDER BY sort_order ASC LIMIT 1`);
+  if (bailianDonor?.text_api_key) {
+    await q(`UPDATE builtin_models SET text_api_key=? WHERE provider='bailian' AND (text_api_key='' OR text_api_key IS NULL)`, [bailianDonor.text_api_key]);
+  }
+  if (bailianDonor?.asr_api_key) {
+    await q(`UPDATE builtin_models SET asr_api_key=? WHERE provider='bailian' AND (asr_api_key='' OR asr_api_key IS NULL)`, [bailianDonor.asr_api_key]);
   }
 }
 
 async function bootstrapAdmins() {
-  if (!ADMIN_EMAILS.length) {
-    await promoteOldestUserIfNoAdmin();
-    return;
-  }
-  for (const email of ADMIN_EMAILS) {
-    await q(`UPDATE users SET role='admin' WHERE lower(email)=?`, [email]);
-  }
-}
-
-async function promoteOldestUserIfNoAdmin() {
-  if (ADMIN_EMAILS.length) return;
-  const admins = await qOne(`SELECT COUNT(*)::int AS n FROM users WHERE role='admin' AND id<>'local-legacy'`);
-  if (Number(admins?.n || 0) > 0) return;
-  const first = await qOne(`SELECT id FROM users WHERE id<>'local-legacy' ORDER BY created_at ASC LIMIT 1`);
-  if (first?.id) await q(`UPDATE users SET role='admin' WHERE id=?`, [first.id]);
+  const user = await upsertBootstrapAdminUser();
+  const bootstrap = getAdminBootstrap();
+  const adminId = user?.id || bootstrap.id;
+  await q(`UPDATE users SET role='user' WHERE role='admin' AND id<>? AND id<>'local-legacy'`, [adminId]);
+  if (adminId) await q(`UPDATE users SET role='admin' WHERE id=?`, [adminId]);
 }
 
 export function calcPoints(totalTokens, weight) {
@@ -257,14 +317,10 @@ export async function getUserAccount(userId) {
   };
 }
 
-export async function ensureUserBillingDefaults(userId, email = '') {
+export async function ensureUserBillingDefaults(userId, _email = '') {
   await initBilling();
   const account = await getUserAccount(userId);
   if (!account) return null;
-  const emailLower = String(email || account.email || '').toLowerCase();
-  if (ADMIN_EMAILS.includes(emailLower) && account.role !== 'admin') {
-    await q(`UPDATE users SET role='admin' WHERE id=?`, [userId]);
-  }
   // Grant signup points once; never rewrite an existing balance on every request.
   await q(
     `UPDATE users SET
@@ -273,8 +329,6 @@ export async function ensureUserBillingDefaults(userId, email = '') {
      WHERE id=? AND signup_points_granted=0`,
     [DEFAULT_SIGNUP_POINTS, userId]
   );
-  // First real user becomes admin when ADMIN_EMAILS is empty (covers register-after-boot).
-  await promoteOldestUserIfNoAdmin();
   return getUserAccount(userId);
 }
 
@@ -303,7 +357,7 @@ export async function saveBuiltinModel(input = {}) {
   const next = {
     id,
     name: String(input.name || current?.name || id).trim().slice(0, 80) || id,
-    provider: ['bailian', 'deepseek', 'custom'].includes(input.provider) ? input.provider : (current?.provider || 'bailian'),
+    provider: ALLOWED_PROVIDERS.includes(input.provider) ? input.provider : (current?.provider || 'bailian'),
     baseURL: String(input.baseURL ?? current?.baseURL ?? providerBase(input.provider || current?.provider)).trim(),
     textApiKey: (() => {
       if (!Object.prototype.hasOwnProperty.call(input, 'textApiKey')) return String(current?.textApiKey || '');
@@ -324,6 +378,8 @@ export async function saveBuiltinModel(input = {}) {
     kind: input.kind === 'asr' ? 'asr' : 'text',
     updatedAt: now
   };
+  const incomingKey = Object.prototype.hasOwnProperty.call(input, 'textApiKey') ? String(input.textApiKey || '').trim() : '';
+  const keyChanged = Boolean(incomingKey && incomingKey !== String(current?.textApiKey || ''));
   await q(
     `INSERT INTO builtin_models(id,name,provider,base_url,text_api_key,asr_api_key,text_model,asr_model,weight,badge,sort_order,enabled,kind,updated_at)
      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
@@ -332,6 +388,19 @@ export async function saveBuiltinModel(input = {}) {
        asr_api_key=EXCLUDED.asr_api_key,text_model=EXCLUDED.text_model,asr_model=EXCLUDED.asr_model,weight=EXCLUDED.weight,
        badge=EXCLUDED.badge,sort_order=EXCLUDED.sort_order,enabled=EXCLUDED.enabled,kind=EXCLUDED.kind,updated_at=EXCLUDED.updated_at`,
     [next.id, next.name, next.provider, next.baseURL, next.textApiKey, next.asrApiKey, next.textModel, next.asrModel, next.weight, next.badge, next.sortOrder, next.enabled, next.kind, next.updatedAt]
+  );
+  if (keyChanged) {
+    await q(`UPDATE builtin_models SET last_test_ok=0, key_verified_at='' WHERE id=?`, [id]);
+  }
+  return getBuiltinModel(id, { includeSecrets: true });
+}
+
+export async function markBuiltinModelTest(id, ok) {
+  await initBilling();
+  const now = new Date().toISOString();
+  await q(
+    `UPDATE builtin_models SET last_test_ok=?, key_verified_at=?, updated_at=? WHERE id=?`,
+    [ok ? 1 : 0, ok ? now : '', now, String(id)]
   );
   return getBuiltinModel(id, { includeSecrets: true });
 }
@@ -344,8 +413,8 @@ export async function deleteBuiltinModel(id) {
 
 export async function setUserSelectedModel(userId, modelId) {
   await initBilling();
-  const model = await getBuiltinModel(modelId);
-  if (!model || !model.enabled || model.kind === 'asr') throw new Error('模型不可用');
+  const model = await getBuiltinModel(modelId, { includeSecrets: true });
+  if (!isSelectableBuiltinModel(model)) throw new Error('模型不可用：需管理员启用、配置密钥并测试通过');
   await q(`UPDATE users SET selected_model_id=? WHERE id=?`, [model.id, String(userId)]);
   return model;
 }
@@ -354,11 +423,8 @@ export async function resolveBuiltinAiConfig(userId) {
   await initBilling();
   const account = await getUserAccount(userId);
   const models = await listBuiltinModels({ enabledOnly: true, includeSecrets: true });
-  const textModels = models.filter((m) => m.kind !== 'asr');
-  const withKey = (m) => Boolean(resolveModelTextKey(m));
-  let selected = textModels.find((m) => m.id === account?.selectedModelId && withKey(m))
-    || textModels.find((m) => m.id === account?.selectedModelId)
-    || textModels.find(withKey)
+  const textModels = models.filter(isSelectableBuiltinModel);
+  let selected = textModels.find((m) => m.id === account?.selectedModelId)
     || textModels[0]
     || null;
   if (!selected) {
@@ -378,9 +444,8 @@ export async function resolveBuiltinAiConfig(userId) {
     };
   }
   const textKey = resolveModelTextKey(selected);
-  // Selected model has no usable key — fall back to any configured builtin model.
   if (!textKey) {
-    const fallback = textModels.find((m) => m.id !== selected.id && withKey(m));
+    const fallback = textModels.find((m) => m.id !== selected.id);
     if (fallback) selected = fallback;
   }
   const finalTextKey = resolveModelTextKey(selected);
@@ -475,12 +540,14 @@ export async function updateUserAdmin(userId, patch = {}) {
   await initBilling();
   const account = await getUserAccount(userId);
   if (!account) throw new Error('用户不存在');
-  const role = patch.role === 'admin' || patch.role === 'user' ? patch.role : account.role;
+  if (Object.prototype.hasOwnProperty.call(patch, 'role')) {
+    throw new Error('管理员角色由启动配置固定，不可修改');
+  }
   const points = Object.prototype.hasOwnProperty.call(patch, 'pointsBalance')
     ? Math.max(0, Number(patch.pointsBalance) || 0)
     : account.pointsBalance;
   // Admin edits count as “granted” so a zeroed balance is not refilled on next login.
-  await q(`UPDATE users SET role=?, points_balance=?, signup_points_granted=1 WHERE id=?`, [role, points, userId]);
+  await q(`UPDATE users SET points_balance=?, signup_points_granted=1 WHERE id=?`, [points, userId]);
   return getUserAccount(userId);
 }
 

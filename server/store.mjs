@@ -24,6 +24,7 @@ export {
   deletePeriodReport,
   createUser,
   authenticateUser,
+  upsertBootstrapAdminUser,
   getUser,
   createSession,
   getSession,

@@ -1,4 +1,4 @@
-const CACHE = 'flowmate-v8-user-prefs';
+const CACHE = 'flowmate-v9-admin-bypass';
 const APP_SHELL = ['/manifest.webmanifest', '/icon.svg'];
 
 self.addEventListener('install', event => {
@@ -14,16 +14,16 @@ self.addEventListener('activate', event => event.waitUntil(
 self.addEventListener('fetch', event => {
   if (event.request.method !== 'GET' || new URL(event.request.url).origin !== self.location.origin) return;
   const url = new URL(event.request.url);
-  const isAdmin = url.pathname === '/admin' || url.pathname === '/admin.html';
-  const isNavigate = event.request.mode === 'navigate' || url.pathname === '/' || url.pathname === '/index.html' || isAdmin;
+  // Never intercept admin — always hit the network (dist/admin.html).
+  if (url.pathname === '/admin' || url.pathname === '/admin.html') return;
+  const isNavigate = event.request.mode === 'navigate' || url.pathname === '/' || url.pathname === '/index.html';
   const isVersion = url.pathname === '/version.json' || url.pathname === '/sw.js';
   // Always prefer network for app shell / version so deployments show up immediately.
   if (isNavigate || isVersion) {
     event.respondWith(
-      fetch(event.request, { cache: 'no-store' }).catch(() => {
-        if (isAdmin) return new Response('管理后台需要联网', { status: 503, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
-        return caches.match(event.request).then(hit => hit || caches.match('/'));
-      })
+      fetch(event.request, { cache: 'no-store' }).catch(() =>
+        caches.match(event.request).then(hit => hit || caches.match('/'))
+      )
     );
     return;
   }

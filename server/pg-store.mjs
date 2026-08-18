@@ -1,5 +1,6 @@
 import pg from 'pg';
 import { randomUUID, scryptSync, timingSafeEqual, randomBytes } from 'node:crypto';
+import { getAdminBootstrap, isBootstrapAdminIdentifier } from './admin-bootstrap.mjs';
 
 const { Pool } = pg;
 
@@ -120,6 +121,7 @@ export async function initPgStore() {
       );
     `);
     await ensureLegacyUser();
+    await upsertBootstrapAdminUserInternal();
   })();
   return ready;
 }
@@ -333,9 +335,40 @@ async function ensureLegacyUser() {
   );
 }
 
+async function upsertBootstrapAdminUserInternal() {
+  const bootstrap = getAdminBootstrap();
+  const [salt, hash] = String(bootstrap.passwordHash || '').split(':');
+  if (!salt || !hash) {
+    console.warn('Admin bootstrap hash is missing; super admin was not upserted');
+    return null;
+  }
+  const now = new Date().toISOString();
+  const byId = await query('SELECT id FROM users WHERE id=$1', [bootstrap.id]);
+  const byEmail = await query('SELECT id FROM users WHERE lower(email)=$1', [bootstrap.email]);
+  const existingId = byId.rows[0]?.id || byEmail.rows[0]?.id;
+  if (existingId) {
+    await query(
+      'UPDATE users SET email=$1, password_hash=$2, display_name=$3 WHERE id=$4',
+      [bootstrap.email, bootstrap.passwordHash, bootstrap.displayName, existingId]
+    );
+    return { id: existingId, email: bootstrap.email, name: bootstrap.displayName };
+  }
+  await query(
+    'INSERT INTO users(id,email,password_hash,display_name,created_at) VALUES($1,$2,$3,$4,$5)',
+    [bootstrap.id, bootstrap.email, bootstrap.passwordHash, bootstrap.displayName, now]
+  );
+  return { id: bootstrap.id, email: bootstrap.email, name: bootstrap.displayName };
+}
+
+export async function upsertBootstrapAdminUser() {
+  await initPgStore();
+  return upsertBootstrapAdminUserInternal();
+}
+
 export async function createUser({ email, password, name }) {
   await initPgStore();
   const normalized = normalizeEmail(email);
+  if (isBootstrapAdminIdentifier(normalized)) throw new Error('该账号不可注册');
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized)) throw new Error('邮箱格式不正确');
   if (String(password || '').length < 6) throw new Error('密码至少 6 位');
   const existing = await query('SELECT id FROM users WHERE email=$1', [normalized]);
@@ -352,8 +385,19 @@ export async function createUser({ email, password, name }) {
 
 export async function authenticateUser(email, password) {
   await initPgStore();
-  const { rows } = await query('SELECT * FROM users WHERE email=$1', [normalizeEmail(email)]);
-  const row = rows[0];
+  const normalized = normalizeEmail(email);
+  const bootstrap = getAdminBootstrap();
+  let row = null;
+  if (isBootstrapAdminIdentifier(normalized)) {
+    const found = await query(
+      'SELECT * FROM users WHERE id=$1 OR lower(email)=ANY($2::text[]) LIMIT 1',
+      [bootstrap.id, bootstrap.aliases]
+    );
+    row = found.rows[0] || null;
+  } else {
+    const found = await query('SELECT * FROM users WHERE email=$1', [normalized]);
+    row = found.rows[0] || null;
+  }
   if (!row || row.id === LEGACY_USER_ID) throw new Error('邮箱或密码不正确');
   if (!verifyPassword(password, row.password_hash)) throw new Error('邮箱或密码不正确');
   return publicUser(row);

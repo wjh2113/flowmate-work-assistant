@@ -201,6 +201,7 @@ header h1,
 }
 
 .quick-voice,
+.quick-photo,
 .quick-add {
   border-radius: var(--radius-lg);
 }

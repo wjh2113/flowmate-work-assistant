@@ -27,19 +27,28 @@
 .admin-model-list button.danger{background:#fff0ed;color:#b85542}
 .admin-editor{margin-top:14px;padding:14px;border-radius:16px;border:1px solid rgba(8,145,178,.14);background:rgba(255,255,255,.9)}
 .admin-editor h3{margin:0 0 8px;font-size:15px}
+.admin-editor .field-help{margin:0 0 10px;color:#8590a3;font-size:11px;line-height:1.45}
+.admin-price-estimate{display:flex;align-items:flex-start;gap:10px;margin:0 0 12px}
+.admin-price-estimate .field-help{flex:1;margin:0;padding-top:6px}
+.admin-price-refresh{flex:none;height:32px;padding:0 12px;border-radius:9px;background:#eef0f5;color:#687086;font-size:11px;font-weight:700}
+.admin-price-refresh:disabled{opacity:.5}
 .admin-check{display:flex;align-items:center;gap:8px;margin:12px 0;font-size:12px;font-weight:700}
 .admin-user-card{display:grid;gap:8px;margin:0 0 12px;padding:14px;border-radius:14px;background:rgba(255,255,255,.84);border:1px solid rgba(15,23,42,.06)}
 .admin-user-card b,.admin-user-card span{display:block}
 .admin-user-card span{color:var(--muted);font-size:11px;margin-top:2px}
+.admin-user-role{font-size:11px;font-weight:700;color:var(--muted)}
 .admin-usage-row{display:grid;gap:4px;padding:12px 0;border-bottom:1px solid rgba(15,23,42,.06)}
 .admin-usage-row span,.admin-usage-row em{color:var(--muted);font-size:11px;font-style:normal}
 .admin-page .settings-loading{padding:45px 0;text-align:center;color:var(--muted);font-size:12px}
 .admin-page .settings-error{margin-top:14px;padding:10px 12px;border-radius:11px;background:#fff0ed;color:#b85542;font-size:10px}
 .admin-page .settings-success{margin-top:14px;padding:10px 12px;border-radius:11px;background:#eaf7f1;color:#267c5c;font-size:10px}
 .admin-page .settings-actions{display:grid;grid-template-columns:1fr 1.5fr;gap:9px;margin-top:22px}
+.admin-page .settings-actions.admin-editor-actions{grid-template-columns:1fr 1.2fr 1.4fr}
 .admin-page .settings-actions button{height:48px;border-radius:14px;background:#eef0f4;color:#697184;font-size:12px;font-weight:800}
+.admin-page .settings-actions button.admin-test{background:#ecfeff;color:var(--primary)}
 .admin-page .settings-actions button:last-child{background:var(--primary);color:#fff}
 .admin-page .settings-actions button:disabled{opacity:.5}
+.admin-editor .settings-success,.admin-editor .settings-error{margin-top:12px}
 .admin-page .model-picker-list{display:grid;gap:8px;margin:8px 0 12px}
 .admin-page .model-picker-item{display:grid;grid-template-columns:1fr auto;align-items:center;gap:10px;width:100%;padding:12px 14px;border:1px solid rgba(15,23,42,.08);border-radius:14px;background:rgba(255,255,255,.86);text-align:left}
 .admin-page .model-picker-item b,.admin-page .model-picker-item span{display:block}

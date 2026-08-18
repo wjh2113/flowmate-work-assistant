@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { Converter } from 'opencc-js/t2cn';
 import { authenticateUser, autoClaimLegacyData, claimLegacyData, closeStore, createSession, createUser, deletePeriodReport, deleteDailyReport, deleteSession, deleteTask, getSession, getTask, getUserPreferences, initStore, LEGACY_USER_ID, listPeriodReports, listTasks, loadPeriodReport, loadDailyReport, patchTask, savePeriodReport, saveDailyReport, saveTask, saveUserPreferences, storageDisplay, storageMode } from './store.mjs';
+import { isBootstrapAdminUser } from './admin-bootstrap.mjs';
 import {
   adminDashboardStats,
   assertEnoughPoints,
@@ -16,14 +17,21 @@ import {
   ensureUserBillingDefaults,
   getUserAccount,
   initBilling,
+  getBuiltinModel,
+  isSelectableBuiltinModel,
   listBuiltinModels,
   listUsageLogs,
   listUsersAdmin,
+  markBuiltinModelTest,
+  modelSwitchCostHint,
+  modelSwitchConfirmMessage,
   resolveBuiltinAiConfig,
+  resolveModelTextKey,
   saveBuiltinModel,
   setUserSelectedModel,
   updateUserAdmin
 } from './billing.mjs';
+import { estimateModelPrice, weightEstimateMessage } from './model-prices.mjs';
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -33,14 +41,17 @@ const ADMIN_SESSION_COOKIE = 'flowmate_admin_session';
 const SESSION_DAYS = 7;
 const BAILIAN_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1';
 const DEEPSEEK_BASE_URL = 'https://api.deepseek.com';
+const MOONSHOT_BASE_URL = 'https://api.moonshot.cn/v1';
 const PROVIDER_PRESETS = {
   bailian: { id: 'bailian', label: '阿里云百炼', baseURL: BAILIAN_BASE_URL },
   deepseek: { id: 'deepseek', label: 'DeepSeek', baseURL: DEEPSEEK_BASE_URL },
+  moonshot: { id: 'moonshot', label: 'Moonshot Kimi', baseURL: MOONSHOT_BASE_URL },
   custom: { id: 'custom', label: '自定义', baseURL: '' }
 };
 const PRESET_TEXT_MODELS = {
-  bailian: ['qwen3.7-plus', 'qwen-plus', 'qwen3.6-flash', 'deepseek-v3.2', 'deepseek-v4-pro', 'deepseek-v4-flash'],
+  bailian: ['qwen3.8-max', 'qwen3.7-plus', 'qwen-plus', 'qwen3.6-flash', 'deepseek-v4-flash', 'deepseek-v4-pro'],
   deepseek: ['deepseek-v4-flash', 'deepseek-v4-pro'],
+  moonshot: ['kimi-k2.6', 'kimi-k2.7-code', 'kimi-k3'],
   custom: []
 };
 const ALLOWED_ASR_MODELS = ['qwen3-asr-flash', 'qwen3-asr-flash-2026-02-10'];
@@ -141,6 +152,7 @@ function normalizeTextProvider(value) {
 function inferProviderFromBaseURL(url) {
   const value = String(url || '').toLowerCase();
   if (value.includes('deepseek.com')) return 'deepseek';
+  if (value.includes('moonshot.cn') || value.includes('moonshot.ai') || value.includes('platform.kimi')) return 'moonshot';
   if (value.includes('dashscope.aliyuncs.com')) return 'bailian';
   if (value.trim()) return 'custom';
   return 'bailian';
@@ -288,7 +300,9 @@ function requireAdmin(req, res, next) {
       const session = await getSession(parseCookies(req)[ADMIN_SESSION_COOKIE]);
       if (!session?.user) return res.status(401).json({ error: 'UNAUTHORIZED', message: '请先登录管理后台' });
       const user = await enrichUser(session.user);
-      if (user?.role !== 'admin') return res.status(403).json({ error: 'FORBIDDEN', message: '需要管理员权限' });
+      if (user?.role !== 'admin' || !isBootstrapAdminUser(user)) {
+        return res.status(403).json({ error: 'FORBIDDEN', message: '需要管理员权限' });
+      }
       req.user = user;
       req.sessionId = session.id;
       next();
@@ -412,10 +426,11 @@ async function testCloudConnection(url, anonKey) {
   }
 }
 
-async function qwenChat({ model = textModel, messages, responseFormat, extra = {}, apiKey = textApiKey, baseURL = textBaseURL }) {
+async function qwenChat({ model = textModel, messages, responseFormat, extra = {}, apiKey = textApiKey, baseURL = textBaseURL, timeoutMs = 90_000 }) {
   if (!apiKey) throw new Error('尚未配置对应的 API Key');
   const endpoint = `${String(baseURL || textBaseURL).replace(/\/$/, '')}/chat/completions`;
-  const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),90_000);
+  const waitMs = Math.max(15_000, Number(timeoutMs) || 90_000);
+  const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),waitMs);
   try{
     const response = await fetch(endpoint, {
       method: 'POST',signal:controller.signal,
@@ -425,7 +440,7 @@ async function qwenChat({ model = textModel, messages, responseFormat, extra = {
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data?.error?.message || data?.message || `模型接口请求失败 (${response.status})`);
     return data;
-  }catch(error){if(error?.name==='AbortError')throw new Error('模型处理超过90秒，已停止本次请求，请点击任务重试');throw error}
+  }catch(error){if(error?.name==='AbortError')throw new Error(`模型处理超过${Math.round(waitMs/1000)}秒，已停止本次请求，请点击任务重试`);throw error}
   finally{clearTimeout(timer)}
 }
 
@@ -610,8 +625,58 @@ async function transcribeAudio(buffer, mime = 'audio/webm', availableTasks = [],
   return { transcript, command, tasks: [], task: null };
 }
 
+async function parseTasksFromImage(buffer, mime = 'image/jpeg', ai) {
+  const type = String(mime || 'image/jpeg').split(';')[0].trim() || 'image/jpeg';
+  const dataUrl = `data:${type};base64,${buffer.toString('base64')}`;
+  let data;
+  try {
+    data = await qwenChatForAi(ai, {
+      timeoutMs: 120_000,
+      messages: [
+        { role: 'system', content: '你是中文工作任务识别助手。用户会上传周报、月报、手写便签或工作清单的照片。请从图片中识别需要执行的工作任务，整理为独立可执行待办。只提取待办任务，不要把已完成事项、总结性描述或纯背景信息当成任务。未提负责人时写“我”，未提日期时根据报表周期写“本周”“本月”或“今天”。最多10项，不要虚构。只输出合法 JSON，不要 Markdown。JSON结构：tasks为数组，每项包含title字符串、assignee字符串、due简短中文、priority为高/中/低、confidence为0到1数字、estimatedMinutes为15到480之间的整数分钟数。' },
+        { role: 'user', content: [
+          { type: 'image_url', image_url: { url: dataUrl } },
+          { type: 'text', text: `当前日期：${new Date().toLocaleDateString('zh-CN')}\n当前用户：我\n请识别图中的工作任务。` }
+        ] }
+      ],
+      responseFormat: { type: 'json_object' }
+    }, 'parse_photo_tasks');
+  } catch (error) {
+    const raw = error?.message || '';
+    if (/InvalidParameter|does not support this input|does not support.*(image|vision|multimodal)|vision|multimodal/i.test(raw)) {
+      throw new Error('当前模型无法识别图片。请在「设置 → 大模型」切换到通义千问等视觉模型后再试');
+    }
+    throw error;
+  }
+  const parsed = parseJSON(messageText(data));
+  const source = Array.isArray(parsed?.tasks) ? parsed.tasks : Array.isArray(parsed) ? parsed : [parsed?.task || parsed];
+  const tasks = source
+    .filter(item => item && typeof item === 'object' && String(item.title || '').trim())
+    .slice(0, 10)
+    .map(item => normalizeParsedTask(item, ''));
+  if (!tasks.length) throw new Error('没有从图片中识别到可执行的工作任务，请拍更清晰的周报、月报或清单后再试');
+  const transcript = convertToSimplified(tasks.map(item => item.title).join('；'));
+  return {
+    transcript,
+    command: {
+      action: 'create',
+      targetTaskId: null,
+      changes: {},
+      tasks,
+      task: tasks[0],
+      message: `从照片识别出${tasks.length}项任务`,
+      confidence: Math.max(0, Math.min(1, Number(tasks[0]?.confidence) || 0.8))
+    },
+    tasks,
+    task: tasks[0]
+  };
+}
+
 function voiceErrorMessage(error) {
   const message = error?.message || '';
+  if (/does not support.*(image|vision|multimodal)|vision.*(not support|unsupported)|image.*(not support|unsupported)|invalid.*image|content.*image/i.test(message)) {
+    return '当前模型无法识别图片。请在「设置 → 大模型」切换到通义千问等视觉模型后再试';
+  }
   if (/InvalidParameter|does not support this input/i.test(message)) return '语音模型无法读取这段录音，请重新录制后再试';
   return message || '语音识别失败';
 }
@@ -621,6 +686,14 @@ function audioExtension(mime = '') {
   if (mime.includes('wav')) return 'wav';
   if (mime.includes('mpeg') || mime.includes('mp3')) return 'mp3';
   return 'webm';
+}
+
+function imageExtension(mime = '') {
+  const type = String(mime || '').toLowerCase();
+  if (type.includes('png')) return 'png';
+  if (type.includes('webp')) return 'webp';
+  if (type.includes('gif')) return 'gif';
+  return 'jpg';
 }
 
 function voiceJobPath(jobOrUserId, id) {
@@ -635,6 +708,15 @@ function voiceAudioPath(job) {
   return path.join(userVoiceJobsDir(job.userId), job.audioFile);
 }
 
+function voiceImagePath(job) {
+  return path.join(userVoiceJobsDir(job.userId), job.imageFile);
+}
+
+async function unlinkVoiceMedia(job) {
+  if (job?.audioFile) await unlink(voiceAudioPath(job)).catch(() => {});
+  if (job?.imageFile) await unlink(voiceImagePath(job)).catch(() => {});
+}
+
 async function persistVoiceJob(job) {
   job.updatedAt = new Date().toISOString();
   voiceJobs.set(job.id, job);
@@ -644,8 +726,13 @@ async function persistVoiceJob(job) {
 }
 
 function publicVoiceJob(job) {
-  const { audioFile, availableTasks: _availableTasks, reports: _reports, ...safeJob } = job;
-  return { ...safeJob, hasAudio: Boolean(audioFile), source: job.source || (audioFile ? 'audio' : 'text') };
+  const { audioFile, imageFile, availableTasks: _availableTasks, reports: _reports, ...safeJob } = job;
+  return {
+    ...safeJob,
+    hasAudio: Boolean(audioFile),
+    hasImage: Boolean(imageFile),
+    source: job.source || (imageFile ? 'photo' : audioFile ? 'audio' : 'text')
+  };
 }
 
 function normalizeJobTimes(times, fallback = ['03:00']) {
@@ -732,7 +819,7 @@ function voiceJobListItem(job) {
     id: job.id,
     status: job.status,
     stage: job.stage,
-    source: job.source || (job.audioFile ? 'audio' : 'text'),
+    source: job.source || (job.imageFile ? 'photo' : job.audioFile ? 'audio' : 'text'),
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
     transcript: job.transcript || '',
@@ -741,6 +828,7 @@ function voiceJobListItem(job) {
     summary,
     error: job.error || '',
     hasAudio: Boolean(job.audioFile),
+    hasImage: Boolean(job.imageFile),
     expiresAt: job.createdAt ? new Date(Date.parse(job.createdAt) + retentionMs).toISOString() : ''
   };
 }
@@ -792,6 +880,7 @@ async function purgeExpiredVoiceJobsInDir(dir, retentionDays) {
         if (job?.id) voiceJobs.delete(job.id);
         await unlink(filePath).catch(() => {});
         if (job?.audioFile) await unlink(path.join(dir, job.audioFile)).catch(() => {});
+        if (job?.imageFile) await unlink(path.join(dir, job.imageFile)).catch(() => {});
         removed += 1;
       } else {
         const info = await stat(filePath);
@@ -833,6 +922,7 @@ async function purgeExpiredVoiceJobs(retentionDays = jobSettings.voiceRetention.
         if (job?.id) voiceJobs.delete(job.id);
         await unlink(full).catch(() => {});
         if (job?.audioFile) await unlink(path.join(voiceJobsDir, job.audioFile)).catch(() => {});
+        if (job?.imageFile) await unlink(path.join(voiceJobsDir, job.imageFile)).catch(() => {});
         removed += 1;
       }
     } catch (error) {
@@ -904,7 +994,7 @@ async function persistVoiceResult(job,result){
   for(let index=0;index<parsedTasks.length;index+=1){
     const parsed=parsedTasks[index];
     const id=index===0?job.id:`${job.id}-${index+1}`;
-    await saveTask(userId,{id,title:parsed.title||result.transcript||'语音任务',assignee:parsed.assignee||'我',due:parsed.due||'今天',status:'todo',priority:parsed.priority||'中',progress:0,estimatedMinutes:parsed.estimatedMinutes||60,createdAt:job.createdAt,startedAt:null,completedAt:null,aiStatus:null});
+    await saveTask(userId,{id,title:parsed.title||result.transcript||(job.source==='photo'?'拍照任务':'语音任务'),assignee:parsed.assignee||'我',due:parsed.due||'今天',status:'todo',priority:parsed.priority||'中',progress:0,estimatedMinutes:parsed.estimatedMinutes||60,createdAt:job.createdAt,startedAt:null,completedAt:null,aiStatus:null});
     ids.push(id);
   }
   return ids;
@@ -920,7 +1010,12 @@ async function processVoiceJob(id) {
     job.status = 'processing';
     job.error = '';
     let result;
-    if (job.audioFile) {
+    if (job.imageFile || job.source === 'photo') {
+      job.stage = 'recognizing';
+      await persistVoiceJob(job);
+      const buffer = await readFile(voiceImagePath(job));
+      result = await parseTasksFromImage(buffer, job.mime, ai);
+    } else if (job.audioFile) {
       if (!ai.resolveAsrKey()) throw new Error('管理员尚未配置语音识别 API Key');
       job.stage = 'transcribing';
       await persistVoiceJob(job);
@@ -1215,6 +1310,7 @@ app.post('/api/auth/login', async (req, res) => {
   if (cloudMode()) return res.status(400).json({ message: '当前已启用云端登录，请使用邮箱登录链接' });
   try {
     const user = await enrichUser(await authenticateUser(req.body?.email, req.body?.password));
+    if (isBootstrapAdminUser(user)) return res.status(403).json({ message: '管理员请从 /admin 登录' });
     const session = await createSession(user.id, SESSION_DAYS);
     setSessionCookie(res, session.id, session.expiresAt, req);
     const legacy = await applyLegacyClaim(user.id);
@@ -1233,8 +1329,11 @@ app.post('/api/auth/logout', async (req, res) => {
 
 app.post('/api/admin/auth/login', async (req, res) => {
   try {
-    const user = await enrichUser(await authenticateUser(req.body?.email, req.body?.password));
-    if (user?.role !== 'admin') return res.status(403).json({ message: '该账号不是管理员' });
+    const identifier = req.body?.email || req.body?.login || req.body?.username;
+    const user = await enrichUser(await authenticateUser(identifier, req.body?.password));
+    if (!isBootstrapAdminUser(user) || user?.role !== 'admin') {
+      return res.status(403).json({ message: '该账号不是管理员' });
+    }
     const session = await createSession(user.id, SESSION_DAYS);
     setAdminSessionCookie(res, session.id, session.expiresAt, req);
     res.json({ user });
@@ -1254,7 +1353,9 @@ app.get('/api/admin/auth/me', async (req, res) => {
   const session = await getSession(parseCookies(req)[ADMIN_SESSION_COOKIE]);
   if (!session?.user) return res.status(401).json({ user: null, message: '未登录管理后台' });
   const user = await enrichUser(session.user);
-  if (user?.role !== 'admin') return res.status(403).json({ user: null, message: '需要管理员权限' });
+  if (!isBootstrapAdminUser(user) || user?.role !== 'admin') {
+    return res.status(403).json({ user: null, message: '需要管理员权限' });
+  }
   res.json({ user });
 });
 
@@ -1387,7 +1488,9 @@ app.delete('/api/settings/cloud', requireSettingsAccess, async (_req, res) => {
 async function modelSettingsPublic(userId) {
   const account = await getUserAccount(userId);
   const ai = await resolveAiConfig(userId);
-  const models = await listBuiltinModels({ enabledOnly: true });
+  const models = (await listBuiltinModels({ enabledOnly: true, includeSecrets: true }))
+    .filter(isSelectableBuiltinModel);
+  const currentHint = ai.modelId ? modelSwitchCostHint({ name: ai.modelName, weight: ai.weight }) : '';
   return {
     mode: 'builtin',
     configured: Boolean(ai.textApiKey),
@@ -1399,14 +1502,16 @@ async function modelSettingsPublic(userId) {
     selectedModelId: account?.selectedModelId || ai.modelId || '',
     pointsBalance: account?.pointsBalance ?? 0,
     role: account?.role || 'user',
+    costHint: currentHint,
     current: {
       id: ai.modelId,
       name: ai.modelName,
       provider: ai.provider,
       textModel: ai.textModel,
-      weight: ai.weight
+      weight: ai.weight,
+      costHint: currentHint
     },
-    models: models.filter((m) => m.kind !== 'asr').map((m) => ({
+    models: models.map((m) => ({
       id: m.id,
       name: m.name,
       provider: m.provider,
@@ -1414,7 +1519,9 @@ async function modelSettingsPublic(userId) {
       weight: m.weight,
       badge: m.badge,
       sortOrder: m.sortOrder,
-      enabled: m.enabled
+      enabled: m.enabled,
+      costHint: modelSwitchCostHint(m),
+      switchConfirm: modelSwitchConfirmMessage(m)
     }))
   };
 }
@@ -1429,7 +1536,9 @@ app.put('/api/settings/model', requireUser, async (req, res) => {
     const modelId = String(req.body?.modelId || req.body?.selectedModelId || '').trim();
     if (!modelId) return res.status(400).json({ message: '请选择内置模型' });
     await setUserSelectedModel(req.user.id, modelId);
-    res.json({ ...(await modelSettingsPublic(req.user.id)), message: '已切换模型' });
+    const payload = await modelSettingsPublic(req.user.id);
+    const hint = payload.current?.costHint || payload.costHint || '';
+    res.json({ ...payload, message: hint ? `已切换。${hint}` : '已切换模型' });
   } catch (error) {
     res.status(400).json({ message: error?.message || '切换模型失败' });
   }
@@ -1443,7 +1552,7 @@ app.post('/api/settings/model/test', requireUser, async (req, res) => {
     res.json({ ok: true, message: `连接成功：${ai.modelName || ai.textModel}${reply ? `（回复：${reply}）` : ''}`, sample: reply });
   } catch (error) {
     console.error(error);
-    res.status(400).json({ message: error?.message || '模型连接测试失败' });
+    res.status(400).json({ message: publicModelTestError(error) });
   }
 });
 
@@ -1467,15 +1576,72 @@ async function probeBailianKey(apiKey) {
   }
 }
 
-async function testTextModelConnection(apiKey, model, baseURL) {
+async function testTextModelConnection(apiKey, model, baseURL, timeoutMs = 25_000) {
   const data = await qwenChat({
     model,
     apiKey,
     baseURL,
     messages: [{ role: 'user', content: '只回复两个字：成功' }],
-    extra: { max_tokens: 16, temperature: 0 }
+    extra: { max_tokens: 16, temperature: 0 },
+    timeoutMs
   });
   return String(messageText(data) || '').trim().slice(0, 40);
+}
+
+function sanitizePublicError(message, extraSecrets = []) {
+  let text = String(message || '模型连接测试失败');
+  for (const secret of extraSecrets) {
+    const value = String(secret || '').trim();
+    if (value.length >= 8) text = text.split(value).join(`${value.slice(0, 4)}…`);
+  }
+  return text
+    .replace(/\bsk-[A-Za-z0-9_\-]{6,}\b/g, (m) => `${m.slice(0, 5)}…`)
+    .replace(/Bearer\s+\S+/gi, 'Bearer …');
+}
+
+function publicModelTestError(error, extraSecrets = []) {
+  const cause = error?.cause;
+  const detail = String(error?.message || '模型连接测试失败');
+  let message = detail;
+  if (/fetch failed/i.test(detail) || cause?.code) {
+    const code = cause?.code || cause?.errno || '';
+    message = code ? `网络连接失败（${code}）` : '网络连接失败，请检查 Base URL 是否可访问';
+  }
+  return sanitizePublicError(message, extraSecrets);
+}
+
+async function handleAdminModelTest(req, res) {
+  const body = req.body || {};
+  const typedKey = String(body.textApiKey || '').trim();
+  const secrets = [typedKey];
+  const id = String(req.params?.id || body.id || '').trim();
+  const stored = id ? await getBuiltinModel(id, { includeSecrets: true }) : null;
+  secrets.push(String(stored?.textApiKey || '').trim());
+  const persist = Boolean(stored && (!typedKey || typedKey === String(stored.textApiKey || '').trim()));
+  try {
+    const apiKey = typedKey || resolveModelTextKey(stored) || secrets.find(Boolean) || '';
+    const textModel = String(body.textModel || stored?.textModel || '').trim();
+    const provider = String(body.provider || stored?.provider || 'bailian').trim();
+    const baseURL = String(body.baseURL || stored?.baseURL || PROVIDER_PRESETS[provider]?.baseURL || BAILIAN_BASE_URL).trim();
+    if (!textModel) return res.status(400).json({ message: '请填写模型 ID' });
+    if (!apiKey) return res.status(400).json({ message: '请填写 API Key，或先保存后再测试已有模型' });
+    const reply = await testTextModelConnection(apiKey, textModel, baseURL);
+    const label = String(body.name || stored?.name || textModel);
+    const model = persist ? await markBuiltinModelTest(stored.id, true) : stored;
+    res.json({
+      ok: true,
+      lastTestOk: Boolean(model?.lastTestOk || persist),
+      message: `连接成功：${label}${reply ? `（回复：${reply}）` : ''}`,
+      sample: reply,
+      model: model ? { ...model, textApiKey: undefined, asrApiKey: undefined } : null
+    });
+  } catch (error) {
+    if (persist) {
+      try { await markBuiltinModelTest(stored.id, false); } catch {}
+    }
+    console.error(error);
+    res.status(400).json({ message: publicModelTestError(error, secrets), lastTestOk: false });
+  }
 }
 
 app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
@@ -1485,6 +1651,58 @@ app.get('/api/admin/dashboard', requireAdmin, async (_req, res) => {
 app.get('/api/admin/models', requireAdmin, async (_req, res) => {
   res.json({ models: await listBuiltinModels({ includeSecrets: true }) });
 });
+
+app.get('/api/admin/model-prices', requireAdmin, async (req, res) => {
+  try {
+    const provider = String(req.query.provider || '');
+    const textModel = String(req.query.textModel || req.query.model || '');
+    const id = String(req.query.id || '');
+    const weight = Number(req.query.weight);
+    const result = await estimateModelPrice({
+      provider,
+      textModel,
+      id,
+      weight: Number.isFinite(weight) ? weight : 0
+    });
+    res.json(result);
+  } catch (error) {
+    const weight = Number(req.query.weight) || 0;
+    res.json({
+      ok: true,
+      source: 'weight',
+      fallback: true,
+      yuanPerMillion: Number((weight * 3).toFixed(3)),
+      weightEstimate: Number((weight * 3).toFixed(3)),
+      message: weightEstimateMessage(weight).replace(/^预估：/, '未能拉取官方价，已用权重估算。预估：')
+    });
+  }
+});
+
+app.post('/api/admin/models/:id/price-estimate', requireAdmin, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const result = await estimateModelPrice({
+      provider: String(body.provider || ''),
+      textModel: String(body.textModel || body.model || ''),
+      id: String(req.params.id || body.id || ''),
+      weight: Number(body.weight)
+    });
+    res.json(result);
+  } catch {
+    const weight = Number(req.body?.weight) || 0;
+    res.json({
+      ok: true,
+      source: 'weight',
+      fallback: true,
+      yuanPerMillion: Number((weight * 3).toFixed(3)),
+      weightEstimate: Number((weight * 3).toFixed(3)),
+      message: `未能拉取官方价，已用权重估算。${weightEstimateMessage(weight)}`
+    });
+  }
+});
+
+app.post('/api/admin/models/test', requireAdmin, handleAdminModelTest);
+app.post('/api/admin/models/:id/test', requireAdmin, handleAdminModelTest);
 
 app.put('/api/admin/models/:id', requireAdmin, async (req, res) => {
   try {
@@ -1778,6 +1996,47 @@ app.post('/api/voice-jobs', upload.single('audio'), requireUser, requireVoiceAi,
   }
 });
 
+app.post('/api/voice-jobs/photo', upload.single('image'), requireUser, requireTextAi, async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'NO_IMAGE', message: '没有收到图片文件' });
+    const mime = String(req.file.mimetype || '').toLowerCase();
+    if (!mime.startsWith('image/')) return res.status(400).json({ error: 'NOT_IMAGE', message: '请上传图片文件' });
+    const { availableTasks, reports } = parseVoiceJobContext(req.body || {});
+    const id = randomUUID();
+    const imageFile = `${id}.${imageExtension(mime)}`;
+    const dir = userVoiceJobsDir(req.user.id);
+    await mkdir(dir, { recursive: true });
+    await writeFile(path.join(dir, imageFile), req.file.buffer, { mode: 0o600 });
+    const job = {
+      id,
+      userId: req.user.id,
+      status: 'queued',
+      stage: 'queued',
+      source: 'photo',
+      mime: mime || 'image/jpeg',
+      audioFile: '',
+      imageFile,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      availableTasks,
+      reports,
+      transcript: '',
+      tasks: [],
+      task: null,
+      command: null,
+      editedReport: null,
+      reportKind: '',
+      error: ''
+    };
+    await persistVoiceJob(job);
+    res.status(202).json(publicVoiceJob(job));
+    setImmediate(() => void processVoiceJob(id));
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'PHOTO_JOB_SAVE_FAILED', message: '图片保存失败，请重试' });
+  }
+});
+
 function ownedVoiceJob(req, res) {
   const job = voiceJobs.get(req.params.id);
   if (!job || (job.userId || 'anonymous') !== req.user.id) {
@@ -1808,13 +2067,28 @@ app.get('/api/voice-jobs/:id/audio', requireUser, async (req, res) => {
   res.sendFile(filePath);
 });
 
+app.get('/api/voice-jobs/:id/image', requireUser, async (req, res) => {
+  const job = ownedVoiceJob(req, res);
+  if (!job) return;
+  if (!job.imageFile) return res.status(404).json({ message: '这条指令没有图片' });
+  const filePath = voiceImagePath(job);
+  try {
+    await stat(filePath);
+  } catch {
+    return res.status(404).json({ message: '图片已过期或不存在' });
+  }
+  res.setHeader('Cache-Control', 'private, max-age=3600');
+  res.type(job.mime || 'image/jpeg');
+  res.sendFile(filePath);
+});
+
 app.delete('/api/voice-jobs/:id', requireUser, async (req, res) => {
   const job = ownedVoiceJob(req, res);
   if (!job) return;
   job.cancelled = true;
   voiceJobs.delete(req.params.id);
   await unlink(voiceJobPath(job)).catch(() => {});
-  if (job.audioFile) await unlink(voiceAudioPath(job)).catch(() => {});
+  await unlinkVoiceMedia(job);
   res.status(204).end();
 });
 

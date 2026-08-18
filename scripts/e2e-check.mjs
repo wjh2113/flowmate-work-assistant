@@ -30,7 +30,7 @@ if (scriptMatch) {
   const js = await (await fetch(`${base}${scriptMatch[1]}`)).text();
   ok('html.hasBuiltinPicker', js.includes('内置大模型') || js.includes('积分余额') || js.includes('model-picker'));
   ok('html.appHasNoAdminLogin', !js.includes('ADMIN CONSOLE') && !js.includes('登录管理后台'));
-  ok('html.hasWeights', /0\.0\dx|积分\s*=\s*Token|weight/.test(js) || js.includes('Deepseek') || js.includes('deepseek'));
+  ok('html.hasWeights', /Flash 权重 1\.0|积分\s*=\s*Token|weight/.test(js) || js.includes('DeepSeek') || js.includes('deepseek'));
 }
 const adminHtml = await (await fetch(`${base}/admin`)).text();
 ok('admin.html.page', adminHtml.includes('管理后台') || adminHtml.includes('/src/admin.tsx') || /src="\/assets\/admin-[^"]+\.js"/.test(adminHtml));

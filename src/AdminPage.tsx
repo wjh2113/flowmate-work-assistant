@@ -17,6 +17,8 @@ type AdminModel = {
   asrApiKey?: string;
   hasTextKey?: boolean;
   hasAsrKey?: boolean;
+  lastTestOk?: boolean;
+  keyVerifiedAt?: string;
 };
 
 type AdminUser = {
@@ -48,6 +50,11 @@ type Dashboard = {
   totalPoints: number;
 };
 
+function formatWeightEstimate(weight: number) {
+  const yuan = Math.round((Number(weight) || 0) * 3 * 1000) / 1000;
+  return `预估：百万 token ≈ ¥${yuan}（按 DeepSeek Flash 闲时单价折算）`;
+}
+
 export default function AdminPage({ initialTab = 'models' }: { initialTab?: 'overview' | 'models' | 'users' | 'usage' } = {}) {
   const [tab, setTab] = useState<'overview' | 'models' | 'users' | 'usage'>(initialTab);
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
@@ -58,6 +65,11 @@ export default function AdminPage({ initialTab = 'models' }: { initialTab?: 'ove
   const [message, setMessage] = useState('');
   const [editing, setEditing] = useState<AdminModel | null>(null);
   const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [testMessage, setTestMessage] = useState('');
+  const [testError, setTestError] = useState('');
+  const [priceHint, setPriceHint] = useState<string | null>(null);
+  const [priceRefreshing, setPriceRefreshing] = useState(false);
   const [loading, setLoading] = useState(true);
   const [authed, setAuthed] = useState(false);
   const [email, setEmail] = useState('');
@@ -129,9 +141,68 @@ export default function AdminPage({ initialTab = 'models' }: { initialTab?: 'ove
     setPassword('');
   };
 
+  const openEditor = (model: AdminModel) => {
+    setTestError('');
+    setTestMessage('');
+    setPriceHint(null);
+    setEditing(model);
+  };
+
+  const refreshPriceEstimate = async () => {
+    if (!editing) return;
+    setPriceRefreshing(true);
+    try {
+      const qs = new URLSearchParams({
+        provider: editing.provider || '',
+        textModel: editing.textModel || '',
+        id: editing.id || '',
+        weight: String(editing.weight ?? 0)
+      });
+      const response = await apiFetch(`/api/admin/model-prices?${qs}`);
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        setPriceHint(`未能拉取官方价，已用权重估算。${formatWeightEstimate(editing.weight)}`);
+        return;
+      }
+      setPriceHint(String(data.message || formatWeightEstimate(editing.weight)));
+    } catch {
+      setPriceHint(`未能拉取官方价，已用权重估算。${formatWeightEstimate(editing.weight)}`);
+    } finally {
+      setPriceRefreshing(false);
+    }
+  };
+
+  const testModel = async () => {
+    if (!editing) return;
+    setTesting(true); setTestError(''); setTestMessage(''); setError(''); setMessage('');
+    try {
+      const response = await apiFetch('/api/admin/models/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: editing.id,
+          name: editing.name,
+          provider: editing.provider,
+          baseURL: editing.baseURL,
+          textModel: editing.textModel,
+          textApiKey: editing.textApiKey || ''
+        })
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.message || '测试失败');
+      setTestMessage(data.message || '连接成功');
+      setEditing((cur) => cur ? { ...cur, lastTestOk: Boolean(data.lastTestOk ?? data.ok) } : cur);
+      await load();
+    } catch (e) {
+      setTestError(e instanceof Error ? e.message : '测试失败');
+    } finally {
+      setTesting(false);
+    }
+  };
+
   const saveModel = async () => {
     if (!editing) return;
-    setSaving(true); setError(''); setMessage('');
+    setSaving(true); setError(''); setMessage(''); setTestError(''); setTestMessage('');
     try {
       const isNew = !models.some((m) => m.id === editing.id);
       const response = await apiFetch(isNew ? '/api/admin/models' : `/api/admin/models/${encodeURIComponent(editing.id)}`, {
@@ -194,8 +265,8 @@ export default function AdminPage({ initialTab = 'models' }: { initialTab?: 'ove
             <h1>管理员登录</h1>
             <p>请使用管理员账号登录。工作台登录不会进入此后台。</p>
             <form onSubmit={(e) => void login(e)}>
-              <label>邮箱</label>
-              <input className="input" type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="admin@company.com" autoComplete="username" required />
+              <label>账号</label>
+              <input className="input" type="text" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="管理员账号" autoComplete="username" required />
               <label>密码</label>
               <input className="input" type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="管理员密码" autoComplete="current-password" required minLength={6} />
               <button className="primary" disabled={loggingIn}>{loggingIn ? '正在登录…' : '登录管理后台'}</button>
@@ -231,19 +302,21 @@ export default function AdminPage({ initialTab = 'models' }: { initialTab?: 'ove
             )}
             {tab === 'models' && (
               <div className="admin-section">
-                <button type="button" className="admin-add" onClick={() => setEditing({
-                  id: `model-${Date.now()}`, name: '新模型', provider: 'bailian', baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-                  textModel: 'qwen3.7-plus', asrModel: 'qwen3-asr-flash', weight: 1, badge: '', sortOrder: 100, enabled: true, kind: 'text', textApiKey: '', asrApiKey: ''
-                })}>＋ 新增模型</button>
+                <button type="button" className="admin-add" onClick={() => {
+                  openEditor({
+                    id: `model-${Date.now()}`, name: '新模型', provider: 'bailian', baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+                    textModel: 'qwen3.7-plus', asrModel: 'qwen3-asr-flash', weight: 1, badge: '', sortOrder: 100, enabled: true, kind: 'text', textApiKey: '', asrApiKey: ''
+                  });
+                }}>＋ 新增模型</button>
                 <div className="model-picker-list admin-model-list">
                   {models.map((m) => (
                     <div className="model-picker-item" key={m.id}>
                       <div>
                         <b>{m.name}</b>
-                        <span>{m.textModel} · {m.provider}{m.badge ? ` · ${m.badge}` : ''}{m.enabled ? '' : ' · 已停用'}</span>
+                        <span>{m.textModel} · {m.provider}{m.badge ? ` · ${m.badge}` : ''}{m.enabled ? '' : ' · 已停用'}{m.lastTestOk ? ' · 已验证' : ' · 未验证'}</span>
                       </div>
-                      <em>{Number(m.weight).toFixed(2)}x</em>
-                      <button type="button" onClick={() => setEditing({ ...m, textApiKey: '', asrApiKey: '' })}>编辑</button>
+                      <em>{Number(m.weight).toFixed(3)}x</em>
+                      <button type="button" onClick={() => openEditor({ ...m, textApiKey: '', asrApiKey: '' })}>编辑</button>
                       <button type="button" className="danger" onClick={() => void removeModel(m.id)}>删</button>
                     </div>
                   ))}
@@ -256,13 +329,31 @@ export default function AdminPage({ initialTab = 'models' }: { initialTab?: 'ove
                     <label>显示名称</label>
                     <input className="input" value={editing.name} onChange={(e) => setEditing({ ...editing, name: e.target.value })} />
                     <label>权重（积分 = Token × 权重）</label>
-                    <input className="input" type="number" step="0.01" min="0" value={editing.weight} onChange={(e) => setEditing({ ...editing, weight: Number(e.target.value) })} />
+                    <input className="input" type="number" step="0.001" min="0" value={editing.weight} onChange={(e) => {
+                      setPriceHint(null);
+                      setEditing({ ...editing, weight: Number(e.target.value) });
+                    }} />
+                    <div className="admin-price-estimate">
+                      <p className="field-help">{priceHint || formatWeightEstimate(editing.weight)}</p>
+                      <button type="button" className="admin-price-refresh" disabled={priceRefreshing || saving || testing} onClick={() => void refreshPriceEstimate()}>
+                        {priceRefreshing ? '刷新中…' : '刷新'}
+                      </button>
+                    </div>
                     <label>角标（可选，如「限时免费」）</label>
                     <input className="input" value={editing.badge} onChange={(e) => setEditing({ ...editing, badge: e.target.value })} />
                     <label>提供商</label>
-                    <select className="input model-select" value={editing.provider} onChange={(e) => setEditing({ ...editing, provider: e.target.value })}>
+                    <select className="input model-select" value={editing.provider} onChange={(e) => {
+                      const provider = e.target.value;
+                      const bases: Record<string, string> = {
+                        bailian: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+                        deepseek: 'https://api.deepseek.com',
+                        moonshot: 'https://api.moonshot.cn/v1'
+                      };
+                      setEditing({ ...editing, provider, baseURL: provider === 'custom' ? editing.baseURL : (bases[provider] || editing.baseURL) });
+                    }}>
                       <option value="bailian">阿里云百炼</option>
                       <option value="deepseek">DeepSeek</option>
+                      <option value="moonshot">Moonshot Kimi</option>
                       <option value="custom">自定义</option>
                     </select>
                     <label>Base URL</label>
@@ -274,7 +365,14 @@ export default function AdminPage({ initialTab = 'models' }: { initialTab?: 'ove
                     <label>ASR Key（可选）</label>
                     <input className="input" type="password" value={editing.asrApiKey || ''} onChange={(e) => setEditing({ ...editing, asrApiKey: e.target.value })} placeholder={editing.hasAsrKey ? '已配置，留空不改' : '可选'} />
                     <label className="admin-check"><input type="checkbox" checked={editing.enabled} onChange={(e) => setEditing({ ...editing, enabled: e.target.checked })} /> 启用</label>
-                    <div className="settings-actions"><button type="button" onClick={() => setEditing(null)}>取消</button><button type="button" disabled={saving} onClick={() => void saveModel()}>{saving ? '保存中…' : '保存'}</button></div>
+                    <p className="field-help">{editing.lastTestOk ? '已通过可用性测试，用户可选。' : '尚未通过可用性测试，用户端不可选。'}</p>
+                    {testMessage && <div className="settings-success">✓ {testMessage}</div>}
+                    {testError && <div className="settings-error">{testError}</div>}
+                    <div className="settings-actions admin-editor-actions">
+                      <button type="button" onClick={() => { setEditing(null); setTestError(''); setTestMessage(''); setPriceHint(null); }}>取消</button>
+                      <button type="button" className="admin-test" disabled={saving || testing} onClick={() => void testModel()}>{testing ? '测试中…' : '测试可用性'}</button>
+                      <button type="button" disabled={saving || testing} onClick={() => void saveModel()}>{saving ? '保存中…' : '保存'}</button>
+                    </div>
                   </div>
                 )}
               </div>
@@ -284,13 +382,7 @@ export default function AdminPage({ initialTab = 'models' }: { initialTab?: 'ove
                 {users.map((u) => (
                   <div className="admin-user-card" key={u.id}>
                     <div><b>{u.name || u.email}</b><span>{u.email}</span></div>
-                    <label>
-                      角色
-                      <select className="input model-select" value={u.role} onChange={(e) => void patchUser(u, { role: e.target.value as 'user' | 'admin' })}>
-                        <option value="user">普通用户</option>
-                        <option value="admin">管理员</option>
-                      </select>
-                    </label>
+                    <div className="admin-user-role">{u.role === 'admin' ? '超级管理员' : '普通用户'}</div>
                     <label>
                       积分
                       <input className="input" type="number" defaultValue={u.pointsBalance} onBlur={(e) => {
