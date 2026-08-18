@@ -20,7 +20,7 @@ type VoiceCommand = { action:'create'|'update'|'clarify'|'edit_report'; updates?
 type PlanItem = { title:string; reason:string; priority:Priority; suggestedTime:string };
 type DailyReport = { headline:string; summary:string; completed:string[]; risks:string[]; tomorrow:PlanItem[] };
 type PeriodReport = { headline:string; summary:string; highlights:string[]; risks:string[]; next:PlanItem[] };
-type VoiceJob = { id:string; status:'queued'|'processing'|'completed'|'failed'; stage?:'queued'|'transcribing'|'recognizing'|'understanding'|'saving'|'completed'|'failed'; source?:'audio'|'text'|'photo'; createdAt?:string; transcript?:string; tasks?:ParsedTask[]; task?:ParsedTask|null; command?:VoiceCommand|null; editedReport?:DailyReport|PeriodReport|null; reportKind?:ReportKind|''; cleared?:boolean; error?:string };
+type VoiceJob = { id:string; status:'queued'|'processing'|'completed'|'failed'; stage?:'queued'|'transcribing'|'recognizing'|'understanding'|'saving'|'completed'|'failed'; source?:'audio'|'text'|'photo'; createdAt?:string; transcript?:string; tasks?:ParsedTask[]; task?:ParsedTask|null; command?:VoiceCommand|null; editedReport?:DailyReport|PeriodReport|null; reportKind?:ReportKind|''; cleared?:boolean; error?:string; notice?:string };
 type VoiceProgress = { id:string; title:string; stage:string; status:'pending'|'failed'; error?:string; createdAt:string };
 type ReportEditJob = { id:string; kind:ReportKind; status:'queued'|'processing'|'completed'|'failed'; stage?:'queued'|'transcribing'|'understanding'|'saving'|'completed'|'failed'; createdAt?:string; transcript?:string; instruction?:string; report?:DailyReport|PeriodReport|null; cleared?:boolean; error?:string; message?:string };
 type AppDialog = { mode:'alert'|'confirm'; title:string; message:string; confirmLabel:string; cancelLabel:string; danger?:boolean; resolve:(ok:boolean)=>void };
@@ -311,7 +311,7 @@ export default function App(){
     if(!parsedTasks.length){finishVoicePolling(job.id);notify('没有识别到可执行的任务指令');return}
     const now=new Date().toISOString();
     const created=parsedTasks.slice(0,10).map((parsed,index):Task=>({id:index===0?job.id:`${job.id}-${index+1}`,title:parsed.title||job.transcript||(job.source==='photo'?'拍照任务':'语音任务'),assignee:parsed.assignee||'我',due:parsed.due||'今天',status:'todo',priority:parsed.priority||'中',progress:0,estimatedMinutes:parsed.estimatedMinutes||defaultEstimate(parsed.priority||'中'),createdAt:index===0?(job.createdAt||now):now}));
-    setTasks(items=>[...created,...items.filter(item=>item.id!==job.id)]);created.forEach(syncVoiceTask);setAiReady(true);finishVoicePolling(job.id);if(created.length>1)goTab('tasks');notify(created.length>1?`已拆解 ${created.length} 项，以下为全部任务`:(job.source==='photo'?'照片任务已创建':'语音任务已创建'));
+    setTasks(items=>[...created,...items.filter(item=>item.id!==job.id)]);created.forEach(syncVoiceTask);setAiReady(true);finishVoicePolling(job.id);if(created.length>1)goTab('tasks');notify(created.length>1?`已拆解 ${created.length} 项，以下为全部任务`:(job.source==='photo'?(job.notice?`${job.notice}，任务已创建`:'照片任务已创建'):'语音任务已创建'));
   };
   const failVoiceJob=(job:VoiceJob)=>{
     setVoiceProgress(items=>{
@@ -331,7 +331,8 @@ export default function App(){
         if(job.status==='completed'){void completeVoiceJob(job);return}
         if(job.status==='failed'){failVoiceJob(job);return}
         const elapsed=Math.max(0,Math.round((Date.now()-new Date(job.createdAt||Date.now()).getTime())/1000));
-        const stage=`${voiceStageText[job.stage||'queued']||'AI后台处理中'} · ${elapsed}秒`;
+        const stageBase=voiceStageText[job.stage||'queued']||'AI后台处理中';
+        const stage=job.notice?`${job.notice} · ${stageBase} · ${elapsed}秒`:`${stageBase} · ${elapsed}秒`;
         const title=toSimplified(job.transcript||'')||undefined;
         setVoiceProgress(items=>{
           const current=items.find(item=>item.id===id);

@@ -491,19 +491,223 @@ function isPeriodKey(kind, key) {
   return false;
 }
 
+const TASK_SPLIT_SYSTEM_PROMPT = '你是中文工作任务拆解助手。把一段口语、清单或识别文字整理为一个或多个独立可执行任务。一句话中出现多个并列目标、不同课程、不同交付物或先后要完成的事项时，必须拆成多项；例如“学习日语直播课、英语雅思和AI练习”应拆成3项。标题要短（一般不超过20字），去掉“嗯”“那个”“就是”等口语填充词，不要把整段转写原文当作标题。不要把同一个目标的普通操作步骤过度拆分。最多10项，不要虚构信息；未提负责人时写“我”，未提日期时写“今天”。每个标题只保留一个动作和一个清晰对象。根据各任务复杂度分别估算时长。只输出合法 JSON，不要 Markdown。JSON结构：tasks为数组，每项包含title字符串、assignee字符串、due简短中文、priority为高/中/低、confidence为0到1数字、estimatedMinutes为15到480之间的整数分钟数。';
+const TASK_SPLIT_RETRY_PROMPT = '上一次结果把整段内容揉成了一条任务。请重新拆分：凡是并列事项、顿号列举、或“然后/还有/以及”连接的不同目标，都必须拆成多项；每项标题短而可执行，不要复述全文。';
+
+function compactText(value) {
+  return String(value || '').replace(/\s+/g, '').trim();
+}
+
+function stripFillerPrefix(title) {
+  return String(title || '')
+    .replace(/^(嗯+|额+|呃+|那个+|就是+|然后+|还有+|以及+|另外+)/g, '')
+    .replace(/[。！？.!?]+$/g, '')
+    .trim();
+}
+
+function looksLikeMultiItemBlob(text) {
+  const value = String(text || '').trim();
+  if (!value) return false;
+  if (/[、；;]|(?:然后)|(?:还有)|(?:以及)|(?:另外)|(?:同时)/.test(value)) return true;
+  if (value.split(/\r?\n+/).map(line => line.trim()).filter(Boolean).length >= 2) return true;
+  if (/(?:^|\n)\s*\d+[\.\)、]/.test(value)) return true;
+  // Very long dumps without clear delimiters still shouldn't become a title as-is.
+  return value.length > 60;
+}
+
+function titlesNearlyEqual(a, b) {
+  const left = compactText(a);
+  const right = compactText(b);
+  if (!left || !right) return false;
+  if (left === right) return true;
+  const shorter = left.length <= right.length ? left : right;
+  const longer = left.length <= right.length ? right : left;
+  if (shorter.length < 12) return false;
+  return longer.includes(shorter) && shorter.length / longer.length >= 0.72;
+}
+
+function shortTitleFromBlob(text, fallback = '未命名任务') {
+  const cleaned = stripFillerPrefix(String(text || '').trim());
+  if (!cleaned) return fallback;
+  const first = cleaned.split(/[、；;，,]|(?:然后)|(?:还有)|(?:以及)/)[0]?.trim() || cleaned;
+  const sliced = first.slice(0, 24).replace(/[的了呢吧啊哦嘿]+$/g, '').trim();
+  return sliced || fallback;
+}
+
+function needsResplit(tasks, transcript) {
+  if (!Array.isArray(tasks) || tasks.length !== 1) return false;
+  const title = String(tasks[0]?.title || '').trim();
+  const full = String(transcript || '').trim();
+  if (!title) return Boolean(full);
+  if (full && titlesNearlyEqual(title, full) && (full.length >= 16 || looksLikeMultiItemBlob(full))) return true;
+  return looksLikeMultiItemBlob(title) && /[、；;]|(?:然后)|(?:还有)|(?:以及)/.test(title);
+}
+
+function cleanListItemTitle(part) {
+  return stripFillerPrefix(
+    String(part || '')
+      .replace(/^\s*(?:\d+[\.\)、:：]|[-•●·*]|第[一二三四五六七八九十\d]+[项条点])\s*/u, '')
+      .replace(/^(要|去|把|将|请|帮我|记得)/, '')
+      .trim()
+  );
+}
+
+function heuristicSplitTranscript(transcript, seed = null) {
+  const full = String(transcript || '').trim();
+  if (!full) return [];
+  // Prefer line / numbered OCR lists (Excel「计划工作」等)
+  let parts = full
+    .split(/\r?\n+/)
+    .map(cleanListItemTitle)
+    .filter(part => part.length >= 2 && part.length <= 40);
+  if (parts.length < 2) {
+    parts = full
+      .split(/(?:[、；;]|(?:然后)|(?:还有)|(?:以及)|(?:另外)|(?:同时)|(?:\d+[\.\)、]))/)
+      .map(cleanListItemTitle)
+      .filter(part => part.length >= 2 && part.length <= 40);
+  }
+  parts = parts.slice(0, 10);
+  if (parts.length < 2) return [];
+  const base = seed && typeof seed === 'object' ? seed : {};
+  return parts.map(title => normalizeParsedTask({
+    ...base,
+    title,
+    confidence: Math.min(0.7, Number(base.confidence) || 0.65)
+  }, ''));
+}
+
+const VISION_UNSUPPORTED_MESSAGE = '当前没有可用的识图模型，请联系管理员在后台启用通义千问并配置 API Key';
+const VISION_TEMP_NOTICE = '已临时使用通义千问识图';
+
+function modelSupportsVision(ai) {
+  const provider = String(ai?.provider || '').toLowerCase();
+  const model = String(ai?.textModel || ai?.modelName || '').toLowerCase();
+  if (provider === 'deepseek') return false;
+  if (provider === 'moonshot') return false;
+  if (/deepseek|kimi|moonshot/.test(model)) return false;
+  // Bailian / Qwen OpenAI-compatible：qwen*、*-vl*、omni 支持 image_url + data URL
+  if (provider === 'bailian' || /dashscope|aliyuncs/.test(String(ai?.baseURL || ''))) {
+    return /qwen|vl|omni/.test(model);
+  }
+  return /qwen|vl|vision|omni|gpt-4o|gemini/.test(model);
+}
+
+function assertVisionCapable(ai) {
+  if (!modelSupportsVision(ai)) throw new Error(VISION_UNSUPPORTED_MESSAGE);
+}
+
+function builtinRowSupportsVision(model) {
+  return modelSupportsVision({
+    provider: model?.provider,
+    textModel: model?.textModel,
+    modelName: model?.name,
+    baseURL: model?.baseURL
+  });
+}
+
+function aiConfigFromBuiltinModel(selected, userId, models = []) {
+  const finalTextKey = resolveModelTextKey(selected);
+  const asr = models.find((m) => m.kind === 'asr' && m.enabled)
+    || models.find((m) => m.provider === 'bailian' && (m.asrApiKey || m.textApiKey || resolveModelTextKey(m)))
+    || selected;
+  const asrKey = (asr?.asrApiKey || (asr?.provider === 'bailian' ? asr?.textApiKey : '') || (selected.provider === 'bailian' ? finalTextKey : ''));
+  return {
+    source: 'builtin',
+    configured: Boolean(finalTextKey),
+    provider: selected.provider,
+    baseURL: String(selected.baseURL || BAILIAN_BASE_URL).replace(/\/$/, '') || BAILIAN_BASE_URL,
+    textApiKey: finalTextKey,
+    asrApiKey: asr?.asrApiKey || '',
+    textModel: selected.textModel,
+    asrModel: asr?.asrModel || 'qwen3-asr-flash',
+    modelId: selected.id,
+    modelName: selected.name,
+    weight: selected.weight,
+    userId: userId || '',
+    resolveAsrKey: () => asrKey || ''
+  };
+}
+
+/** One-shot vision model for photo jobs; does not change users.selected_model_id. */
+async function resolveVisionAiForJob(userId, currentAi) {
+  if (modelSupportsVision(currentAi) && currentAi?.textApiKey) {
+    return { ai: currentAi, switched: false, notice: '' };
+  }
+  const models = await listBuiltinModels({ enabledOnly: true, includeSecrets: true });
+  const withKey = models.filter((m) => m.kind !== 'asr' && builtinRowSupportsVision(m) && resolveModelTextKey(m));
+  if (!withKey.length) throw new Error(VISION_UNSUPPORTED_MESSAGE);
+
+  const tested = withKey.filter((m) => m.lastTestOk);
+  const pool = tested.length ? tested : withKey;
+  const preferredProviders = pool.filter((m) => {
+    const provider = String(m.provider || '').toLowerCase();
+    const textModel = String(m.textModel || '').toLowerCase();
+    return provider === 'bailian' || /qwen|vl|omni/.test(textModel);
+  });
+  const ranked = (preferredProviders.length ? preferredProviders : pool)
+    .slice()
+    .sort((a, b) => Number(a.sortOrder || 0) - Number(b.sortOrder || 0) || String(a.name || '').localeCompare(String(b.name || ''), 'zh'));
+
+  let preferredId = '';
+  try {
+    const logs = userId ? await listUsageLogs({ userId, limit: 40 }) : [];
+    for (const log of logs) {
+      const hit = ranked.find((m) => m.id === log.modelId);
+      if (hit) {
+        preferredId = hit.id;
+        break;
+      }
+    }
+  } catch {}
+  if (!preferredId) {
+    const account = userId ? await getUserAccount(userId) : null;
+    const selectedId = String(account?.selectedModelId || '').trim();
+    if (selectedId && ranked.some((m) => m.id === selectedId)) preferredId = selectedId;
+  }
+
+  const pick = ranked.find((m) => m.id === preferredId) || ranked[0];
+  const ai = aiConfigFromBuiltinModel(pick, userId, models);
+  if (!ai.textApiKey) throw new Error(VISION_UNSUPPORTED_MESSAGE);
+  return {
+    ai,
+    switched: true,
+    notice: VISION_TEMP_NOTICE,
+    modelId: pick.id,
+    modelName: pick.name
+  };
+}
+
 function normalizeParsedTask(parsed, transcript) {
+  let title = stripFillerPrefix(String(parsed?.title || '').trim());
+  const full = String(transcript || '').trim();
+  if (!title) {
+    // Never dump a long multi-clause transcript as the task title.
+    title = full && !looksLikeMultiItemBlob(full) && full.length <= 36
+      ? stripFillerPrefix(full)
+      : shortTitleFromBlob(full);
+  } else if (full && titlesNearlyEqual(title, full) && looksLikeMultiItemBlob(full)) {
+    title = shortTitleFromBlob(full);
+  } else if (looksLikeMultiItemBlob(title) && /[、；;]|(?:然后)|(?:还有)|(?:以及)/.test(title)) {
+    title = shortTitleFromBlob(title);
+  }
+  if (!title) title = '未命名任务';
   return simplify({
-    title: String(parsed?.title || transcript), assignee: String(parsed?.assignee || '我'),
-    due: String(parsed?.due || '今天'), priority: ['高','中','低'].includes(parsed?.priority) ? parsed.priority : '中',
+    title: title.slice(0, 80),
+    assignee: String(parsed?.assignee || '我'),
+    due: String(parsed?.due || '今天'),
+    priority: ['高', '中', '低'].includes(parsed?.priority) ? parsed.priority : '中',
     confidence: Math.max(0, Math.min(1, Number(parsed?.confidence) || 0.8)),
     estimatedMinutes: Math.max(15, Math.min(480, Math.round(Number(parsed?.estimatedMinutes) || 60)))
   });
 }
 
 function normalizeParsedTasks(parsed, transcript) {
-  const source=Array.isArray(parsed?.tasks)?parsed.tasks:Array.isArray(parsed)?parsed:[parsed?.task||parsed];
-  const tasks=source.filter(item=>item&&typeof item==='object'&&String(item.title||'').trim()).slice(0,10).map(item=>normalizeParsedTask(item,transcript));
-  return tasks.length?tasks:[normalizeParsedTask(parsed?.task||parsed,transcript)];
+  const source = Array.isArray(parsed?.tasks) ? parsed.tasks : Array.isArray(parsed) ? parsed : [parsed?.task || parsed];
+  const tasks = source
+    .filter(item => item && typeof item === 'object' && String(item.title || '').trim())
+    .slice(0, 10)
+    .map(item => normalizeParsedTask(item, transcript));
+  return tasks.length ? tasks : [normalizeParsedTask(parsed?.task || parsed, transcript)];
 }
 
 function withAi(ai, opts = {}) {
@@ -530,16 +734,35 @@ async function qwenChatForAi(ai, opts = {}, action = 'chat') {
   return data;
 }
 
-async function parseTasks(transcript, ai) {
+async function parseTasksOnce(transcript, ai, { reinforce = false } = {}) {
+  const messages = [
+    { role: 'system', content: TASK_SPLIT_SYSTEM_PROMPT },
+    { role: 'user', content: `当前日期：${new Date().toLocaleDateString('zh-CN')}\n当前用户：我\n待拆分内容：${transcript}` }
+  ];
+  if (reinforce) {
+    messages.push({ role: 'user', content: TASK_SPLIT_RETRY_PROMPT });
+  }
   const data = await qwenChatForAi(ai, {
-    messages: [
-      { role: 'system', content: '你是中文工作任务拆解助手。把一段口语整理为一个或多个独立可执行任务。一句话中出现多个并列目标、不同课程、不同交付物或先后要完成的事项时，必须拆成多项；例如“学习日语直播课、英语雅思和AI练习”应拆成3项。不要把同一个目标的普通操作步骤过度拆分。最多10项，不要虚构信息；未提负责人时写“我”，未提日期时写“今天”。每个标题只保留一个动作和一个清晰对象。根据各任务复杂度分别估算时长。只输出合法 JSON，不要 Markdown。JSON结构：tasks为数组，每项包含title字符串、assignee字符串、due简短中文、priority为高/中/低、confidence为0到1数字、estimatedMinutes为15到480之间的整数分钟数。' },
-      { role: 'user', content: `当前日期：${new Date().toLocaleDateString('zh-CN')}\n当前用户：我\n语音内容：${transcript}` }
-    ],
+    messages,
     responseFormat: { type: 'json_object' }
-  }, 'parse_tasks');
+  }, reinforce ? 'parse_tasks_retry' : 'parse_tasks');
   const parsed = parseJSON(messageText(data));
   return normalizeParsedTasks(parsed, transcript);
+}
+
+async function parseTasks(transcript, ai, initialTasks = null) {
+  const text = String(transcript || '').trim();
+  let tasks = Array.isArray(initialTasks) && initialTasks.length
+    ? initialTasks.slice(0, 10).map(item => normalizeParsedTask(item, text))
+    : await parseTasksOnce(text, ai);
+  if (needsResplit(tasks, text)) {
+    tasks = await parseTasksOnce(text, ai, { reinforce: true });
+  }
+  if (needsResplit(tasks, text)) {
+    const heuristic = heuristicSplitTranscript(text, tasks[0]);
+    if (heuristic.length >= 2) tasks = heuristic;
+  }
+  return tasks.slice(0, 10);
 }
 
 async function parseVoiceCommand(transcript, availableTasks = [], reports = {}, ai) {
@@ -556,7 +779,7 @@ async function parseVoiceCommand(transcript, availableTasks = [], reports = {}, 
   };
   const data = await qwenChatForAi(ai, {
     messages: [
-      { role: 'system', content: '你是中文工作助手的统一语音指令解析器。先判断用户意图属于哪一类：1) edit_report：修改今日复盘/日报、本周周报、本月月报（含小结、亮点、风险、明日/下周/下月计划等表述）；2) create：新建待办任务；3) update：修改已有任务；4) clarify：目标不明确。提及“今日复盘/今日小结/日报/明天建议”→reportKind=daily；“周报/本周复盘/下周计划”→weekly；“月报/本月复盘/下月计划”→monthly。若同时像任务又像复盘，优先看是否明确点名复盘/周报/月报。edit_report 时 instruction 写清具体修改意见。修改任务时只能使用候选任务真实 id，不明确则 clarify。新建任务最多10项。只输出合法JSON，不要Markdown。JSON字段：action为create/update/clarify/edit_report；reportKind为daily/weekly/monthly或空；instruction字符串；updates数组(targetTaskId,changes)；tasks新建数组；message简短中文；confidence为0到1。' },
+      { role: 'system', content: '你是中文工作助手的统一语音指令解析器。先判断用户意图属于哪一类：1) edit_report：修改今日复盘/日报、本周周报、本月月报（含小结、亮点、风险、明日/下周/下月计划等表述）；2) create：新建待办任务；3) update：修改已有任务；4) clarify：目标不明确。提及“今日复盘/今日小结/日报/明天建议”→reportKind=daily；“周报/本周复盘/下周计划”→weekly；“月报/本月复盘/下月计划”→monthly。若同时像任务又像复盘，优先看是否明确点名复盘/周报/月报。edit_report 时 instruction 写清具体修改意见。修改任务时只能使用候选任务真实 id，不明确则 clarify。create 时：多个并列目标/不同交付物必须拆成多项（最多10项），每项 title 短而可执行，不要把整段语音原文当作一条 title，去掉嗯/那个等填充词。只输出合法JSON，不要Markdown。JSON字段：action为create/update/clarify/edit_report；reportKind为daily/weekly/monthly或空；instruction字符串；updates数组(targetTaskId,changes)；tasks新建数组；message简短中文；confidence为0到1。' },
       { role: 'user', content: `当前日期：${new Date().toLocaleDateString('zh-CN')}\n当前用户：我\n已有复盘：${JSON.stringify(reportMeta)}\n候选任务：${JSON.stringify(tasks)}\n语音指令：${transcript}` }
     ],
     responseFormat: { type: 'json_object' }
@@ -590,7 +813,9 @@ async function parseVoiceCommand(transcript, availableTasks = [], reports = {}, 
     return { action: 'clarify', targetTaskId: null, changes: {}, message: '没有找到唯一的目标任务，请说出更完整的任务名称和修改内容', confidence: 0 };
   }
   if (parsed.action === 'clarify') return simplify({ action: 'clarify', targetTaskId: null, changes: {}, message: String(parsed.message || '请说出要新建的任务，或说明要修改哪条任务/哪份复盘'), confidence: Math.max(0, Math.min(1, Number(parsed.confidence) || 0)) });
-  const createdTasks=normalizeParsedTasks(parsed,transcript);
+  // create：与照片共用 parseTasks 强拆分（含重试/启发式），避免整段 ASR 落成一条 title
+  const initialCreate = normalizeParsedTasks(parsed, transcript);
+  const createdTasks = await parseTasks(transcript, ai, initialCreate);
   return { action: 'create', targetTaskId: null, changes: {}, tasks: createdTasks, task: createdTasks[0], message: String(parsed.message || `创建${createdTasks.length}项任务`), confidence: Math.max(0, Math.min(1, Number(parsed.confidence) || Number(createdTasks[0]?.confidence) || 0.8)) };
 }
 
@@ -626,36 +851,47 @@ async function transcribeAudio(buffer, mime = 'audio/webm', availableTasks = [],
 }
 
 async function parseTasksFromImage(buffer, mime = 'image/jpeg', ai) {
+  // DeepSeek / 纯文本模型会拒绝 image_url（unknown variant `image_url`, expected `text`）
+  assertVisionCapable(ai);
   const type = String(mime || 'image/jpeg').split(';')[0].trim() || 'image/jpeg';
   const dataUrl = `data:${type};base64,${buffer.toString('base64')}`;
   let data;
   try {
+    // 识别：DashScope OpenAI 兼容格式 image_url + data URL；先抽文字，不落成一条胖 title
     data = await qwenChatForAi(ai, {
       timeoutMs: 120_000,
       messages: [
-        { role: 'system', content: '你是中文工作任务识别助手。用户会上传周报、月报、手写便签或工作清单的照片。请从图片中识别需要执行的工作任务，整理为独立可执行待办。只提取待办任务，不要把已完成事项、总结性描述或纯背景信息当成任务。未提负责人时写“我”，未提日期时根据报表周期写“本周”“本月”或“今天”。最多10项，不要虚构。只输出合法 JSON，不要 Markdown。JSON结构：tasks为数组，每项包含title字符串、assignee字符串、due简短中文、priority为高/中/低、confidence为0到1数字、estimatedMinutes为15到480之间的整数分钟数。' },
+        { role: 'system', content: '你是中文工作清单识别助手。用户会上传周报、月报、手写便签、Excel 计划表或工作清单的照片。请识别图中需要执行的工作内容，整理为纯文本。表格/编号列表请逐条放入 items；整段文字放入 text，多项用换行或顿号分开。只提取待办，不要已完成事项、总结性描述、表头或纯背景。不要虚构。只输出合法 JSON，不要 Markdown。JSON结构：text为识别出的完整待办文字；items为字符串数组（每条一个短待办标题）。' },
         { role: 'user', content: [
           { type: 'image_url', image_url: { url: dataUrl } },
-          { type: 'text', text: `当前日期：${new Date().toLocaleDateString('zh-CN')}\n当前用户：我\n请识别图中的工作任务。` }
+          { type: 'text', text: `当前日期：${new Date().toLocaleDateString('zh-CN')}\n当前用户：我\n请识别图中的工作待办文字，多项请拆开列出。` }
         ] }
       ],
       responseFormat: { type: 'json_object' }
-    }, 'parse_photo_tasks');
+    }, 'recognize_photo_text');
   } catch (error) {
     const raw = error?.message || '';
-    if (/InvalidParameter|does not support this input|does not support.*(image|vision|multimodal)|vision|multimodal/i.test(raw)) {
-      throw new Error('当前模型无法识别图片。请在「设置 → 大模型」切换到通义千问等视觉模型后再试');
+    if (/unknown variant.*image_url|expected [`']?text[`']?|InvalidParameter|does not support this input|does not support.*(image|vision|multimodal)|vision|multimodal|image_url/i.test(raw)) {
+      throw new Error(VISION_UNSUPPORTED_MESSAGE);
     }
     throw error;
   }
-  const parsed = parseJSON(messageText(data));
-  const source = Array.isArray(parsed?.tasks) ? parsed.tasks : Array.isArray(parsed) ? parsed : [parsed?.task || parsed];
-  const tasks = source
-    .filter(item => item && typeof item === 'object' && String(item.title || '').trim())
-    .slice(0, 10)
-    .map(item => normalizeParsedTask(item, ''));
+  const recognized = parseJSON(messageText(data));
+  const ocrItems = Array.isArray(recognized?.items)
+    ? recognized.items.map(item => cleanListItemTitle(item)).filter(part => part.length >= 2).slice(0, 10)
+    : [];
+  const itemText = ocrItems.join('\n');
+  const transcript = convertToSimplified(String(recognized?.text || itemText || '').trim());
+  if (!transcript) throw new Error('没有从图片中识别到可执行的工作任务，请拍更清晰的周报、月报或清单后再试');
+  const initialFromOcr = ocrItems.length >= 2
+    ? ocrItems.map(title => ({ title, assignee: '我', due: '今天', priority: '中', confidence: 0.85, estimatedMinutes: 60 }))
+    : null;
+  // 理解 → 拆分：与语音 create 共用 parseTasks
+  let tasks = await parseTasks(transcript, ai, initialFromOcr);
+  if (needsResplit(tasks, transcript) && ocrItems.length >= 2) {
+    tasks = ocrItems.map(title => normalizeParsedTask({ title, confidence: 0.8, estimatedMinutes: 60 }, ''));
+  }
   if (!tasks.length) throw new Error('没有从图片中识别到可执行的工作任务，请拍更清晰的周报、月报或清单后再试');
-  const transcript = convertToSimplified(tasks.map(item => item.title).join('；'));
   return {
     transcript,
     command: {
@@ -674,8 +910,8 @@ async function parseTasksFromImage(buffer, mime = 'image/jpeg', ai) {
 
 function voiceErrorMessage(error) {
   const message = error?.message || '';
-  if (/does not support.*(image|vision|multimodal)|vision.*(not support|unsupported)|image.*(not support|unsupported)|invalid.*image|content.*image/i.test(message)) {
-    return '当前模型无法识别图片。请在「设置 → 大模型」切换到通义千问等视觉模型后再试';
+  if (message.includes('识图') || message.includes('通义千问') || /unknown variant.*image_url|expected [`']?text[`']?|does not support.*(image|vision|multimodal)|vision.*(not support|unsupported)|image.*(not support|unsupported)|invalid.*image|content.*image|image_url/i.test(message)) {
+    return message.includes('管理员') ? message : VISION_UNSUPPORTED_MESSAGE;
   }
   if (/InvalidParameter|does not support this input/i.test(message)) return '语音模型无法读取这段录音，请重新录制后再试';
   return message || '语音识别失败';
@@ -1009,12 +1245,27 @@ async function processVoiceJob(id) {
     if (!ai.textApiKey) throw new Error('管理员尚未配置内置大模型 API Key');
     job.status = 'processing';
     job.error = '';
+    job.notice = '';
     let result;
     if (job.imageFile || job.source === 'photo') {
+      const vision = await resolveVisionAiForJob(job.userId, ai);
+      const visionAi = vision.ai;
+      if (vision.switched) {
+        job.notice = vision.notice || VISION_TEMP_NOTICE;
+        job.visionModelId = vision.modelId || visionAi.modelId || '';
+        job.visionModelName = vision.modelName || visionAi.modelName || '';
+      }
       job.stage = 'recognizing';
       await persistVoiceJob(job);
       const buffer = await readFile(voiceImagePath(job));
-      result = await parseTasksFromImage(buffer, job.mime, ai);
+      result = await parseTasksFromImage(buffer, job.mime, visionAi);
+      if (vision.switched && result?.command && typeof result.command === 'object') {
+        const baseMsg = String(result.command.message || '').trim();
+        result.command = {
+          ...result.command,
+          message: baseMsg ? `${job.notice}，${baseMsg}` : job.notice
+        };
+      }
     } else if (job.audioFile) {
       if (!ai.resolveAsrKey()) throw new Error('管理员尚未配置语音识别 API Key');
       job.stage = 'transcribing';
