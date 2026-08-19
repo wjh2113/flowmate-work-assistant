@@ -12,6 +12,15 @@ export function apiFetch(input: RequestInfo | URL, init?: RequestInit) {
   return fetch(input, { ...init, credentials: 'include' });
 }
 
+/** Browser TypeError "Failed to fetch" when the API is unreachable. */
+export function describeApiError(error: unknown, fallback = '请求失败，请重试'): string {
+  const message = error instanceof Error ? error.message : String(error || '');
+  if (/failed to fetch|load failed|networkerror|network request failed|internet connection appears to be offline/i.test(message)) {
+    return '无法连接服务器，请确认服务已启动';
+  }
+  return message.trim() || fallback;
+}
+
 async function readAuthJson<T>(response: Response): Promise<T> {
   const text = await response.text();
   if (!text.trim()) return {} as T;

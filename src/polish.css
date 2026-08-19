@@ -64,6 +64,7 @@
 .home-page > .task-wrap,
 .home-page > .ai-report,
 .home-page > .voice-progress,
+.home-page > .activity,
 .home-page > .activity-empty,
 .home-page > .install {
   animation: polish-rise 0.45s ease both;
@@ -304,6 +305,62 @@
 .task p b.high {
   background: #fff1f2;
   color: #e11d48;
+}
+
+.activity {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  width: 100%;
+  margin-bottom: 10px;
+  padding: 14px 16px;
+  border-radius: 18px;
+  text-align: left;
+}
+
+.activity > i {
+  width: 36px;
+  height: 36px;
+  border-radius: 12px;
+  display: grid;
+  place-items: center;
+  flex: none;
+  background: linear-gradient(145deg, #ecfeff, #cffafe);
+  color: #0891b2;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.activity.kind-started > i {
+  background: linear-gradient(145deg, #fff7ed, #ffedd5);
+  color: #ea580c;
+}
+
+.activity.kind-done > i {
+  background: linear-gradient(145deg, #ecfdf5, #d1fae5);
+  color: #059669;
+}
+
+.activity b {
+  display: block;
+  font-size: 13px;
+  font-weight: 750;
+}
+
+.activity p {
+  margin: 4px 0 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: #475569;
+}
+
+.activity em {
+  display: block;
+  margin-top: 6px;
+  font-style: normal;
+  font-size: 11px;
+  font-weight: 650;
+  color: #94a3b8;
 }
 
 .activity-empty,
@@ -631,6 +688,7 @@ nav button.active span {
   .home-page > .task-wrap,
   .home-page > .ai-report,
   .home-page > .voice-progress,
+  .home-page > .activity,
   .home-page > .activity-empty,
   .home-page > .install {
     animation: none !important;

@@ -53,7 +53,7 @@ DATABASE_URL=postgres://flowmate:CHANGE_ME@127.0.0.1:5432/flowmate
 - 可用 `ADMIN_BOOTSTRAP_USER` / `ADMIN_BOOTSTRAP_PASSWORD_HASH` 覆盖 json。轮换哈希：把新密码通过 stdin 传给 `node scripts/hash-admin-password.mjs`（stdout 只打印 `salt:hash`），写入配置后重启服务
 - 新用户默认积分：`DEFAULT_SIGNUP_POINTS=50000`
 - 用户在「设置 → 大模型」只选择内置模型；API Key 只在 `/admin` 的「模型权重」里配置（百炼 / DeepSeek / Moonshot Kimi 各用各的 Key）
-- 每次调用按接口返回的 token 自动计费：`积分 = Token × 权重`。DeepSeek V4 Flash 为 `1.0`；切换模型前会确认权重变化
+- 每次调用按接口返回的 token 自动计费：`积分 = Token × 权重`。DeepSeek V4 Flash 为 `0.001`（约 100 万 token = 1000 积分 ≈ ¥3，1 积分 ≈ ¥0.003）；切换模型前会确认权重变化
 - 内置目录含百炼 `qwen3.8-max`（DashScope 目前仅有 3.8 Max，无 3.8 Flash/Plus）和 Moonshot `kimi-k2.6` / `kimi-k2.7-code` / `kimi-k3`（`https://api.moonshot.cn/v1`）
 
 ## 可选：Supabase 云端存储

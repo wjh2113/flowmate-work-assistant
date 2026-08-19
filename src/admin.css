@@ -40,8 +40,10 @@
 .admin-user-role{font-size:11px;font-weight:700;color:var(--muted)}
 .admin-user-points{display:grid;gap:6px}
 .admin-user-points .admin-points-yuan{margin-top:0;line-height:1.4}
-.admin-usage-row{display:grid;gap:4px;padding:12px 0;border-bottom:1px solid rgba(15,23,42,.06)}
+.admin-usage-head,.admin-usage-row{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,2fr) auto auto;gap:8px 12px;align-items:center;padding:12px 0;border-bottom:1px solid rgba(15,23,42,.06)}
+.admin-usage-head{padding-top:0;padding-bottom:8px;font-size:10px;font-weight:700;color:var(--muted)}
 .admin-usage-row span,.admin-usage-row em{color:var(--muted);font-size:11px;font-style:normal}
+.admin-usage-yuan{font-variant-numeric:tabular-nums;color:#267c5c!important;font-weight:600;white-space:nowrap}
 .admin-page .settings-loading{padding:45px 0;text-align:center;color:var(--muted);font-size:12px}
 .admin-page .settings-error{margin-top:14px;padding:10px 12px;border-radius:11px;background:#fff0ed;color:#b85542;font-size:10px}
 .admin-page .settings-success{margin-top:14px;padding:10px 12px;border-radius:11px;background:#eaf7f1;color:#267c5c;font-size:10px}

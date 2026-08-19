@@ -50,18 +50,34 @@ type Dashboard = {
   totalPoints: number;
 };
 
+const FLASH_BASELINE_WEIGHT = 0.001;
+const FLASH_YUAN_PER_MILLION = 3;
+
+function formatWeightLabel(weight: number) {
+  const n = Math.round((Number(weight) || 0) * 1e5) / 1e5;
+  if (!Number.isFinite(n)) return '0';
+  return n.toFixed(5).replace(/\.?0+$/, '') || '0';
+}
+
 function formatWeightEstimate(weight: number) {
-  const yuan = Math.round((Number(weight) || 0) * 3 * 1000) / 1000;
+  const yuan = Math.round(((Number(weight) || 0) / FLASH_BASELINE_WEIGHT) * FLASH_YUAN_PER_MILLION * 1000) / 1000;
   return `预估：百万 token ≈ ¥${yuan}（按 DeepSeek Flash 闲时单价折算）`;
 }
 
-/** Display-only: Flash 闲时 100万 token = 100万积分 ≈ ¥3 → 1 积分 ≈ ¥0.000003. Does not change billing. */
-const YUAN_PER_POINT = 3 / 1_000_000;
+/** Display-only: Flash 闲时 100万 token = 1000 积分 ≈ ¥3 → 1 积分 ≈ ¥0.003. Does not change billing. */
+const YUAN_PER_POINT = 3 / 1000;
 
 function formatYuanAmount(yuan: number) {
   if (!Number.isFinite(yuan)) return '0';
   const fixed = yuan.toFixed(6).replace(/\.?0+$/, '');
   return fixed || '0';
+}
+
+/** Usage yuan from tokens × weight (independent of points scale in stored logs). */
+function estimateUsageYuan(totalTokens: number, weight: number) {
+  const tokens = Number(totalTokens) || 0;
+  const w = Number(weight) || 0;
+  return (tokens * w * FLASH_YUAN_PER_MILLION) / (1_000_000 * FLASH_BASELINE_WEIGHT);
 }
 
 function AdminUserPointsField({
@@ -350,7 +366,7 @@ export default function AdminPage({ initialTab = 'models' }: { initialTab?: 'ove
                 <button type="button" className="admin-add" onClick={() => {
                   openEditor({
                     id: `model-${Date.now()}`, name: '新模型', provider: 'bailian', baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-                    textModel: 'qwen3.7-plus', asrModel: 'qwen3-asr-flash', weight: 1, badge: '', sortOrder: 100, enabled: true, kind: 'text', textApiKey: '', asrApiKey: ''
+                    textModel: 'qwen3.7-plus', asrModel: 'qwen3-asr-flash', weight: 0.001, badge: '', sortOrder: 100, enabled: true, kind: 'text', textApiKey: '', asrApiKey: ''
                   });
                 }}>＋ 新增模型</button>
                 <div className="model-picker-list admin-model-list">
@@ -360,7 +376,7 @@ export default function AdminPage({ initialTab = 'models' }: { initialTab?: 'ove
                         <b>{m.name}</b>
                         <span>{m.textModel} · {m.provider}{m.badge ? ` · ${m.badge}` : ''}{m.enabled ? '' : ' · 已停用'}{m.lastTestOk ? ' · 已验证' : ' · 未验证'}</span>
                       </div>
-                      <em>{Number(m.weight).toFixed(3)}x</em>
+                      <em>{formatWeightLabel(m.weight)}x</em>
                       <button type="button" onClick={() => openEditor({ ...m, textApiKey: '', asrApiKey: '' })}>编辑</button>
                       <button type="button" className="danger" onClick={() => void removeModel(m.id)}>删</button>
                     </div>
@@ -374,7 +390,7 @@ export default function AdminPage({ initialTab = 'models' }: { initialTab?: 'ove
                     <label>显示名称</label>
                     <input className="input" value={editing.name} onChange={(e) => setEditing({ ...editing, name: e.target.value })} />
                     <label>权重（积分 = Token × 权重）</label>
-                    <input className="input" type="number" step="0.001" min="0" value={editing.weight} onChange={(e) => {
+                    <input className="input" type="number" step="any" min="0" value={editing.weight} onChange={(e) => {
                       setPriceHint(null);
                       setEditing({ ...editing, weight: Number(e.target.value) });
                     }} />
@@ -424,7 +440,7 @@ export default function AdminPage({ initialTab = 'models' }: { initialTab?: 'ove
             )}
             {tab === 'users' && (
               <div className="admin-users">
-                <p className="field-help admin-points-rate-hint">折算参考：DeepSeek Flash 闲时百万 token ≈ ¥3（仅展示，不改计费）</p>
+                <p className="field-help admin-points-rate-hint">折算参考：Flash 闲时百万 token ≈ ¥3 = 1000 积分，1 积分 ≈ ¥0.003，100 万积分 ≈ ¥3000（仅展示，不改计费）</p>
                 {users.map((u) => (
                   <div className="admin-user-card" key={u.id}>
                     <div><b>{u.name || u.email}</b><span>{u.email}</span></div>
@@ -439,10 +455,19 @@ export default function AdminPage({ initialTab = 'models' }: { initialTab?: 'ove
             )}
             {tab === 'usage' && (
               <div className="admin-usage">
+                {!!usage.length && (
+                  <div className="admin-usage-head">
+                    <span>模型</span>
+                    <span>详情</span>
+                    <span>人民币</span>
+                    <span>时间</span>
+                  </div>
+                )}
                 {usage.map((item) => (
                   <div className="admin-usage-row" key={item.id}>
                     <b>{item.modelName || item.action}</b>
                     <span>{item.action} · {item.totalTokens} tokens · {item.points} 积分 · {item.weight}x</span>
+                    <span className="admin-usage-yuan">≈ ¥{formatYuanAmount(estimateUsageYuan(item.totalTokens, item.weight))}</span>
                     <em>{item.createdAt?.slice(0, 19)?.replace('T', ' ')}</em>
                   </div>
                 ))}

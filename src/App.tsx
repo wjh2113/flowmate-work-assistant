@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Session } from '@supabase/supabase-js';
 import { cloudConfigured, deleteDailyReport, deletePeriodReport, deleteTask, getSession, getWorkspace, listPeriodReports, listTasks, loadDailyReport, loadPeriodReport, saveDailyReport, savePeriodReport, sendMagicLink, supabase, updateTask, upsertTask, type CloudTask } from './cloud';
-import { apiFetch, getLocalUser, loginLocalUser, logoutLocalUser, registerLocalUser, type LocalUser } from './localAuth';
+import { apiFetch, describeApiError, getLocalUser, loginLocalUser, logoutLocalUser, registerLocalUser, type LocalUser } from './localAuth';
 import { deleteFileDailyReport, deleteFilePeriodReport, deleteFileTask, listFilePeriodReports, listFileTasks, loadFileDailyReport, loadFilePeriodReport, patchFileTask, saveFileDailyReport, saveFilePeriodReport, saveFileTask, type PeriodReportMeta } from './localStore';
 import GuidePage from './GuidePage';
 import { toSimplified } from './chinese';
@@ -13,7 +13,8 @@ type Status = 'todo' | 'doing' | 'done';
 type Priority = '高' | '中' | '低';
 type ReportKind = 'daily' | 'weekly' | 'monthly';
 type Task = { id:string; title:string; assignee:string; due:string; status:Status; priority:Priority; progress:number; estimatedMinutes:number; createdAt?:string; startedAt?:string; completedAt?:string; aiStatus?:'pending'|'failed' };
-type ParsedTask = { title:string; assignee:string; due:string; priority:Priority; confidence:number; estimatedMinutes?:number };
+type TeamActivity = { id:string; kind:'created'|'started'|'done'; assignee:string; title:string; at:string };
+type ParsedTask = { title:string; assignee:string; due:string; priority:Priority; confidence:number; estimatedMinutes?:number; createdAt?:string };
 type VoiceTaskChanges = Partial<Pick<Task,'title'|'assignee'|'due'|'priority'|'status'|'estimatedMinutes'>>;
 type VoiceUpdate={targetTaskId:string;changes:VoiceTaskChanges};
 type VoiceCommand = { action:'create'|'update'|'clarify'|'edit_report'; updates?:VoiceUpdate[]; targetTaskId:string|null; changes:VoiceTaskChanges; tasks?:ParsedTask[]; task?:ParsedTask; reportKind?:ReportKind; instruction?:string; message?:string; confidence:number };
@@ -310,7 +311,7 @@ export default function App(){
     removeVoiceProgress(job.id);
     if(!parsedTasks.length){finishVoicePolling(job.id);notify('没有识别到可执行的任务指令');return}
     const now=new Date().toISOString();
-    const created=parsedTasks.slice(0,10).map((parsed,index):Task=>({id:index===0?job.id:`${job.id}-${index+1}`,title:parsed.title||job.transcript||(job.source==='photo'?'拍照任务':'语音任务'),assignee:parsed.assignee||'我',due:parsed.due||'今天',status:'todo',priority:parsed.priority||'中',progress:0,estimatedMinutes:parsed.estimatedMinutes||defaultEstimate(parsed.priority||'中'),createdAt:index===0?(job.createdAt||now):now}));
+    const created=parsedTasks.slice(0,10).map((parsed,index):Task=>({id:index===0?job.id:`${job.id}-${index+1}`,title:parsed.title||job.transcript||(job.source==='photo'?'拍照任务':'语音任务'),assignee:parsed.assignee||'我',due:parsed.due||'今天',status:'todo',priority:parsed.priority||'中',progress:0,estimatedMinutes:parsed.estimatedMinutes||defaultEstimate(parsed.priority||'中'),createdAt:parsed.createdAt||(index===0?(job.createdAt||now):now)}));
     setTasks(items=>[...created,...items.filter(item=>item.id!==job.id)]);created.forEach(syncVoiceTask);setAiReady(true);finishVoicePolling(job.id);if(created.length>1)goTab('tasks');notify(created.length>1?`已拆解 ${created.length} 项，以下为全部任务`:(job.source==='photo'?(job.notice?`${job.notice}，任务已创建`:'照片任务已创建'):'语音任务已创建'));
   };
   const failVoiceJob=(job:VoiceJob)=>{
@@ -413,6 +414,7 @@ export default function App(){
 
   const realTasks=useMemo(()=>tasks.filter(isRealTask),[tasks]);
   const stats=useMemo(()=>({mine:realTasks.filter(t=>t.assignee==='我').length,done:realTasks.filter(t=>t.assignee==='我'&&t.status==='done').length,follow:realTasks.filter(t=>t.assignee!=='我'&&t.status!=='done').length}),[realTasks]);
+  const teamActivity=useMemo(()=>buildTeamActivity(realTasks),[realTasks]);
   const addTask=(text=title,parsed?:ParsedTask|null)=>{
     if(!text.trim())return;const p=parsed||null;const priority=p?.priority||'中';const task:Task=toSimplified({id:crypto.randomUUID(),title:p?.title||text.trim(),assignee:p?.assignee||assignee,due:p?.due||'今天',status:'todo',priority,progress:0,estimatedMinutes:p?.estimatedMinutes||estimate||defaultEstimate(priority),createdAt:new Date().toISOString()});
     setTasks(v=>[task,...v]);setTitle('');setEstimate(60);setTranscript('');setParsedTask(null);setModal(null);notify('任务已创建');
@@ -573,7 +575,7 @@ export default function App(){
       upsertVoiceProgress({id:job.id,title:'照片任务识别中…',stage:'AI后台处理中',status:'pending',createdAt:job.createdAt||new Date().toISOString()});
       rememberVoiceJob(job.id);pollVoiceJob(job.id);goTab('home');
       setModal(null);notify('照片已提交，AI 将在后台识别任务');
-    }catch(error){notify(error instanceof Error?error.message:'图片识别提交失败，请重试')}
+    }catch(error){notify(describeApiError(error,'图片识别提交失败，请重试'))}
     finally{setProcessing(false)}
   };
 
@@ -634,7 +636,7 @@ export default function App(){
       <Title text="优先处理" action="查看全部 ›" onClick={()=>goTab('tasks')}/>
       {realTasks.filter(t=>t.status!=='done').slice(0,3).map(t=><TaskItem key={t.id} task={t} cycle={cycle} remove={removeTask} now={clock}/>)}
       <Title text="团队动态" action="全部动态" onClick={()=>goTab('team')}/>
-      <div className="empty activity-empty">团队动态稍后会出现在这里</div>
+      {teamActivity.length?teamActivity.slice(0,4).map(item=><ActivityCard key={item.id} item={item} now={clock} onClick={()=>goTab('team')}/>):<div className="empty activity-empty">把任务分给同事后，动态会出现在这里</div>}
       <Title text="今日复盘" action={report?'更新':'生成'} onClick={()=>void generateReport()}/>
       <AIReport report={report} loading={reportLoading} error={reportError} aiReady={aiReady} generate={()=>void generateReport()} addTomorrow={addTomorrow} openSettings={()=>setModal('settings')} editPending={editPending.daily} onRetryEdit={()=>void retryReportEditJob('daily')}/>
       <Title text="本周周报" action={weeklyReport?'更新':'生成'} onClick={()=>void generateWeeklyReport()}/>
@@ -671,6 +673,28 @@ function AIPeriodReport({kind,report,loading,error,aiReady,generate,addNext,open
   return <section className={'ai-report full'+(editPending?' editing':'')}><div className="report-top"><div className="ai-orb">{editPending&&!editPending.error?'…':'✦'}</div><div><small>{label}复盘 · {rangeLabel}{editPending?` · ${editPending.error?'改稿失败':editPending.stage}`:''}</small><h3>{report.headline}</h3></div></div>{editPending?.error&&<p className="report-edit-error">{editPending.error} <button type="button" onClick={onRetryEdit}>重试</button></p>}<p className="report-summary">{report.summary}</p>{report.highlights.length>0&&<div className="report-block"><b>亮点</b>{report.highlights.map(x=><span key={x}>✓ {x}</span>)}</div>}{report.risks.length>0&&<div className="report-block risks"><b>需要关注</b>{report.risks.map(x=><span key={x}>! {x}</span>)}</div>}<div className="tomorrow-head"><b>{nextLabel}计划</b><span>{report.next.length} 项</span></div>{report.next.map((x,i)=><div className="tomorrow" key={`${x.title}-${i}`}><i>{i+1}</i><div><b>{x.title}</b><p>{x.suggestedTime} · {x.reason}</p></div><em>{x.priority}</em></div>)}{addNext&&<div className="report-actions"><button className="add-plan" type="button" onClick={addNext}>＋ 加入{nextLabel}任务</button></div>}</section>;
 }
 function Title({text,action,onClick}:{text:string;action:string;onClick?:()=>void}){return <div className="section-title"><h2>{text}</h2>{onClick?<button type="button" onClick={onClick}>{action}</button>:<span>{action}</span>}</div>}
+function activityKindLabel(kind:TeamActivity['kind']){return kind==='done'?'完成了任务':kind==='started'?'开始处理':'新建了任务'}
+function formatActivityTime(value:string,now:number){
+  const ts=Date.parse(value);if(!Number.isFinite(ts))return'刚刚';
+  const diff=Math.max(0,now-ts);
+  if(diff<60_000)return'刚刚';
+  if(diff<3_600_000)return `${Math.floor(diff/60_000)}分钟前`;
+  const date=new Date(ts);const sameDay=new Date(now).toDateString()===date.toDateString();
+  const hh=String(date.getHours()).padStart(2,'0');const mi=String(date.getMinutes()).padStart(2,'0');
+  if(sameDay)return `今天 ${hh}:${mi}`;
+  return `${String(date.getMonth()+1).padStart(2,'0')}-${String(date.getDate()).padStart(2,'0')} ${hh}:${mi}`;
+}
+function buildTeamActivity(tasks:Task[]):TeamActivity[]{
+  return tasks.filter(t=>t.assignee!=='我').map(t=>{
+    const kind:TeamActivity['kind']=t.status==='done'?'done':t.status==='doing'?'started':'created';
+    const at=kind==='done'?(t.completedAt||t.startedAt||t.createdAt||''):kind==='started'?(t.startedAt||t.createdAt||''):(t.createdAt||t.startedAt||t.completedAt||'');
+    return {id:t.id,kind,assignee:t.assignee||'同事',title:t.title,at};
+  }).sort((a,b)=>(Date.parse(b.at)||0)-(Date.parse(a.at)||0));
+}
+function ActivityCard({item,now,onClick}:{item:TeamActivity;now:number;onClick:()=>void}){
+  const initial=(item.assignee||'同').slice(0,1);
+  return <button type="button" className={'activity kind-'+item.kind} onClick={onClick}><i aria-hidden="true">{initial}</i><div><b>{item.assignee} {activityKindLabel(item.kind)}</b><p>{item.title}</p><em>{formatActivityTime(item.at,now)}</em></div></button>;
+}
 function MicIcon(){return <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="2" width="8" height="13" rx="4" fill="currentColor"/><path d="M5 11a7 7 0 0 0 14 0M12 18v4M8 22h8" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/></svg>}
 function CameraIcon(){return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 8.5h3l1.4-2h6.2l1.4 2H19.5A1.5 1.5 0 0 1 21 10v8.5a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 18.5V10a1.5 1.5 0 0 1 1.5-1.5z" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round"/><circle cx="12" cy="14.2" r="3.1" fill="none" stroke="currentColor" strokeWidth="1.8"/></svg>}
 function AlbumIcon(){return <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="5" width="16" height="14" rx="2.4" fill="none" stroke="currentColor" strokeWidth="1.8"/><path d="m7.2 15.2 3-3.2 2.4 2.4 2.2-2.6 2.8 3.4" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/><circle cx="9" cy="9.2" r="1.1" fill="currentColor"/></svg>}
@@ -950,6 +974,12 @@ const TEXT_MODEL_LABELS:Record<string,string>={
 
 type BuiltinModelOption={id:string;name:string;provider:string;textModel:string;weight:number;badge?:string;costHint?:string;switchConfirm?:string};
 
+function formatWeightLabel(weight:number){
+  const n=Math.round((Number(weight)||0)*1e5)/1e5;
+  if(!Number.isFinite(n))return '0';
+  return n.toFixed(5).replace(/\.?0+$/,'')||'0';
+}
+
 function ModelSettings({onClose,onSaved,askConfirm}:{onClose:()=>void;onSaved:()=>void;askConfirm?:(message:string,options?:{title?:string;confirmLabel?:string;cancelLabel?:string;danger?:boolean})=>Promise<boolean>}){
   const [loading,setLoading]=useState(true);
   const [saving,setSaving]=useState(false);
@@ -976,8 +1006,9 @@ function ModelSettings({onClose,onSaved,askConfirm}:{onClose:()=>void;onSaved:()
     if(modelId===selectedModelId)return;
     const model=models.find(m=>m.id===modelId);
     if(!model)return;
-    const weight=Number(model.weight).toFixed(3);
-    const confirmText=model.switchConfirm||`切换到 ${model.name} 后，积分 = Token × ${weight}（Flash 权重 1.0，约 100 万 token = 100 万积分 ≈ ¥3；当前权重 ${weight}，相对 Flash 为 ${weight} 倍）。确定？`;
+    const weight=formatWeightLabel(model.weight);
+    const rel=formatWeightLabel(Number(model.weight)/0.001);
+    const confirmText=model.switchConfirm||`切换到 ${model.name} 后，积分 = Token × ${weight}（Flash 权重 0.001，约 100 万 token = 1000 积分 ≈ ¥3；1 积分 ≈ ¥0.003。当前权重 ${weight}，相对 Flash 为 ${rel} 倍）。确定？`;
     const ok=askConfirm
       ? await askConfirm(confirmText,{title:'切换模型',confirmLabel:'确定'})
       : window.confirm(confirmText);
@@ -991,7 +1022,7 @@ function ModelSettings({onClose,onSaved,askConfirm}:{onClose:()=>void;onSaved:()
       setPointsBalance(Number(data.pointsBalance||0));
       setCurrentName(String(data.current?.name||''));
       setConfigured(Boolean(data.configured||data.textConfigured));
-      const hint=data.current?.costHint||data.costHint||`该模型权重 ${weight}（Flash 权重 1.0，约 100 万 token = 100 万积分 ≈ ¥3；当前权重 ${weight}，相对 Flash 为 ${weight} 倍）`;
+      const hint=data.current?.costHint||data.costHint||`该模型权重 ${weight}（Flash 权重 0.001，约 100 万 token = 1000 积分 ≈ ¥3；1 积分 ≈ ¥0.003，100 万积分 ≈ ¥3000。当前权重 ${weight}，相对 Flash 为 ${rel} 倍）`;
       setSuccess(data.message||`已切换。${hint}`);
       onSaved();
     }catch(e){setError(e instanceof Error?e.message:'切换失败')}
@@ -1013,12 +1044,12 @@ function ModelSettings({onClose,onSaved,askConfirm}:{onClose:()=>void;onSaved:()
         const active=model.id===selectedModelId;
         return <button type="button" key={model.id} className={'model-picker-item'+(active?' active':'')} disabled={saving} onClick={()=>void select(model.id)}>
           <div><b>{model.name}</b><span>{model.badge?`${model.badge} · `:''}{model.textModel}</span></div>
-          <em>{Number(model.weight).toFixed(3)}x</em>
+          <em>{formatWeightLabel(model.weight)}x</em>
         </button>;
       })}
       {!models.length&&<div className="empty">暂无可用模型。需管理员启用、配置密钥，并在后台「测试可用性」通过。</div>}
     </div>
-    <p className="field-help">积分 = Token × 权重（Flash 权重 1.0，约 100 万 token = 100 万积分 ≈ ¥3；当前权重 x，相对 Flash 为 x 倍）。切换前会确认消耗变化。仅显示已启用、已配置密钥且通过可用性测试的模型。</p>
+    <p className="field-help">积分 = Token × 权重（Flash 权重 0.001，约 100 万 token = 1000 积分 ≈ ¥3；1 积分 ≈ ¥0.003，100 万积分 ≈ ¥3000）。切换前会确认消耗变化。仅显示已启用、已配置密钥且通过可用性测试的模型。</p>
     {success&&<div className="settings-success">✓ {success}</div>}
     {error&&<div className="settings-error">{error}</div>}
     <div className="settings-actions cloud-actions"><button type="button" disabled={testing||saving||!configured} onClick={()=>void test()}>{testing?'正在测试…':'测试当前模型'}</button><button type="button" onClick={onClose}>完成</button></div>

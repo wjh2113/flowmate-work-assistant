@@ -4,6 +4,8 @@
  */
 
 export const FLASH_YUAN_PER_MILLION = 3;
+/** Must match billing FLASH_BASELINE_WEIGHT: 1M Flash tokens = 1000 points ≈ ¥3. */
+export const FLASH_BASELINE_WEIGHT = 0.001;
 
 const FETCH_MS = 12000;
 
@@ -14,7 +16,8 @@ function fmtYuan(n) {
 
 export function estimateYuanFromWeight(weight) {
   const w = Math.max(0, Number(weight) || 0);
-  return Math.round(w * FLASH_YUAN_PER_MILLION * 1000) / 1000;
+  const flash = FLASH_BASELINE_WEIGHT || 0.001;
+  return Math.round((w / flash) * FLASH_YUAN_PER_MILLION * 1000) / 1000;
 }
 
 function blend11(input, output) {

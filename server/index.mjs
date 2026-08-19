@@ -31,7 +31,7 @@ import {
   setUserSelectedModel,
   updateUserAdmin
 } from './billing.mjs';
-import { estimateModelPrice, weightEstimateMessage } from './model-prices.mjs';
+import { estimateModelPrice, estimateYuanFromWeight, weightEstimateMessage } from './model-prices.mjs';
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -491,7 +491,7 @@ function isPeriodKey(kind, key) {
   return false;
 }
 
-const TASK_SPLIT_SYSTEM_PROMPT = '你是中文工作任务拆解助手。把一段口语、清单或识别文字整理为一个或多个独立可执行任务。一句话中出现多个并列目标、不同课程、不同交付物或先后要完成的事项时，必须拆成多项；例如“学习日语直播课、英语雅思和AI练习”应拆成3项。标题要短（一般不超过20字），去掉“嗯”“那个”“就是”等口语填充词，不要把整段转写原文当作标题。不要把同一个目标的普通操作步骤过度拆分。最多10项，不要虚构信息；未提负责人时写“我”，未提日期时写“今天”。每个标题只保留一个动作和一个清晰对象。根据各任务复杂度分别估算时长。只输出合法 JSON，不要 Markdown。JSON结构：tasks为数组，每项包含title字符串、assignee字符串、due简短中文、priority为高/中/低、confidence为0到1数字、estimatedMinutes为15到480之间的整数分钟数。';
+const TASK_SPLIT_SYSTEM_PROMPT = '你是中文工作任务拆解助手。把一段口语、清单或识别文字整理为一个或多个独立可执行任务。一句话中出现多个并列目标、不同课程、不同交付物或先后要完成的事项时，必须拆成多项；例如“学习日语直播课、英语雅思和AI练习”应拆成3项。标题要短（一般不超过20字），去掉“嗯”“那个”“就是”等口语填充词，不要把整段转写原文当作标题。不要把同一个目标的普通操作步骤过度拆分。最多10项，不要虚构信息；未提负责人时写“我”。日期：图中或文字里写明的日期（含已经过去的日期，如 8月12日、2026-08-12、上周三）必须写入 due，不要改成“今天”；仅当完全未提及日期时写“今天”。每个标题只保留一个动作和一个清晰对象。根据各任务复杂度分别估算时长。只输出合法 JSON，不要 Markdown。JSON结构：tasks为数组，每项包含title字符串、assignee字符串、due简短中文、priority为高/中/低、confidence为0到1数字、estimatedMinutes为15到480之间的整数分钟数。';
 const TASK_SPLIT_RETRY_PROMPT = '上一次结果把整段内容揉成了一条任务。请重新拆分：凡是并列事项、顿号列举、或“然后/还有/以及”连接的不同目标，都必须拆成多项；每项标题短而可执行，不要复述全文。';
 
 function compactText(value) {
@@ -552,6 +552,63 @@ function cleanListItemTitle(part) {
   );
 }
 
+function extractDueFromText(text) {
+  const s = String(text || '');
+  const match = s.match(/(\d{4}\s*年\s*)?\d{1,2}\s*月\s*\d{1,2}\s*日|\d{4}-\d{1,2}-\d{1,2}|前天|昨天|上周[一二三四五六日天]?/);
+  return match ? match[0].replace(/\s+/g, '') : '';
+}
+
+function parseDueToLocalDate(due, now = new Date()) {
+  const s = String(due || '').trim();
+  if (!s || s === '今天' || s === '今日') return new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  if (s === '昨天') return new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+  if (s === '前天') return new Date(now.getFullYear(), now.getMonth(), now.getDate() - 2);
+  let m = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(s);
+  if (m) return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  m = /(\d{4})年(\d{1,2})月(\d{1,2})日/.exec(s);
+  if (m) return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  m = /(\d{1,2})月(\d{1,2})日/.exec(s);
+  if (m) {
+    const d = new Date(now.getFullYear(), Number(m[1]) - 1, Number(m[2]));
+    if (d.getTime() - now.getTime() > 60 * 86400000) d.setFullYear(now.getFullYear() - 1);
+    return d;
+  }
+  m = /上周([一二三四五六日天])/.exec(s);
+  if (m) {
+    const map = { 日: 0, 天: 0, 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6 };
+    const target = map[m[1]];
+    const today = now.getDay();
+    const mondayOffset = today === 0 ? -6 : 1 - today;
+    const lastMonday = new Date(now.getFullYear(), now.getMonth(), now.getDate() + mondayOffset - 7);
+    const add = target === 0 ? 6 : target - 1;
+    return new Date(lastMonday.getFullYear(), lastMonday.getMonth(), lastMonday.getDate() + add);
+  }
+  return null;
+}
+
+function createdAtIsoFromDue(due, fallbackIso) {
+  const d = parseDueToLocalDate(due);
+  if (!d || Number.isNaN(d.getTime())) return fallbackIso;
+  const now = new Date();
+  const startToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  if (d.getTime() >= startToday.getTime()) return fallbackIso;
+  d.setHours(12, 0, 0, 0);
+  return d.toISOString();
+}
+
+function normalizeOcrListItem(item) {
+  if (typeof item === 'string') {
+    const title = cleanListItemTitle(item);
+    return { title, due: extractDueFromText(item) };
+  }
+  if (item && typeof item === 'object') {
+    const title = cleanListItemTitle(item.title || item.text || item.item || '');
+    const due = String(item.due || item.date || extractDueFromText(title) || '').trim();
+    return { title, due };
+  }
+  return { title: '', due: '' };
+}
+
 function heuristicSplitTranscript(transcript, seed = null) {
   const full = String(transcript || '').trim();
   if (!full) return [];
@@ -576,8 +633,10 @@ function heuristicSplitTranscript(transcript, seed = null) {
   }, ''));
 }
 
-const VISION_UNSUPPORTED_MESSAGE = '当前没有可用的识图模型，请联系管理员在后台启用通义千问并配置 API Key';
-const VISION_TEMP_NOTICE = '已临时使用通义千问识图';
+const VISION_UNSUPPORTED_MESSAGE = '当前没有可用的识图模型，请联系管理员配置通义千问 API Key（拍照会自动使用 qwen-vl-plus）';
+const VISION_TEMP_NOTICE = '已临时使用通义千问视觉模型识图';
+/** Plain qwen-plus / flash 等文本模型会静默忽略 image_url，必须用 VL/Omni。 */
+const PHOTO_VISION_FALLBACK_MODEL = 'qwen-vl-plus';
 
 function modelSupportsVision(ai) {
   const provider = String(ai?.provider || '').toLowerCase();
@@ -585,11 +644,14 @@ function modelSupportsVision(ai) {
   if (provider === 'deepseek') return false;
   if (provider === 'moonshot') return false;
   if (/deepseek|kimi|moonshot/.test(model)) return false;
-  // Bailian / Qwen OpenAI-compatible：qwen*、*-vl*、omni 支持 image_url + data URL
-  if (provider === 'bailian' || /dashscope|aliyuncs/.test(String(ai?.baseURL || ''))) {
-    return /qwen|vl|omni/.test(model);
-  }
-  return /qwen|vl|vision|omni|gpt-4o|gemini/.test(model);
+  // 仅真正多模态：*-vl* / omni / gpt-4o / gemini…；qwen-plus 不算
+  if (/(^|[^a-z])vl([^a-z]|$)|omni|vision|gpt-4o|gemini/.test(model)) return true;
+  return false;
+}
+
+function isBailianCompatibleAi(ai) {
+  const provider = String(ai?.provider || '').toLowerCase();
+  return provider === 'bailian' || /dashscope|aliyuncs/.test(String(ai?.baseURL || ''));
 }
 
 function assertVisionCapable(ai) {
@@ -628,53 +690,74 @@ function aiConfigFromBuiltinModel(selected, userId, models = []) {
   };
 }
 
+function withPhotoVisionModel(ai, modelId = PHOTO_VISION_FALLBACK_MODEL) {
+  return {
+    ...ai,
+    textModel: modelId,
+    modelId: modelId,
+    modelName: 'Qwen-VL-Plus',
+    provider: ai.provider || 'bailian',
+    baseURL: String(ai.baseURL || BAILIAN_BASE_URL).replace(/\/$/, '') || BAILIAN_BASE_URL
+  };
+}
+
 /** One-shot vision model for photo jobs; does not change users.selected_model_id. */
 async function resolveVisionAiForJob(userId, currentAi) {
+  const models = await listBuiltinModels({ enabledOnly: true, includeSecrets: true });
+
+  // 已是真正 VL/Omni：直接用
   if (modelSupportsVision(currentAi) && currentAi?.textApiKey) {
+    console.log('[photo-vision] using current', currentAi.textModel, currentAi.modelId);
     return { ai: currentAi, switched: false, notice: '' };
   }
-  const models = await listBuiltinModels({ enabledOnly: true, includeSecrets: true });
-  const withKey = models.filter((m) => m.kind !== 'asr' && builtinRowSupportsVision(m) && resolveModelTextKey(m));
-  if (!withKey.length) throw new Error(VISION_UNSUPPORTED_MESSAGE);
 
-  const tested = withKey.filter((m) => m.lastTestOk);
-  const pool = tested.length ? tested : withKey;
-  const preferredProviders = pool.filter((m) => {
-    const provider = String(m.provider || '').toLowerCase();
-    const textModel = String(m.textModel || '').toLowerCase();
-    return provider === 'bailian' || /qwen|vl|omni/.test(textModel);
-  });
-  const ranked = (preferredProviders.length ? preferredProviders : pool)
+  // 目录里的 VL 模型（若已配置）
+  const visionCatalog = models
+    .filter((m) => m.kind !== 'asr' && builtinRowSupportsVision(m) && resolveModelTextKey(m))
     .slice()
-    .sort((a, b) => Number(a.sortOrder || 0) - Number(b.sortOrder || 0) || String(a.name || '').localeCompare(String(b.name || ''), 'zh'));
-
-  let preferredId = '';
-  try {
-    const logs = userId ? await listUsageLogs({ userId, limit: 40 }) : [];
-    for (const log of logs) {
-      const hit = ranked.find((m) => m.id === log.modelId);
-      if (hit) {
-        preferredId = hit.id;
-        break;
-      }
-    }
-  } catch {}
-  if (!preferredId) {
-    const account = userId ? await getUserAccount(userId) : null;
-    const selectedId = String(account?.selectedModelId || '').trim();
-    if (selectedId && ranked.some((m) => m.id === selectedId)) preferredId = selectedId;
+    .sort((a, b) => Number(a.sortOrder || 0) - Number(b.sortOrder || 0));
+  if (visionCatalog.length) {
+    const pick = visionCatalog[0];
+    const ai = aiConfigFromBuiltinModel(pick, userId, models);
+    if (!ai.textApiKey) throw new Error(VISION_UNSUPPORTED_MESSAGE);
+    console.log('[photo-vision] catalog', ai.textModel, ai.modelId);
+    return {
+      ai,
+      switched: true,
+      notice: VISION_TEMP_NOTICE,
+      modelId: pick.id,
+      modelName: pick.name
+    };
   }
 
-  const pick = ranked.find((m) => m.id === preferredId) || ranked[0];
-  const ai = aiConfigFromBuiltinModel(pick, userId, models);
-  if (!ai.textApiKey) throw new Error(VISION_UNSUPPORTED_MESSAGE);
-  return {
-    ai,
-    switched: true,
-    notice: VISION_TEMP_NOTICE,
-    modelId: pick.id,
-    modelName: pick.name
-  };
+  // 否则：百炼 Key + 强制 qwen-vl-plus（绝不用 qwen-plus 冒充识图）
+  const bailianRow = models.find((m) => m.kind !== 'asr' && isBailianCompatibleAi(m) && resolveModelTextKey(m));
+  if (bailianRow) {
+    const baseAi = aiConfigFromBuiltinModel(bailianRow, userId, models);
+    if (!baseAi?.textApiKey) throw new Error(VISION_UNSUPPORTED_MESSAGE);
+    const ai = withPhotoVisionModel(baseAi);
+    console.log('[photo-vision] fallback', ai.textModel, ai.modelId, 'from', bailianRow.id);
+    return {
+      ai,
+      switched: true,
+      notice: VISION_TEMP_NOTICE,
+      modelId: ai.modelId,
+      modelName: ai.modelName
+    };
+  }
+  if (isBailianCompatibleAi(currentAi) && currentAi?.textApiKey) {
+    const ai = withPhotoVisionModel({ ...currentAi, userId });
+    console.log('[photo-vision] fallback-current', ai.textModel, ai.modelId);
+    return {
+      ai,
+      switched: true,
+      notice: VISION_TEMP_NOTICE,
+      modelId: ai.modelId,
+      modelName: ai.modelName
+    };
+  }
+
+  throw new Error(VISION_UNSUPPORTED_MESSAGE);
 }
 
 function normalizeParsedTask(parsed, transcript) {
@@ -850,8 +933,20 @@ async function transcribeAudio(buffer, mime = 'audio/webm', availableTasks = [],
   return { transcript, command, tasks: [], task: null };
 }
 
+function collectOcrItems(recognized) {
+  const bags = [
+    recognized?.items,
+    recognized?.tasks,
+    recognized?.list,
+    recognized?.lines,
+    recognized?.todos
+  ];
+  const rawItems = bags.find((arr) => Array.isArray(arr) && arr.length) || [];
+  return rawItems.map(normalizeOcrListItem).filter((item) => item.title.length >= 2).slice(0, 10);
+}
+
 async function parseTasksFromImage(buffer, mime = 'image/jpeg', ai) {
-  // DeepSeek / 纯文本模型会拒绝 image_url（unknown variant `image_url`, expected `text`）
+  // DeepSeek / 纯文本模型会拒绝或静默忽略 image_url
   assertVisionCapable(ai);
   const type = String(mime || 'image/jpeg').split(';')[0].trim() || 'image/jpeg';
   const dataUrl = `data:${type};base64,${buffer.toString('base64')}`;
@@ -861,10 +956,10 @@ async function parseTasksFromImage(buffer, mime = 'image/jpeg', ai) {
     data = await qwenChatForAi(ai, {
       timeoutMs: 120_000,
       messages: [
-        { role: 'system', content: '你是中文工作清单识别助手。用户会上传周报、月报、手写便签、Excel 计划表或工作清单的照片。请识别图中需要执行的工作内容，整理为纯文本。表格/编号列表请逐条放入 items；整段文字放入 text，多项用换行或顿号分开。只提取待办，不要已完成事项、总结性描述、表头或纯背景。不要虚构。只输出合法 JSON，不要 Markdown。JSON结构：text为识别出的完整待办文字；items为字符串数组（每条一个短待办标题）。' },
+        { role: 'system', content: '你是中文工作清单识别助手。用户可能上传：Excel/表格截图（含「计划工作」「Todo」列、上午/下午分栏）、电脑屏幕照片、周报、月报、手写便签。请把图中所有计划中的工作事项提取为待办。编号列表（1，2，3 / 1. 2.）、单元格内多行、不同日期行，都必须逐条拆开写入 items。表头（计划工作/上午/下午/日期）可忽略，但单元格里的具体事项必须提取。不要因为是「计划」就当成总结而跳过。不要虚构。图中日期（含过去日期）写入 due；无日期则 due 为空字符串。只输出合法 JSON，不要 Markdown。JSON结构：text为全部待办换行拼接；items为对象数组，每项含 title（短待办标题）和 due。' },
         { role: 'user', content: [
           { type: 'image_url', image_url: { url: dataUrl } },
-          { type: 'text', text: `当前日期：${new Date().toLocaleDateString('zh-CN')}\n当前用户：我\n请识别图中的工作待办文字，多项请拆开列出。` }
+          { type: 'text', text: `当前日期：${new Date().toLocaleDateString('zh-CN')}\n当前用户：我\n这可能是 Excel「计划工作」截图。请把每一条编号/分行工作事项都提取出来，不要返回空列表。图上写的日期（包括过去的周/月）请原样填入每条 due，不要改成今天。` }
         ] }
       ],
       responseFormat: { type: 'json_object' }
@@ -876,24 +971,40 @@ async function parseTasksFromImage(buffer, mime = 'image/jpeg', ai) {
     }
     throw error;
   }
-  const recognized = parseJSON(messageText(data));
-  const ocrItems = Array.isArray(recognized?.items)
-    ? recognized.items.map(item => cleanListItemTitle(item)).filter(part => part.length >= 2).slice(0, 10)
-    : [];
-  const itemText = ocrItems.join('\n');
-  const transcript = convertToSimplified(String(recognized?.text || itemText || '').trim());
-  if (!transcript) throw new Error('没有从图片中识别到可执行的工作任务，请拍更清晰的周报、月报或清单后再试');
-  const initialFromOcr = ocrItems.length >= 2
-    ? ocrItems.map(title => ({ title, assignee: '我', due: '今天', priority: '中', confidence: 0.85, estimatedMinutes: 60 }))
+  const rawText = messageText(data);
+  const recognized = parseJSON(rawText);
+  const ocrItems = collectOcrItems(recognized);
+  const itemText = ocrItems.map((item) => (item.due ? `${item.due} ${item.title}` : item.title)).join('\n');
+  const transcript = convertToSimplified(String(recognized?.text || itemText || rawText || '').trim())
+    .replace(/^```(?:json)?\s*|\s*```$/g, '')
+    .trim();
+  // 文本模型误用时常见：prompt_tokens 很少且返回空 JSON
+  const promptTokens = Number(data?.usage?.prompt_tokens || 0);
+  if (!transcript || transcript === '{}' || /^\{?\s*"text"\s*:\s*""\s*,\s*"items"\s*:\s*\[\s*\]\s*\}?$/.test(transcript)) {
+    if (promptTokens > 0 && promptTokens < 400) {
+      throw new Error('识图模型没有读到图片内容（当前可能仍是纯文本模型）。请重试；系统会改用通义视觉模型。');
+    }
+    throw new Error('没有从图片中识别到可执行的工作任务，请拍更清晰的周报、月报或清单后再试');
+  }
+  const usableTranscript = ocrItems.length ? itemText || transcript : transcript;
+  const initialFromOcr = ocrItems.length >= 1
+    ? ocrItems.map((item) => ({ title: item.title, assignee: '我', due: item.due || extractDueFromText(usableTranscript) || '今天', priority: '中', confidence: 0.85, estimatedMinutes: 60 }))
     : null;
   // 理解 → 拆分：与语音 create 共用 parseTasks
-  let tasks = await parseTasks(transcript, ai, initialFromOcr);
-  if (needsResplit(tasks, transcript) && ocrItems.length >= 2) {
-    tasks = ocrItems.map(title => normalizeParsedTask({ title, confidence: 0.8, estimatedMinutes: 60 }, ''));
+  let tasks = await parseTasks(usableTranscript, ai, initialFromOcr);
+  if (needsResplit(tasks, usableTranscript) && ocrItems.length >= 2) {
+    tasks = ocrItems.map((item) => normalizeParsedTask({ title: item.title, due: item.due || '今天', confidence: 0.8, estimatedMinutes: 60 }, ''));
   }
+  if ((!tasks.length || (tasks.length === 1 && !String(tasks[0]?.title || '').trim())) && ocrItems.length) {
+    tasks = ocrItems.map((item) => normalizeParsedTask({ title: item.title, due: item.due || '今天', confidence: 0.8, estimatedMinutes: 60 }, ''));
+  }
+  tasks = tasks.map((task) => ({
+    ...task,
+    createdAt: createdAtIsoFromDue(task.due)
+  })).filter((task) => String(task.title || '').trim());
   if (!tasks.length) throw new Error('没有从图片中识别到可执行的工作任务，请拍更清晰的周报、月报或清单后再试');
   return {
-    transcript,
+    transcript: usableTranscript,
     command: {
       action: 'create',
       targetTaskId: null,
@@ -1230,7 +1341,7 @@ async function persistVoiceResult(job,result){
   for(let index=0;index<parsedTasks.length;index+=1){
     const parsed=parsedTasks[index];
     const id=index===0?job.id:`${job.id}-${index+1}`;
-    await saveTask(userId,{id,title:parsed.title||result.transcript||(job.source==='photo'?'拍照任务':'语音任务'),assignee:parsed.assignee||'我',due:parsed.due||'今天',status:'todo',priority:parsed.priority||'中',progress:0,estimatedMinutes:parsed.estimatedMinutes||60,createdAt:job.createdAt,startedAt:null,completedAt:null,aiStatus:null});
+    await saveTask(userId,{id,title:parsed.title||result.transcript||(job.source==='photo'?'拍照任务':'语音任务'),assignee:parsed.assignee||'我',due:parsed.due||'今天',status:'todo',priority:parsed.priority||'中',progress:0,estimatedMinutes:parsed.estimatedMinutes||60,createdAt:parsed.createdAt||((job.source==='photo'||job.imageFile)?createdAtIsoFromDue(parsed.due,job.createdAt):job.createdAt),startedAt:null,completedAt:null,aiStatus:null});
     ids.push(id);
   }
   return ids;
@@ -1918,12 +2029,13 @@ app.get('/api/admin/model-prices', requireAdmin, async (req, res) => {
     res.json(result);
   } catch (error) {
     const weight = Number(req.query.weight) || 0;
+    const yuan = estimateYuanFromWeight(weight);
     res.json({
       ok: true,
       source: 'weight',
       fallback: true,
-      yuanPerMillion: Number((weight * 3).toFixed(3)),
-      weightEstimate: Number((weight * 3).toFixed(3)),
+      yuanPerMillion: yuan,
+      weightEstimate: yuan,
       message: weightEstimateMessage(weight).replace(/^预估：/, '未能拉取官方价，已用权重估算。预估：')
     });
   }
@@ -1941,12 +2053,13 @@ app.post('/api/admin/models/:id/price-estimate', requireAdmin, async (req, res) 
     res.json(result);
   } catch {
     const weight = Number(req.body?.weight) || 0;
+    const yuan = estimateYuanFromWeight(weight);
     res.json({
       ok: true,
       source: 'weight',
       fallback: true,
-      yuanPerMillion: Number((weight * 3).toFixed(3)),
-      weightEstimate: Number((weight * 3).toFixed(3)),
+      yuanPerMillion: yuan,
+      weightEstimate: yuan,
       message: `未能拉取官方价，已用权重估算。${weightEstimateMessage(weight)}`
     });
   }
@@ -2392,7 +2505,7 @@ app.post('/api/weekly-plan', requireUser, requireTextAi, async (req, res) => {
     const { tasks = [], weekStart, weekEnd, user = '用户' } = req.body || {};
     const data = await qwenChatForAi(req.ai, {
       messages: [
-        { role: 'system', content: '你是务实的中文周报助手。根据真实任务数据总结本周完成亮点与风险，并规划下周重点。不要虚构未提供的成果。下周计划最多8项，按重要性排序。只输出合法 JSON，不要 Markdown。JSON字段：headline字符串、summary字符串、highlights字符串数组、risks字符串数组、next对象数组；next每项包含title、reason、priority(高/中/低)、suggestedTime。' },
+        { role: 'system', content: '你是务实的中文周报助手。根据真实任务数据总结本周完成亮点与风险，并规划下周重点。不要虚构未提供的成果。任务 due / createdAt 可能是过去的日期（例如拍照导入的周报、月报），请按这些日期归入对应周期，不要因为导入当天是今天就忽略历史任务。下周计划最多8项，按重要性排序。只输出合法 JSON，不要 Markdown。JSON字段：headline字符串、summary字符串、highlights字符串数组、risks字符串数组、next对象数组；next每项包含title、reason、priority(高/中/低)、suggestedTime。' },
         { role: 'user', content: `用户：${user}\n本周：${weekStart} 至 ${weekEnd}\n任务数据：${JSON.stringify(tasks)}` }
       ],
       responseFormat: { type: 'json_object' }
@@ -2409,7 +2522,7 @@ app.post('/api/monthly-plan', requireUser, requireTextAi, async (req, res) => {
     const { tasks = [], month, user = '用户' } = req.body || {};
     const data = await qwenChatForAi(req.ai, {
       messages: [
-        { role: 'system', content: '你是务实的中文月报助手。根据真实任务数据总结本月完成亮点与风险，并规划下月重点。不要虚构未提供的成果。下月计划最多8项，按重要性排序。只输出合法 JSON，不要 Markdown。JSON字段：headline字符串、summary字符串、highlights字符串数组、risks字符串数组、next对象数组；next每项包含title、reason、priority(高/中/低)、suggestedTime。' },
+        { role: 'system', content: '你是务实的中文月报助手。根据真实任务数据总结本月完成亮点与风险，并规划下月重点。不要虚构未提供的成果。任务 due / createdAt 可能是过去的日期（例如拍照导入的周报、月报），请按这些日期归入对应月份，不要因为导入当天是今天就忽略历史任务。下月计划最多8项，按重要性排序。只输出合法 JSON，不要 Markdown。JSON字段：headline字符串、summary字符串、highlights字符串数组、risks字符串数组、next对象数组；next每项包含title、reason、priority(高/中/低)、suggestedTime。' },
         { role: 'user', content: `用户：${user}\n月份：${month}\n任务数据：${JSON.stringify(tasks)}` }
       ],
       responseFormat: { type: 'json_object' }

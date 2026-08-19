@@ -33,7 +33,7 @@ export default defineConfig({
     port: 5174,
     proxy: {
       '/api': {
-        target: 'http://localhost:8790',
+        target: 'http://127.0.0.1:8787',
         changeOrigin: true,
         configure(proxy) {
           (proxy as any).on('proxyRes', (proxyRes: { headers: Record<string, string | string[] | undefined> }) => {

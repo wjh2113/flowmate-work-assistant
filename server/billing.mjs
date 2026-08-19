@@ -12,19 +12,19 @@ const DEFAULT_SIGNUP_POINTS = Number(process.env.DEFAULT_SIGNUP_POINTS || 50000)
 
 const ALLOWED_PROVIDERS = ['bailian', 'deepseek', 'moonshot', 'custom'];
 
-/** Weights: Flash = 1.0 so 1M tokens = 1M points ≈ ¥3 (idle blended in:out 1:1). */
-export const FLASH_BASELINE_WEIGHT = 1;
+/** Weights: Flash = 0.001 so 1M tokens = 1000 points ≈ ¥3 (idle blended in:out 1:1). */
+export const FLASH_BASELINE_WEIGHT = 0.001;
 
 const DEFAULT_MODELS = [
-  { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', provider: 'deepseek', textModel: 'deepseek-v4-flash', weight: 1.000, badge: '', sortOrder: 10 },
-  { id: 'qwen-plus', name: 'Qwen-Plus', provider: 'bailian', textModel: 'qwen-plus', weight: 0.460, badge: '', sortOrder: 20 },
-  { id: 'qwen3.6-flash', name: 'Qwen3.6-Flash', provider: 'bailian', textModel: 'qwen3.6-flash', weight: 1.400, badge: '', sortOrder: 30 },
-  { id: 'qwen3.7-plus', name: 'Qwen3.7-Plus', provider: 'bailian', textModel: 'qwen3.7-plus', weight: 1.660, badge: '', sortOrder: 40 },
-  { id: 'qwen3.8-max', name: 'Qwen3.8-Max', provider: 'bailian', textModel: 'qwen3.8-max', weight: 8.000, badge: '', sortOrder: 50 },
-  { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', provider: 'deepseek', textModel: 'deepseek-v4-pro', weight: 3.000, badge: '', sortOrder: 60 },
-  { id: 'kimi-k2.6', name: 'Kimi K2.6', provider: 'moonshot', textModel: 'kimi-k2.6', weight: 5.580, badge: '', sortOrder: 70 },
-  { id: 'kimi-k2.7-code', name: 'Kimi K2.7 Code', provider: 'moonshot', textModel: 'kimi-k2.7-code', weight: 5.580, badge: '', sortOrder: 80 },
-  { id: 'kimi-k3', name: 'Kimi K3', provider: 'moonshot', textModel: 'kimi-k3', weight: 20.000, badge: '', sortOrder: 90 }
+  { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', provider: 'deepseek', textModel: 'deepseek-v4-flash', weight: 0.001, badge: '', sortOrder: 10 },
+  { id: 'qwen-plus', name: 'Qwen-Plus', provider: 'bailian', textModel: 'qwen-plus', weight: 0.00046, badge: '', sortOrder: 20 },
+  { id: 'qwen3.6-flash', name: 'Qwen3.6-Flash', provider: 'bailian', textModel: 'qwen3.6-flash', weight: 0.0014, badge: '', sortOrder: 30 },
+  { id: 'qwen3.7-plus', name: 'Qwen3.7-Plus', provider: 'bailian', textModel: 'qwen3.7-plus', weight: 0.00166, badge: '', sortOrder: 40 },
+  { id: 'qwen3.8-max', name: 'Qwen3.8-Max', provider: 'bailian', textModel: 'qwen3.8-max', weight: 0.008, badge: '', sortOrder: 50 },
+  { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', provider: 'deepseek', textModel: 'deepseek-v4-pro', weight: 0.003, badge: '', sortOrder: 60 },
+  { id: 'kimi-k2.6', name: 'Kimi K2.6', provider: 'moonshot', textModel: 'kimi-k2.6', weight: 0.00558, badge: '', sortOrder: 70 },
+  { id: 'kimi-k2.7-code', name: 'Kimi K2.7 Code', provider: 'moonshot', textModel: 'kimi-k2.7-code', weight: 0.00558, badge: '', sortOrder: 80 },
+  { id: 'kimi-k3', name: 'Kimi K3', provider: 'moonshot', textModel: 'kimi-k3', weight: 0.02, badge: '', sortOrder: 90 }
 ];
 
 const BAILIAN_BASE = 'https://dashscope.aliyuncs.com/compatible-mode/v1';
@@ -136,18 +136,27 @@ export function isSelectableBuiltinModel(model) {
 }
 
 export function formatModelWeight(weight) {
-  return (Math.round((Number(weight) || 0) * 1000) / 1000).toFixed(3);
+  const n = Math.round((Number(weight) || 0) * 1e5) / 1e5;
+  if (!Number.isFinite(n)) return '0';
+  return n.toFixed(5).replace(/\.?0+$/, '') || '0';
+}
+
+export function formatFlashRelative(weight) {
+  const flash = FLASH_BASELINE_WEIGHT || 0.001;
+  return formatModelWeight((Number(weight) || 0) / flash);
 }
 
 export function modelSwitchCostHint(model) {
   const wLabel = formatModelWeight(model?.weight);
-  return `该模型权重 ${wLabel}（Flash 权重 1.0，约 100 万 token = 100 万积分 ≈ ¥3；当前权重 ${wLabel}，相对 Flash 为 ${wLabel} 倍）`;
+  const rel = formatFlashRelative(model?.weight);
+  return `该模型权重 ${wLabel}（Flash 权重 0.001，约 100 万 token = 1000 积分 ≈ ¥3；1 积分 ≈ ¥0.003，100 万积分 ≈ ¥3000。当前权重 ${wLabel}，相对 Flash 为 ${rel} 倍）`;
 }
 
 export function modelSwitchConfirmMessage(model) {
   const name = String(model?.name || model?.id || '该模型').trim();
   const wLabel = formatModelWeight(model?.weight);
-  return `切换到 ${name} 后，积分 = Token × ${wLabel}（Flash 权重 1.0，约 100 万 token = 100 万积分 ≈ ¥3；当前权重 ${wLabel}，相对 Flash 为 ${wLabel} 倍）。确定？`;
+  const rel = formatFlashRelative(model?.weight);
+  return `切换到 ${name} 后，积分 = Token × ${wLabel}（Flash 权重 0.001，约 100 万 token = 1000 积分 ≈ ¥3；1 积分 ≈ ¥0.003。当前权重 ${wLabel}，相对 Flash 为 ${rel} 倍）。确定？`;
 }
 
 function toModel(row, { includeSecrets = false } = {}) {
@@ -159,7 +168,7 @@ function toModel(row, { includeSecrets = false } = {}) {
     baseURL: row.base_url || '',
     textModel: row.text_model,
     asrModel: row.asr_model || 'qwen3-asr-flash',
-    weight: Number(row.weight ?? 1),
+    weight: Number(row.weight ?? FLASH_BASELINE_WEIGHT),
     badge: row.badge || '',
     sortOrder: Number(row.sort_order || 0),
     enabled: Boolean(Number(row.enabled ?? 1)),
@@ -195,7 +204,7 @@ export async function initBilling() {
         asr_api_key TEXT NOT NULL DEFAULT '',
         text_model TEXT NOT NULL,
         asr_model TEXT NOT NULL DEFAULT 'qwen3-asr-flash',
-        weight DOUBLE PRECISION NOT NULL DEFAULT 1,
+        weight DOUBLE PRECISION NOT NULL DEFAULT 0.001,
         badge TEXT NOT NULL DEFAULT '',
         sort_order INTEGER NOT NULL DEFAULT 0,
         enabled INTEGER NOT NULL DEFAULT 1,
@@ -219,6 +228,8 @@ export async function initBilling() {
       CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_logs(created_at DESC);
       ALTER TABLE builtin_models ADD COLUMN IF NOT EXISTS last_test_ok INTEGER NOT NULL DEFAULT 0;
       ALTER TABLE builtin_models ADD COLUMN IF NOT EXISTS key_verified_at TEXT NOT NULL DEFAULT '';
+      ALTER TABLE builtin_models ALTER COLUMN weight TYPE DOUBLE PRECISION;
+      ALTER TABLE builtin_models ALTER COLUMN weight SET DEFAULT 0.001;
     `);
     await q(`UPDATE users SET signup_points_granted=1 WHERE signup_points_granted=0 AND (points_balance>0 OR id IN (SELECT DISTINCT user_id FROM usage_logs))`);
     await syncBuiltinModelCatalog();
@@ -252,6 +263,7 @@ async function syncBuiltinModelCatalog() {
          weight=EXCLUDED.weight,sort_order=EXCLUDED.sort_order,kind=EXCLUDED.kind,updated_at=EXCLUDED.updated_at`,
       [item.id, item.name, item.provider, baseURL, textKey, asr, item.textModel, 'qwen3-asr-flash', item.weight, item.badge, item.sortOrder, 1, 'text', now]
     );
+    await q(`UPDATE builtin_models SET weight=?, updated_at=? WHERE id=?`, [item.weight, now, item.id]);
   }
 }
 
@@ -296,7 +308,7 @@ async function bootstrapAdmins() {
 export function calcPoints(totalTokens, weight) {
   const tokens = Math.max(0, Number(totalTokens) || 0);
   const w = Math.max(0, Number(weight) || 0);
-  return Math.round(tokens * w * 1000) / 1000;
+  return Math.round(tokens * w * 1e6) / 1e6;
 }
 
 export async function getUserAccount(userId) {
@@ -371,7 +383,7 @@ export async function saveBuiltinModel(input = {}) {
     })(),
     textModel: String(input.textModel || current?.textModel || id).trim(),
     asrModel: String(input.asrModel || current?.asrModel || 'qwen3-asr-flash').trim(),
-    weight: Math.max(0, Number(input.weight ?? current?.weight ?? 1)),
+    weight: Math.max(0, Number(input.weight ?? current?.weight ?? FLASH_BASELINE_WEIGHT)),
     badge: String(input.badge ?? current?.badge ?? '').trim().slice(0, 40),
     sortOrder: Math.round(Number(input.sortOrder ?? current?.sortOrder ?? 0)),
     enabled: input.enabled === false || input.enabled === 0 ? 0 : 1,
