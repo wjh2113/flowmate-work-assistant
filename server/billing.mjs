@@ -8,7 +8,7 @@ const { Pool } = pg;
 if (!String(process.env.DATABASE_URL || '').trim()) {
   throw new Error('缺少 DATABASE_URL，请先配置本机 PostgreSQL');
 }
-const DEFAULT_SIGNUP_POINTS = Number(process.env.DEFAULT_SIGNUP_POINTS || 50000);
+const DEFAULT_SIGNUP_POINTS = Number(process.env.DEFAULT_SIGNUP_POINTS || 0);
 
 const ALLOWED_PROVIDERS = ['bailian', 'deepseek', 'moonshot', 'custom'];
 
@@ -333,14 +333,23 @@ export async function ensureUserBillingDefaults(userId, _email = '') {
   await initBilling();
   const account = await getUserAccount(userId);
   if (!account) return null;
-  // Grant signup points once; never rewrite an existing balance on every request.
-  await q(
-    `UPDATE users SET
-       points_balance=CASE WHEN points_balance=0 THEN ? ELSE points_balance END,
-       signup_points_granted=1
-     WHERE id=? AND signup_points_granted=0`,
-    [DEFAULT_SIGNUP_POINTS, userId]
-  );
+  // Mark signup as handled once so admins can grant later without accidental refill.
+  // When DEFAULT_SIGNUP_POINTS is 0, only set the flag (no balance write).
+  if (DEFAULT_SIGNUP_POINTS > 0) {
+    await q(
+      `UPDATE users SET
+         points_balance=CASE WHEN points_balance=0 THEN ? ELSE points_balance END,
+         signup_points_granted=1
+       WHERE id=? AND signup_points_granted=0`,
+      [DEFAULT_SIGNUP_POINTS, userId]
+    );
+  } else {
+    await q(
+      `UPDATE users SET signup_points_granted=1
+       WHERE id=? AND signup_points_granted=0`,
+      [userId]
+    );
+  }
   return getUserAccount(userId);
 }
 
