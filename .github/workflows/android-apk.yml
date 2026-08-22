@@ -1,0 +1,54 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'android/**'
+      - 'src/**'
+      - 'capacitor.config.ts'
+      - 'package.json'
+      - '.github/workflows/android-apk.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install dependencies and build APK
+        run: npm ci && npm run android:apk
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flowmate-user-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 90
+
+      - name: Publish rolling debug release
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=android-user-debug
+          NOTES="FlowMate 用户端调试 APK（侧载安装）。首次打开填写服务器地址，如 http://192.168.1.31:8787。管理后台请用电脑浏览器 /admin。"
+          gh release view "$TAG" 2>/dev/null || gh release create "$TAG" --title "FlowMate Android 用户端 (debug)" --notes "$NOTES"
+          gh release upload "$TAG" android/app/build/outputs/apk/debug/app-debug.apk --clobber
