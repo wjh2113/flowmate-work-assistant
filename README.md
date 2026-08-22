@@ -84,4 +84,22 @@ VITE_SUPABASE_ANON_KEY=your-anon-or-publishable-key
 - Android Chrome：浏览器菜单 → 安装应用 / 添加到主屏幕。
 - iPhone Safari：分享 → 添加到主屏幕。
 
+### Android 原生 App（用户端）
+
+**仅用户工作台**，不含管理后台（管理员继续用电脑浏览器 `/admin`）。功能与 H5 一致：语音、拍照、任务、团队、日复盘/周报/月报等。
+
+**环境要求**：Node.js 22+、[Android Studio](https://developer.android.com/studio)、已运行的 FlowMate 服务端。
+
+```bash
+npm install
+npm run android:sync
+npm run android:open
+```
+
+详见 [android/README.md](android/README.md)。
+
+**首次使用**：App 启动后填写服务器局域网地址（如 `http://192.168.1.31:8787`）→ 测试并继续 → 注册/登录。
+
+### H5 安装到主屏幕
+
 录音要求 HTTPS（本机 `localhost` 除外）。若未配置 Supabase，应用会以本地体验模式运行；配置后任务与日报使用云端存储。

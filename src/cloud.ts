@@ -1,4 +1,5 @@
 import { createClient, type Session, type SupabaseClient } from '@supabase/supabase-js';
+import { apiUrl } from './apiBase';
 
 const envUrl = import.meta.env.VITE_SUPABASE_URL?.trim() || '';
 const envAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY?.trim() || '';
@@ -19,7 +20,7 @@ export async function bootstrapCloud(){
   try{
     const controller=new AbortController();
     const timer=window.setTimeout(()=>controller.abort(),4000);
-    const response=await fetch('/api/settings/cloud',{signal:controller.signal,cache:'no-store'});
+    const response=await fetch(apiUrl('/api/settings/cloud'),{signal:controller.signal,cache:'no-store'});
     window.clearTimeout(timer);
     if(!response.ok)throw new Error('无法读取服务端云存储配置');
     const data=await response.json();

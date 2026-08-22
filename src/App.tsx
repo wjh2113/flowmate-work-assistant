@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Session } from '@supabase/supabase-js';
 import { cloudConfigured, deleteDailyReport, deletePeriodReport, deleteTask, getSession, getWorkspace, listPeriodReports, listTasks, loadDailyReport, loadPeriodReport, saveDailyReport, savePeriodReport, sendMagicLink, supabase, updateTask, upsertTask, type CloudTask } from './cloud';
+import { getApiBase, getStoredApiBase, isNativeApp, setStoredApiBase } from './apiBase';
 import { apiFetch, describeApiError, getLocalUser, loginLocalUser, logoutLocalUser, registerLocalUser, type LocalUser } from './localAuth';
 import { deleteFileDailyReport, deleteFilePeriodReport, deleteFileTask, listFilePeriodReports, listFileTasks, loadFileDailyReport, loadFilePeriodReport, patchFileTask, saveFileDailyReport, saveFilePeriodReport, saveFileTask, type PeriodReportMeta } from './localStore';
 import GuidePage from './GuidePage';
@@ -57,6 +58,7 @@ export default function App(){
   const [session,setSession]=useState<Session|null>(null);
   const [localUser,setLocalUser]=useState<LocalUser|null>(null);
   const [authLoading,setAuthLoading]=useState(true);
+  const [nativeServerReady,setNativeServerReady]=useState(()=>!isNativeApp()||Boolean(getApiBase()));
   const [teamId,setTeamId]=useState(''); const [syncing,setSyncing]=useState(false);
   const [clock,setClock]=useState(()=>Date.now());
   const recorder=useRef<MediaRecorder|null>(null); const stream=useRef<MediaStream|null>(null); const chunks=useRef<Blob[]>([]);
@@ -615,6 +617,7 @@ export default function App(){
 
   if(showGuide)return <GuidePage/>;
   if(loginDemo)return <LoginPage demo/>;
+  if(isNativeApp()&&!nativeServerReady)return <NativeServerSetup onReady={()=>setNativeServerReady(true)}/>;
   if(authLoading)return <div className="viewport"><main className="app auth-shell"><div className="cloud-loader"><div className="ai-orb">✦</div><b>{cloudConfigured?'正在连接云端工作区…':'正在检查本地登录状态…'}</b></div></main></div>;
   if(cloudConfigured&&!session)return <LoginPage/>;
   if(!cloudConfigured&&!localUser)return <LoginPage mode="local" onLocalAuth={async user=>{
@@ -887,8 +890,8 @@ function CloudSettings({onClose,askConfirm}:{onClose:()=>void;askConfirm:(messag
   const [loading,setLoading]=useState(true);const [saving,setSaving]=useState(false);const [testing,setTesting]=useState(false);const [removing,setRemoving]=useState(false);
   const [configured,setConfigured]=useState(false);const [url,setUrl]=useState('');const [anonKey,setAnonKey]=useState('');const [masked,setMasked]=useState('');const [showKey,setShowKey]=useState(false);const [error,setError]=useState('');const [success,setSuccess]=useState('');
   const headers=async()=>{const token=(await supabase?.auth.getSession())?.data.session?.access_token;return{'Content-Type':'application/json',...(token?{Authorization:`Bearer ${token}`}:{})}};
-  useEffect(()=>{fetch('/api/settings/cloud',{cache:'no-store'}).then(async response=>{const data=await response.json();if(!response.ok)throw new Error(data.message||'读取云存储配置失败');setConfigured(Boolean(data.configured));setUrl(data.url||'');setMasked(data.maskedKey||'')}).catch(e=>setError(e.message)).finally(()=>setLoading(false))},[]);
-  const request=async(path:string,options:RequestInit)=>{const response=await fetch(path,{...options,headers:await headers()});const data=await response.json();if(!response.ok)throw new Error(data.message||'操作失败');return data};
+  useEffect(()=>{apiFetch('/api/settings/cloud').then(async response=>{const data=await response.json();if(!response.ok)throw new Error(data.message||'读取云存储配置失败');setConfigured(Boolean(data.configured));setUrl(data.url||'');setMasked(data.maskedKey||'')}).catch(e=>setError(e.message)).finally(()=>setLoading(false))},[]);
+  const request=async(path:string,options:RequestInit)=>{const response=await apiFetch(path,{...options,headers:{...(options.headers||{}),...(await headers())}});const data=await response.json();if(!response.ok)throw new Error(data.message||'操作失败');return data};
   const test=async()=>{setTesting(true);setError('');setSuccess('');try{const data=await request('/api/settings/cloud/test',{method:'POST',body:JSON.stringify({url,anonKey})});setSuccess(data.message||'连接成功')}catch(e){setError(e instanceof Error?e.message:'连接测试失败')}finally{setTesting(false)}};
   const save=async()=>{setSaving(true);setError('');setSuccess('');try{const data=await request('/api/settings/cloud',{method:'PUT',body:JSON.stringify({url,anonKey})});setConfigured(true);setMasked(data.maskedKey||'');setAnonKey('');setSuccess('保存成功，正在进入云端登录…');window.setTimeout(()=>window.location.reload(),700)}catch(e){setError(e instanceof Error?e.message:'保存失败')}finally{setSaving(false)}};
   const remove=async()=>{const ok=await askConfirm('移除后将改回本机 PostgreSQL 存储，Supabase 中已有数据不会被删除。确定继续吗？',{title:'移除云存储',confirmLabel:'确认移除',danger:true});if(!ok)return;setRemoving(true);setError('');try{await request('/api/settings/cloud',{method:'DELETE'});window.location.reload()}catch(e){setError(e instanceof Error?e.message:'移除失败');setRemoving(false)}};
@@ -897,8 +900,40 @@ function CloudSettings({onClose,askConfirm}:{onClose:()=>void;askConfirm:(messag
 }
 
 function AppSettings({schedule,onScheduleSaved,onClose,onModelSaved,askConfirm}:{schedule:AutoSchedule;onScheduleSaved:(next:AutoSchedule)=>void;onClose:()=>void;onModelSaved:()=>void;askConfirm:(message:string,options?:{title?:string;confirmLabel?:string;cancelLabel?:string;danger?:boolean})=>Promise<boolean>}){
-  const [tab,setTab]=useState<'schedule'|'model'>('model');
-  return <div className="model-settings app-settings"><div className="settings-head"><div><small>应用设置</small><h2>设置</h2></div><button type="button" onClick={onClose} aria-label="关闭">×</button></div><div className="settings-tabs" role="tablist"><button type="button" role="tab" aria-selected={tab==='schedule'} className={tab==='schedule'?'active':''} onClick={()=>setTab('schedule')}>自动作业</button><button type="button" role="tab" aria-selected={tab==='model'} className={tab==='model'?'active':''} onClick={()=>setTab('model')}>大模型</button></div>{tab==='schedule'?<ScheduleSettings schedule={schedule} onSaved={onScheduleSaved} onClose={onClose}/>:<ModelSettings onClose={onClose} onSaved={onModelSaved} askConfirm={askConfirm}/>}</div>;
+  const native=isNativeApp();
+  const [tab,setTab]=useState<'schedule'|'model'|'server'>(native?'server':'model');
+  return <div className="model-settings app-settings"><div className="settings-head"><div><small>应用设置</small><h2>设置</h2></div><button type="button" onClick={onClose} aria-label="关闭">×</button></div><div className="settings-tabs" role="tablist">{native&&<button type="button" role="tab" aria-selected={tab==='server'} className={tab==='server'?'active':''} onClick={()=>setTab('server')}>服务器</button>}<button type="button" role="tab" aria-selected={tab==='schedule'} className={tab==='schedule'?'active':''} onClick={()=>setTab('schedule')}>自动作业</button><button type="button" role="tab" aria-selected={tab==='model'} className={tab==='model'?'active':''} onClick={()=>setTab('model')}>大模型</button></div>{tab==='server'?<ServerSettings onClose={onClose}/>:tab==='schedule'?<ScheduleSettings schedule={schedule} onSaved={onScheduleSaved} onClose={onClose}/>:<ModelSettings onClose={onClose} onSaved={onModelSaved} askConfirm={askConfirm}/>}</div>;
+}
+
+function NativeServerSetup({onReady}:{onReady:()=>void}){
+  return <div className="viewport"><main className="app auth-shell"><section className="login-card"><div className="brand-mark">✓</div><span className="login-eyebrow">FLOWMATE · ANDROID</span><h1>连接 FlowMate 服务器</h1><p>这是用户端 App，不含管理后台。模型、积分等请在电脑浏览器打开 <b>/admin</b> 配置。</p><ServerSettings standalone onReady={onReady}/></section></main></div>;
+}
+
+function ServerSettings({onClose,onReady,standalone}:{onClose?:()=>void;onReady?:()=>void;standalone?:boolean}){
+  const [draft,setDraft]=useState(()=>getStoredApiBase());
+  const [testing,setTesting]=useState(false);
+  const [error,setError]=useState('');
+  const [success,setSuccess]=useState('');
+  const connect=async()=>{
+    setTesting(true);setError('');setSuccess('');
+    try{
+      const base=setStoredApiBase(draft);
+      if(!base)throw new Error('请填写服务器地址，例如 http://192.168.1.31:8787');
+      const response=await fetch(`${base}/api/health`,{credentials:'include',headers:{'X-Flowmate-Client':'capacitor'}});
+      const data=await response.json().catch(()=>({}));
+      if(!response.ok)throw new Error(data.message||`连接失败（${response.status}）`);
+      setSuccess(standalone?'连接成功':'连接成功，请重新登录以同步账号');
+      if(standalone)onReady?.();
+    }catch(e){setError(e instanceof Error?e.message:'连接失败')}
+    finally{setTesting(false)}
+  };
+  const save=()=>{
+    setError('');setSuccess('');
+    const base=setStoredApiBase(draft);
+    if(!base){setError('请填写服务器地址');return}
+    setSuccess(standalone?'已保存，请点击「测试并继续」':'已保存，建议点击「测试连接」后重新登录');
+  };
+  return <><label>FlowMate 服务器地址</label><input className="input" type="url" value={draft} onChange={e=>setDraft(e.target.value)} placeholder="http://192.168.1.31:8787" autoCapitalize="off" autoCorrect="off"/><p className="field-help">手机与电脑需在同一 WiFi。填写运行 npm start 的那台机器的局域网地址，不要用 localhost。</p>{success&&<div className="settings-success">✓ {success}</div>}{error&&<div className="settings-error">{error}</div>}<div className="settings-actions">{!standalone&&onClose&&<button type="button" onClick={onClose}>关闭</button>}<button type="button" disabled={testing} onClick={()=>void connect()}>{testing?'测试中…':(standalone?'测试并继续':'测试连接')}</button><button type="button" onClick={save}>保存</button></div></>;
 }
 
 function cloneSchedule(schedule:AutoSchedule):AutoSchedule{

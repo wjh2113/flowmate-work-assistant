@@ -210,6 +210,39 @@ function simplify(value) {
 app.use(express.json({ limit: '2mb' }));
 app.set('trust proxy', 1);
 
+const CAPACITOR_ORIGINS = new Set([
+  'https://localhost',
+  'http://localhost',
+  'capacitor://localhost',
+  'ionic://localhost'
+]);
+
+function isCapacitorClient(req) {
+  if (String(req.headers['x-flowmate-client'] || '').toLowerCase() === 'capacitor') return true;
+  const origin = String(req.headers.origin || '');
+  return CAPACITOR_ORIGINS.has(origin);
+}
+
+function allowCorsOrigin(origin) {
+  if (!origin) return false;
+  if (CAPACITOR_ORIGINS.has(origin)) return true;
+  const extra = String(process.env.CORS_ORIGIN || '').trim();
+  return Boolean(extra && origin === extra);
+}
+
+app.use((req, res, next) => {
+  const origin = String(req.headers.origin || '');
+  if (allowCorsOrigin(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Flowmate-Client');
+  }
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 function isRealCloudConfig(url, key) {
   const u = String(url || '').trim();
   const k = String(key || '').trim();
@@ -248,14 +281,26 @@ function requestIsHttps(req) {
 
 function setNamedCookie(res, name, sessionId, expiresAt, req) {
   const maxAge = Math.max(0, Math.floor((Date.parse(expiresAt) - Date.now()) / 1000));
-  const parts = [`${name}=${encodeURIComponent(sessionId)}`, 'Path=/', 'HttpOnly', 'SameSite=Lax', `Max-Age=${maxAge}`];
-  if (requestIsHttps(req)) parts.push('Secure');
+  const parts = [`${name}=${encodeURIComponent(sessionId)}`, 'Path=/', 'HttpOnly', `Max-Age=${maxAge}`];
+  if (isCapacitorClient(req)) {
+    parts.push('SameSite=None');
+    if (requestIsHttps(req)) parts.push('Secure');
+  } else {
+    parts.push('SameSite=Lax');
+    if (requestIsHttps(req)) parts.push('Secure');
+  }
   res.append('Set-Cookie', parts.join('; '));
 }
 
 function clearNamedCookie(res, name, req) {
-  const parts = [`${name}=`, 'Path=/', 'HttpOnly', 'SameSite=Lax', 'Max-Age=0'];
-  if (requestIsHttps(req)) parts.push('Secure');
+  const parts = [`${name}=`, 'Path=/', 'HttpOnly', 'Max-Age=0'];
+  if (isCapacitorClient(req)) {
+    parts.push('SameSite=None');
+    if (requestIsHttps(req)) parts.push('Secure');
+  } else {
+    parts.push('SameSite=Lax');
+    if (requestIsHttps(req)) parts.push('Secure');
+  }
   res.append('Set-Cookie', parts.join('; '));
 }
 

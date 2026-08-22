@@ -2,8 +2,10 @@ import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
 const buildVersion=Date.now().toString();
+const forCapacitor = process.env.CAPACITOR === 'true';
 
 export default defineConfig({
+  base: forCapacitor ? './' : '/',
   plugins: [
     react(),
     {
@@ -23,10 +25,9 @@ export default defineConfig({
     target: ['es2020', 'safari14'],
     sourcemap: true,
     rollupOptions: {
-      input: {
-        main: 'index.html',
-        admin: 'admin.html'
-      }
+      input: forCapacitor
+        ? { main: 'index.html' }
+        : { main: 'index.html', admin: 'admin.html' }
     }
   },
   server: {

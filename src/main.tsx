@@ -1,7 +1,9 @@
 import React from 'react';
 import { createRoot } from 'react-dom/client';
+import { Capacitor } from '@capacitor/core';
 import App from './App';
 import { bootstrapCloud } from './cloud';
+import { apiUrl } from './apiBase';
 import './styles.css';
 import './voice.css';
 import './ai.css';
@@ -24,9 +26,9 @@ async function start(){
 
 void start();
 
-if ('serviceWorker' in navigator && import.meta.env.PROD) {
+if ('serviceWorker' in navigator && import.meta.env.PROD && !Capacitor.isNativePlatform()) {
   window.addEventListener('load', async () => {
-    const registration = await navigator.serviceWorker.register('/sw.js');
+    const registration = await navigator.serviceWorker.register(apiUrl('/sw.js'));
     void registration.update();
     window.setInterval(()=>void registration.update(),60_000);
     let refreshing=false;
@@ -34,7 +36,7 @@ if ('serviceWorker' in navigator && import.meta.env.PROD) {
       if(refreshing)return;refreshing=true;
       window.location.reload();
     });
-    const checkAppVersion=async()=>{try{const response=await fetch(`/version.json?t=${Date.now()}`,{cache:'no-store'});const data=await response.json();if(data.version&&data.version!==__APP_BUILD_VERSION__)window.location.reload()}catch{}};
+    const checkAppVersion=async()=>{try{const response=await fetch(apiUrl(`/version.json?t=${Date.now()}`),{cache:'no-store'});const data=await response.json();if(data.version&&data.version!==__APP_BUILD_VERSION__)window.location.reload()}catch{}};
     window.setInterval(()=>void checkAppVersion(),60_000);
   });
 }

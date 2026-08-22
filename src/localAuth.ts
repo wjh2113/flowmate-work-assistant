@@ -1,3 +1,5 @@
+import { apiUrl, isNativeApp } from './apiBase';
+
 export type LocalUser = {
   id: string;
   email: string;
@@ -9,7 +11,10 @@ export type LocalUser = {
 };
 
 export function apiFetch(input: RequestInfo | URL, init?: RequestInit) {
-  return fetch(input, { ...init, credentials: 'include' });
+  const url = typeof input === 'string' ? apiUrl(input) : input;
+  const headers = new Headers(init?.headers);
+  if (isNativeApp()) headers.set('X-Flowmate-Client', 'capacitor');
+  return fetch(url, { ...init, credentials: 'include', headers });
 }
 
 /** Browser TypeError "Failed to fetch" when the API is unreachable. */
