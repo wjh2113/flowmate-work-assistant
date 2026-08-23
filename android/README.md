@@ -16,7 +16,7 @@ npm run android:open   # 用 Android Studio 打开
 ## 首次使用
 
 1. 安装 App 后直接注册/登录（已内置服务器 `https://usertool.aidigitcloud.cn`）
-2. 模型、积分等请在电脑浏览器打开 `https://usertool.aidigitcloud.cn/admin` 配置
+2. **用户端不能自选大模型**；模型、积分等请在电脑浏览器打开 `https://usertool.aidigitcloud.cn/admin` 配置
 
 ## 发布 APK
 

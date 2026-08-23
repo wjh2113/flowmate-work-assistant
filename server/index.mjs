@@ -1892,7 +1892,7 @@ app.delete('/api/settings/cloud', requireSettingsAccess, async (_req, res) => {
   }
 });
 
-async function modelSettingsPublic(userId) {
+async function modelSettingsPublic(userId, { allowModelSelection = true } = {}) {
   const account = await getUserAccount(userId);
   const ai = await resolveAiConfig(userId);
   const models = (await listBuiltinModels({ enabledOnly: true, includeSecrets: true }))
@@ -1904,6 +1904,7 @@ async function modelSettingsPublic(userId) {
     textConfigured: Boolean(ai.textApiKey),
     asrConfigured: Boolean(ai.resolveAsrKey?.()),
     requiresUserKey: false,
+    canSelectModel: allowModelSelection,
     scope: 'builtin',
     source: 'builtin',
     selectedModelId: account?.selectedModelId || ai.modelId || '',
@@ -1918,27 +1919,32 @@ async function modelSettingsPublic(userId) {
       weight: ai.weight,
       costHint: currentHint
     },
-    models: models.map((m) => ({
-      id: m.id,
-      name: m.name,
-      provider: m.provider,
-      textModel: m.textModel,
-      weight: m.weight,
-      badge: m.badge,
-      sortOrder: m.sortOrder,
-      enabled: m.enabled,
-      costHint: modelSwitchCostHint(m),
-      switchConfirm: modelSwitchConfirmMessage(m)
-    }))
+    models: allowModelSelection
+      ? models.map((m) => ({
+        id: m.id,
+        name: m.name,
+        provider: m.provider,
+        textModel: m.textModel,
+        weight: m.weight,
+        badge: m.badge,
+        sortOrder: m.sortOrder,
+        enabled: m.enabled,
+        costHint: modelSwitchCostHint(m),
+        switchConfirm: modelSwitchConfirmMessage(m)
+      }))
+      : []
   };
 }
 
 app.get('/api/settings/model', requireUser, async (req, res) => {
   res.set('Cache-Control', 'no-store');
-  res.json(await modelSettingsPublic(req.user.id));
+  res.json(await modelSettingsPublic(req.user.id, { allowModelSelection: !isCapacitorClient(req) }));
 });
 
 app.put('/api/settings/model', requireUser, async (req, res) => {
+  if (isCapacitorClient(req)) {
+    return res.status(403).json({ message: '移动端不可切换模型，请联系管理员在后台配置' });
+  }
   try {
     const modelId = String(req.body?.modelId || req.body?.selectedModelId || '').trim();
     if (!modelId) return res.status(400).json({ message: '请选择内置模型' });
@@ -1952,6 +1958,9 @@ app.put('/api/settings/model', requireUser, async (req, res) => {
 });
 
 app.post('/api/settings/model/test', requireUser, async (req, res) => {
+  if (isCapacitorClient(req)) {
+    return res.status(403).json({ message: '移动端不可测试切换模型，请联系管理员在后台配置' });
+  }
   try {
     const ai = await resolveAiConfig(req.user.id);
     if (!ai.textApiKey) return res.status(400).json({ message: '管理员尚未配置该模型的 API Key' });
