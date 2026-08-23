@@ -1,0 +1,18 @@
+# /etc/systemd/system/flowmate.service
+[Unit]
+Description=FlowMate Work Assistant
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/flowmate-work-assistant
+EnvironmentFile=/opt/flowmate-work-assistant/.env
+Environment=NODE_ENV=production
+Environment=PORT=3003
+ExecStart=/usr/bin/node server/index.mjs
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

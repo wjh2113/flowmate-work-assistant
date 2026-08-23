@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Session } from '@supabase/supabase-js';
 import { cloudConfigured, deleteDailyReport, deletePeriodReport, deleteTask, getSession, getWorkspace, listPeriodReports, listTasks, loadDailyReport, loadPeriodReport, saveDailyReport, savePeriodReport, sendMagicLink, supabase, updateTask, upsertTask, type CloudTask } from './cloud';
-import { getApiBase, getStoredApiBase, isNativeApp, setStoredApiBase } from './apiBase';
+import { isNativeApp } from './apiBase';
 import { apiFetch, describeApiError, getLocalUser, loginLocalUser, logoutLocalUser, registerLocalUser, type LocalUser } from './localAuth';
 import { deleteFileDailyReport, deleteFilePeriodReport, deleteFileTask, listFilePeriodReports, listFileTasks, loadFileDailyReport, loadFilePeriodReport, patchFileTask, saveFileDailyReport, saveFilePeriodReport, saveFileTask, type PeriodReportMeta } from './localStore';
 import GuidePage from './GuidePage';
@@ -58,7 +58,6 @@ export default function App(){
   const [session,setSession]=useState<Session|null>(null);
   const [localUser,setLocalUser]=useState<LocalUser|null>(null);
   const [authLoading,setAuthLoading]=useState(true);
-  const [nativeServerReady,setNativeServerReady]=useState(()=>!isNativeApp()||Boolean(getApiBase()));
   const [teamId,setTeamId]=useState(''); const [syncing,setSyncing]=useState(false);
   const [clock,setClock]=useState(()=>Date.now());
   const recorder=useRef<MediaRecorder|null>(null); const stream=useRef<MediaStream|null>(null); const chunks=useRef<Blob[]>([]);
@@ -617,17 +616,15 @@ export default function App(){
 
   if(showGuide)return <GuidePage/>;
   if(loginDemo)return <LoginPage demo/>;
-  if(isNativeApp()&&!nativeServerReady)return <NativeServerSetup onReady={()=>setNativeServerReady(true)}/>;
   if(authLoading)return <div className="viewport"><main className="app auth-shell"><div className="cloud-loader"><div className="ai-orb">✦</div><b>{cloudConfigured?'正在连接云端工作区…':'正在检查本地登录状态…'}</b></div></main></div>;
   if(cloudConfigured&&!session)return <LoginPage/>;
-  if(!cloudConfigured&&!localUser)return <LoginPage mode="local" onLocalAuth={async user=>{
-    // Prefer cookie-backed /me, but always enter home with the login response so a brief cookie lag won't block entry.
-    const verified=await getLocalUser().catch(()=>null);
-    setLocalUser(verified||user);
+  if(!cloudConfigured&&!localUser)return <LoginPage mode="local" onLocalAuth={user=>{
+    setLocalUser(user);
     setTab('home');
     setArchiveKind(null);
     setVoiceHistoryOpen(false);
     setReportError('');
+    void getLocalUser().then(verified=>{if(verified)setLocalUser(verified)}).catch(()=>{});
   }}/>;
 
   return <div className="viewport"><main className="app">
@@ -900,40 +897,8 @@ function CloudSettings({onClose,askConfirm}:{onClose:()=>void;askConfirm:(messag
 }
 
 function AppSettings({schedule,onScheduleSaved,onClose,onModelSaved,askConfirm}:{schedule:AutoSchedule;onScheduleSaved:(next:AutoSchedule)=>void;onClose:()=>void;onModelSaved:()=>void;askConfirm:(message:string,options?:{title?:string;confirmLabel?:string;cancelLabel?:string;danger?:boolean})=>Promise<boolean>}){
-  const native=isNativeApp();
-  const [tab,setTab]=useState<'schedule'|'model'|'server'>(native?'server':'model');
-  return <div className="model-settings app-settings"><div className="settings-head"><div><small>应用设置</small><h2>设置</h2></div><button type="button" onClick={onClose} aria-label="关闭">×</button></div><div className="settings-tabs" role="tablist">{native&&<button type="button" role="tab" aria-selected={tab==='server'} className={tab==='server'?'active':''} onClick={()=>setTab('server')}>服务器</button>}<button type="button" role="tab" aria-selected={tab==='schedule'} className={tab==='schedule'?'active':''} onClick={()=>setTab('schedule')}>自动作业</button><button type="button" role="tab" aria-selected={tab==='model'} className={tab==='model'?'active':''} onClick={()=>setTab('model')}>大模型</button></div>{tab==='server'?<ServerSettings onClose={onClose}/>:tab==='schedule'?<ScheduleSettings schedule={schedule} onSaved={onScheduleSaved} onClose={onClose}/>:<ModelSettings onClose={onClose} onSaved={onModelSaved} askConfirm={askConfirm}/>}</div>;
-}
-
-function NativeServerSetup({onReady}:{onReady:()=>void}){
-  return <div className="viewport"><main className="app auth-shell"><section className="login-card"><div className="brand-mark">✓</div><span className="login-eyebrow">FLOWMATE · ANDROID</span><h1>连接 FlowMate 服务器</h1><p>这是用户端 App，不含管理后台。模型、积分等请在电脑浏览器打开 <b>/admin</b> 配置。</p><ServerSettings standalone onReady={onReady}/></section></main></div>;
-}
-
-function ServerSettings({onClose,onReady,standalone}:{onClose?:()=>void;onReady?:()=>void;standalone?:boolean}){
-  const [draft,setDraft]=useState(()=>getStoredApiBase());
-  const [testing,setTesting]=useState(false);
-  const [error,setError]=useState('');
-  const [success,setSuccess]=useState('');
-  const connect=async()=>{
-    setTesting(true);setError('');setSuccess('');
-    try{
-      const base=setStoredApiBase(draft);
-      if(!base)throw new Error('请填写服务器地址，例如 http://192.168.1.31:8787');
-      const response=await fetch(`${base}/api/health`,{credentials:'include',headers:{'X-Flowmate-Client':'capacitor'}});
-      const data=await response.json().catch(()=>({}));
-      if(!response.ok)throw new Error(data.message||`连接失败（${response.status}）`);
-      setSuccess(standalone?'连接成功':'连接成功，请重新登录以同步账号');
-      if(standalone)onReady?.();
-    }catch(e){setError(e instanceof Error?e.message:'连接失败')}
-    finally{setTesting(false)}
-  };
-  const save=()=>{
-    setError('');setSuccess('');
-    const base=setStoredApiBase(draft);
-    if(!base){setError('请填写服务器地址');return}
-    setSuccess(standalone?'已保存，请点击「测试并继续」':'已保存，建议点击「测试连接」后重新登录');
-  };
-  return <><label>FlowMate 服务器地址</label><input className="input" type="url" value={draft} onChange={e=>setDraft(e.target.value)} placeholder="http://192.168.1.31:8787" autoCapitalize="off" autoCorrect="off"/><p className="field-help">手机与电脑需在同一 WiFi。填写运行 npm start 的那台机器的局域网地址，不要用 localhost。</p>{success&&<div className="settings-success">✓ {success}</div>}{error&&<div className="settings-error">{error}</div>}<div className="settings-actions">{!standalone&&onClose&&<button type="button" onClick={onClose}>关闭</button>}<button type="button" disabled={testing} onClick={()=>void connect()}>{testing?'测试中…':(standalone?'测试并继续':'测试连接')}</button><button type="button" onClick={save}>保存</button></div></>;
+  const [tab,setTab]=useState<'schedule'|'model'>('model');
+  return <div className="model-settings app-settings"><div className="settings-head"><div><small>应用设置</small><h2>设置</h2></div><button type="button" onClick={onClose} aria-label="关闭">×</button></div><div className="settings-tabs" role="tablist"><button type="button" role="tab" aria-selected={tab==='schedule'} className={tab==='schedule'?'active':''} onClick={()=>setTab('schedule')}>自动作业</button><button type="button" role="tab" aria-selected={tab==='model'} className={tab==='model'?'active':''} onClick={()=>setTab('model')}>大模型</button></div>{tab==='schedule'?<ScheduleSettings schedule={schedule} onSaved={onScheduleSaved} onClose={onClose}/>:<ModelSettings onClose={onClose} onSaved={onModelSaved} askConfirm={askConfirm}/>}</div>;
 }
 
 function cloneSchedule(schedule:AutoSchedule):AutoSchedule{
@@ -1115,15 +1080,16 @@ function LoginPage({demo=false,mode='cloud',onLocalAuth}:{demo?:boolean;mode?:'c
       if(demo)await new Promise(resolve=>setTimeout(resolve,700));
       else await sendMagicLink(email.trim());
       setSent(true);
-    }catch(err){setError(err instanceof Error?err.message:(mode==='local'?'登录失败':'登录邮件发送失败'))}
+    }catch(err){setError(mode==='local'?describeApiError(err,authTab==='register'?'注册失败':'登录失败'):(err instanceof Error?err.message:'登录邮件发送失败'))}
     finally{setSending(false)}
   };
   if(mode==='local'){
+    const native=isNativeApp();
     return <div className="viewport"><main className="app auth-shell"><section className="login-card">
       <div className="brand-mark">✓</div>
-      <span className="login-eyebrow">FLOWMATE LOCAL</span>
-      <h1>{authTab==='register'?'注册本机账号':'登录工作助手'}</h1>
-      <p>{authTab==='register'?'用邮箱和密码创建账号，任务与复盘仅对本账号可见。':'未配置云端时，请使用本机账号登录后继续使用。'}</p>
+      <span className="login-eyebrow">{native?'FLOWMATE':'FLOWMATE LOCAL'}</span>
+      <h1>{authTab==='register'?(native?'注册账号':'注册本机账号'):'登录工作助手'}</h1>
+      <p>{authTab==='register'?'用邮箱和密码创建账号，任务与复盘仅对本账号可见。':(native?'打开即可使用，无需填写服务器地址。':'未配置云端时，请使用本机账号登录后继续使用。')}</p>
       <div className="auth-tabs" role="tablist">
         <button type="button" role="tab" aria-selected={authTab==='login'} className={authTab==='login'?'active':''} onClick={()=>{setAuthTab('login');setError('')}}>登录</button>
         <button type="button" role="tab" aria-selected={authTab==='register'} className={authTab==='register'?'active':''} onClick={()=>{setAuthTab('register');setError('')}}>注册</button>

@@ -8,7 +8,7 @@
     "dev": "concurrently -k \"vite --host 0.0.0.0\" \"node --watch server/index.mjs\"",
     "start": "node server/index.mjs",
     "build": "tsc --noEmit && vite build",
-    "build:android": "CAPACITOR=true tsc --noEmit && vite build && node -e \"try{require('node:fs').unlinkSync('dist/admin.html')}catch{}\"",
+    "build:android": "CAPACITOR=true VITE_API_BASE_URL=https://usertool.aidigitcloud.cn tsc --noEmit && vite build && node -e \"try{require('node:fs').unlinkSync('dist/admin.html')}catch{}\"",
     "android:sync": "npm run build:android && npx cap sync android",
     "android:open": "npx cap open android",
     "android:run": "npm run android:sync && npx cap run android",

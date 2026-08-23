@@ -1,6 +1,7 @@
 import { Capacitor } from '@capacitor/core';
 
-const STORAGE_KEY = 'flowmate.apiBase';
+/** Production API origin baked into the Android/iOS user app. */
+export const NATIVE_DEFAULT_API_BASE = 'https://usertool.aidigitcloud.cn';
 
 function normalizeBase(value: string) {
   return String(value || '').trim().replace(/\/+$/, '');
@@ -11,30 +12,11 @@ export function isNativeApp() {
   return Capacitor.isNativePlatform();
 }
 
-export function getStoredApiBase() {
-  try {
-    return normalizeBase(localStorage.getItem(STORAGE_KEY) || '');
-  } catch {
-    return '';
-  }
-}
-
-export function setStoredApiBase(value: string) {
-  const next = normalizeBase(value);
-  try {
-    if (next) localStorage.setItem(STORAGE_KEY, next);
-    else localStorage.removeItem(STORAGE_KEY);
-  } catch {}
-  return next;
-}
-
 /** API origin for native app; empty string on web (same-origin /api). */
 export function getApiBase() {
-  const stored = getStoredApiBase();
-  if (stored) return stored;
   const fromEnv = normalizeBase(import.meta.env.VITE_API_BASE_URL || '');
-  if (fromEnv) return fromEnv;
-  return '';
+  if (isNativeApp()) return fromEnv || NATIVE_DEFAULT_API_BASE;
+  return fromEnv;
 }
 
 export function apiUrl(path: string) {

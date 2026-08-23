@@ -98,7 +98,7 @@ npm run android:open
 
 详见 [android/README.md](android/README.md)。
 
-**首次使用**：App 启动后填写服务器局域网地址（如 `http://192.168.1.31:8787`）→ 测试并继续 → 注册/登录。
+**首次使用**：安装后打开即可注册/登录。App 已内置服务器 `https://usertool.aidigitcloud.cn`，无需填写地址。
 
 ### H5 安装到主屏幕
 

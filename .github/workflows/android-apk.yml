@@ -49,6 +49,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG=android-user-debug
-          NOTES="FlowMate 用户端调试 APK（侧载安装）。首次打开填写服务器地址，如 http://192.168.1.31:8787。管理后台请用电脑浏览器 /admin。"
+          NOTES="FlowMate 用户端调试 APK（侧载安装）。打开即可注册/登录，已内置 https://usertool.aidigitcloud.cn。管理后台请用电脑浏览器 https://usertool.aidigitcloud.cn/admin。"
           gh release view "$TAG" 2>/dev/null || gh release create "$TAG" --title "FlowMate Android 用户端 (debug)" --notes "$NOTES"
           gh release upload "$TAG" android/app/build/outputs/apk/debug/app-debug.apk --clobber

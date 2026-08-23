@@ -10,18 +10,33 @@ export type LocalUser = {
   selectedModelId?: string;
 };
 
+const API_TIMEOUT_MS = 20_000;
+
 export function apiFetch(input: RequestInfo | URL, init?: RequestInit) {
   const url = typeof input === 'string' ? apiUrl(input) : input;
   const headers = new Headers(init?.headers);
   if (isNativeApp()) headers.set('X-Flowmate-Client', 'capacitor');
-  return fetch(url, { ...init, credentials: 'include', headers });
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  const signal = init?.signal
+    ? (() => {
+        const outer = init.signal!;
+        if (outer.aborted) controller.abort(outer.reason);
+        else outer.addEventListener('abort', () => controller.abort(outer.reason), { once: true });
+        return controller.signal;
+      })()
+    : controller.signal;
+  return fetch(url, { ...init, credentials: 'include', headers, signal }).finally(() => window.clearTimeout(timer));
 }
 
 /** Browser TypeError "Failed to fetch" when the API is unreachable. */
 export function describeApiError(error: unknown, fallback = '请求失败，请重试'): string {
   const message = error instanceof Error ? error.message : String(error || '');
+  if (error instanceof DOMException && error.name === 'AbortError') {
+    return '连接服务器超时，请检查网络后重试';
+  }
   if (/failed to fetch|load failed|networkerror|network request failed|internet connection appears to be offline/i.test(message)) {
-    return '无法连接服务器，请确认服务已启动';
+    return '无法连接服务器，请检查网络后重试';
   }
   return message.trim() || fallback;
 }
