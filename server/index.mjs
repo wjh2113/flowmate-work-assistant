@@ -237,7 +237,7 @@ app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Credentials', 'true');
     res.setHeader('Vary', 'Origin');
     res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Flowmate-Client');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Flowmate-Client, X-Flowmate-Session');
   }
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
@@ -271,6 +271,13 @@ function parseCookies(req) {
     else out[decodeURIComponent(trimmed.slice(0, index))] = decodeURIComponent(trimmed.slice(index + 1));
   }
   return out;
+}
+
+function sessionIdFromRequest(req, cookieName = SESSION_COOKIE) {
+  const fromCookie = parseCookies(req)[cookieName];
+  if (fromCookie) return fromCookie;
+  if (cookieName !== SESSION_COOKIE) return '';
+  return String(req.headers['x-flowmate-session'] || '').trim();
 }
 
 function requestIsHttps(req) {
@@ -327,7 +334,7 @@ function requireUser(req, res, next) {
   }
   Promise.resolve()
     .then(async () => {
-      const session = await getSession(parseCookies(req)[SESSION_COOKIE]);
+      const session = await getSession(sessionIdFromRequest(req));
       if (!session?.user) return res.status(401).json({ error: 'UNAUTHORIZED', message: '请先登录' });
       req.user = await enrichUser(session.user);
       req.sessionId = session.id;
@@ -1707,7 +1714,7 @@ app.post('/api/auth/register', async (req, res) => {
     const session = await createSession(user.id, SESSION_DAYS);
     setSessionCookie(res, session.id, session.expiresAt, req);
     const legacy = await applyLegacyClaim(user.id);
-    res.status(201).json({ user, legacy });
+    res.status(201).json({ user, legacy, ...(isCapacitorClient(req) ? { sessionId: session.id } : {}) });
   } catch (error) {
     res.status(400).json({ message: error?.message || '注册失败' });
   }
@@ -1721,14 +1728,14 @@ app.post('/api/auth/login', async (req, res) => {
     const session = await createSession(user.id, SESSION_DAYS);
     setSessionCookie(res, session.id, session.expiresAt, req);
     const legacy = await applyLegacyClaim(user.id);
-    res.json({ user, legacy });
+    res.json({ user, legacy, ...(isCapacitorClient(req) ? { sessionId: session.id } : {}) });
   } catch (error) {
     res.status(401).json({ message: error?.message || '登录失败' });
   }
 });
 
 app.post('/api/auth/logout', async (req, res) => {
-  const sid = parseCookies(req)[SESSION_COOKIE];
+  const sid = sessionIdFromRequest(req);
   if (sid) await deleteSession(sid);
   clearSessionCookie(res, req);
   res.status(204).end();
@@ -1768,7 +1775,7 @@ app.get('/api/admin/auth/me', async (req, res) => {
 
 app.get('/api/auth/me', async (req, res) => {
   if (cloudMode()) return res.json({ user: null, mode: 'supabase' });
-  const session = await getSession(parseCookies(req)[SESSION_COOKIE]);
+  const session = await getSession(sessionIdFromRequest(req));
   if (!session?.user) return res.status(401).json({ user: null, message: '未登录' });
   res.json({ user: await enrichUser(session.user), mode: 'local' });
 });
