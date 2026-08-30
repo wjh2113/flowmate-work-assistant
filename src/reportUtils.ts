@@ -279,3 +279,35 @@ export function formatPeriodLabel(kind: 'weekly' | 'monthly', key: string) {
   const range = weekRange(start);
   return `${key} · ${range.weekStart} ~ ${range.weekEnd}`;
 }
+
+const RELATIVE_DUE = /^(今天|今日|明天|明日|后天|昨天|前天)(?:\s+(.+))?$/;
+
+function startOfLocalDay(date: Date) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+}
+
+/** Resolve frozen labels like "今天" against createdAt, then display relative to now. */
+export function formatDueLabel(due: string, createdAt?: string, now = Date.now()) {
+  const raw = String(due || '').trim();
+  if (!raw) return '今天';
+  const created = createdAt ? new Date(createdAt) : new Date(now);
+  if (!Number.isFinite(created.getTime())) return raw;
+  const match = RELATIVE_DUE.exec(raw);
+  if (!match) return raw;
+  const word = match[1];
+  const rest = String(match[2] || '').trim();
+  const offset = word === '明天' || word === '明日' ? 1
+    : word === '后天' ? 2
+    : word === '昨天' ? -1
+    : word === '前天' ? -2
+    : 0;
+  const target = new Date(created.getFullYear(), created.getMonth(), created.getDate() + offset);
+  const diffDays = Math.round((startOfLocalDay(target) - startOfLocalDay(new Date(now))) / 86_400_000);
+  const suffix = rest ? ` ${rest}` : '';
+  if (diffDays === 0) return `今天${suffix}`;
+  if (diffDays === 1) return `明天${suffix}`;
+  if (diffDays === 2) return `后天${suffix}`;
+  if (diffDays === -1) return `昨天${suffix}`;
+  if (diffDays === -2) return `前天${suffix}`;
+  return `${target.getMonth() + 1}月${target.getDate()}日${suffix}`;
+}
