@@ -1,0 +1,77 @@
+/* Android WebView paints backdrop-filter as extra opaque layers that cover task cards. */
+html.native-app .stat,
+html.native-app .task,
+html.native-app .activity,
+html.native-app .profile,
+html.native-app .week,
+html.native-app .menu,
+html.native-app .ai-report,
+html.native-app .sheet,
+html.native-app nav,
+html.native-app .filters button,
+html.native-app .people button,
+html.native-app .voice-card,
+html.native-app .quick-create,
+html.native-app .toast,
+html.native-app .add-plan,
+html.native-app .tomorrow > i,
+html.native-app .ai-badge,
+html.native-app .app {
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+}
+
+html.native-app .stat,
+html.native-app .task,
+html.native-app .activity,
+html.native-app .profile,
+html.native-app .week,
+html.native-app .menu,
+html.native-app .ai-report {
+  background: #fff !important;
+}
+
+html.native-app nav {
+  background: #fff !important;
+}
+
+html.native-app .filters button,
+html.native-app .people button {
+  background: #f8fafc !important;
+}
+
+html.native-app .filters button.active,
+html.native-app .people button.selected {
+  background: linear-gradient(135deg, #0891b2, #06b6d4) !important;
+  color: #fff !important;
+}
+
+html.native-app .page-title,
+html.native-app header h1,
+html.native-app .week strong {
+  background: none !important;
+  -webkit-background-clip: unset !important;
+  background-clip: unset !important;
+  color: #0f172a !important;
+  -webkit-text-fill-color: #0f172a !important;
+}
+
+html.native-app .viewport,
+html.native-app .app {
+  overflow: visible;
+}
+
+html.native-app .viewport::before,
+html.native-app .viewport::after {
+  display: none !important;
+}
+
+html.native-app .task {
+  overflow: visible;
+  transform: none !important;
+  grid-template-columns: 24px minmax(0, 1fr);
+}
+
+html.native-app .task > div {
+  min-width: 0;
+}

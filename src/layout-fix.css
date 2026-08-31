@@ -29,6 +29,11 @@
 .task-wrap>.task{
   margin-bottom:0;
   padding-right:58px;
+  grid-template-columns:24px minmax(0,1fr);
+}
+
+.task-wrap>.task>div{
+  min-width:0;
 }
 
 .task-delete{

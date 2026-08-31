@@ -18,6 +18,9 @@ import './layout-fix.css';
 import './dialog.css';
 import './theme.css';
 import './polish.css';
+import './native.css';
+
+if (Capacitor.isNativePlatform()) document.documentElement.classList.add('native-app');
 
 async function start(){
   await bootstrapCloud();

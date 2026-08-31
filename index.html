@@ -16,6 +16,13 @@
     <link rel="icon" href="/icon.svg" />
     <link rel="apple-touch-icon" href="/icon.svg" />
     <title>FlowMate 工作助手</title>
+    <script>
+      try {
+        if (window.Capacitor && typeof window.Capacitor.isNativePlatform === 'function' && window.Capacitor.isNativePlatform()) {
+          document.documentElement.classList.add('native-app');
+        }
+      } catch (e) {}
+    </script>
   </head>
   <body>
     <div id="root"></div>
