@@ -1,4 +1,5 @@
 import { apiUrl, isNativeApp } from './apiBase';
+import { clearOfflineData, isConnectivityError, isOfflineNow, readCachedUser, writeCachedUser } from './offlineStore';
 
 export type LocalUser = {
   id: string;
@@ -33,16 +34,17 @@ function writeNativeSession(sessionId?: string) {
   }
 }
 
-export function apiFetch(input: RequestInfo | URL, init?: RequestInit) {
+export function apiFetch(input: RequestInfo | URL, init?: RequestInit & { timeoutMs?: number }) {
   const url = typeof input === 'string' ? apiUrl(input) : input;
-  const headers = new Headers(init?.headers);
+  const { timeoutMs, ...rest } = (init || {}) as RequestInit & { timeoutMs?: number };
+  const headers = new Headers(rest.headers);
   if (isNativeApp()) {
     headers.set('X-Flowmate-Client', 'capacitor');
     const sessionId = readNativeSession();
     if (sessionId) headers.set('X-Flowmate-Session', sessionId);
   }
   const controller = new AbortController();
-  const timer = window.setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs || API_TIMEOUT_MS);
   const signal = init?.signal
     ? (() => {
         const outer = init.signal!;
@@ -51,7 +53,7 @@ export function apiFetch(input: RequestInfo | URL, init?: RequestInit) {
         return controller.signal;
       })()
     : controller.signal;
-  return fetch(url, { ...init, credentials: 'include', headers, signal }).finally(() => window.clearTimeout(timer));
+  return fetch(url, { ...rest, credentials: 'include', headers, signal }).finally(() => window.clearTimeout(timer));
 }
 
 /** Browser TypeError "Failed to fetch" when the API is unreachable. */
@@ -89,6 +91,7 @@ export async function registerLocalUser(input: { email: string; password: string
   const data = await readAuthJson<{ user?: LocalUser; message?: string; sessionId?: string }>(response);
   if (!response.ok || !data.user) throw new Error(data.message || '注册失败');
   writeNativeSession(data.sessionId);
+  writeCachedUser(data.user);
   return data.user;
 }
 
@@ -101,24 +104,35 @@ export async function loginLocalUser(input: { email: string; password: string })
   const data = await readAuthJson<{ user?: LocalUser; message?: string; sessionId?: string }>(response);
   if (!response.ok || !data.user) throw new Error(data.message || '登录失败');
   writeNativeSession(data.sessionId);
+  writeCachedUser(data.user);
   return data.user;
 }
 
 export async function logoutLocalUser(): Promise<void> {
   try {
-    await apiFetch('/api/auth/logout', { method: 'POST' });
+    await apiFetch('/api/auth/logout', { method: 'POST', timeoutMs: 4000 });
   } finally {
     writeNativeSession('');
+    clearOfflineData();
   }
 }
 
 export async function getLocalUser(): Promise<LocalUser | null> {
-  const response = await apiFetch('/api/auth/me', { cache: 'no-store' });
-  if (response.status === 401) {
-    writeNativeSession('');
+  const cached = isNativeApp() ? readCachedUser() : null;
+  if (cached && isOfflineNow()) return cached as LocalUser;
+  try {
+    const response = await apiFetch('/api/auth/me', { cache: 'no-store', timeoutMs: cached ? 4000 : API_TIMEOUT_MS });
+    if (response.status === 401) {
+      writeNativeSession('');
+      writeCachedUser(null);
+      return null;
+    }
+    const data = await readAuthJson<{ user?: LocalUser | null; mode?: string; message?: string }>(response);
+    if (!response.ok) return cached as LocalUser | null;
+    if (data.user) writeCachedUser(data.user);
+    return data.user || cached as LocalUser | null;
+  } catch (error) {
+    if (cached && (isConnectivityError(error) || isOfflineNow())) return cached as LocalUser;
     return null;
   }
-  const data = await readAuthJson<{ user?: LocalUser | null; mode?: string; message?: string }>(response);
-  if (!response.ok) return null;
-  return data.user || null;
 }

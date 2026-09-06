@@ -75,3 +75,14 @@ html.native-app .task {
 html.native-app .task > div {
   min-width: 0;
 }
+
+.offline-banner {
+  margin: calc(10px + env(safe-area-inset-top)) 16px 0;
+  padding: 9px 12px;
+  border-radius: 12px;
+  background: #fff7ed;
+  color: #c2410c;
+  font-size: 12px;
+  font-weight: 700;
+  text-align: center;
+}

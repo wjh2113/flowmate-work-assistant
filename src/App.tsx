@@ -3,11 +3,12 @@ import type { Session } from '@supabase/supabase-js';
 import { cloudConfigured, deleteDailyReport, deletePeriodReport, deleteTask, getSession, getWorkspace, listPeriodReports, listTasks, loadDailyReport, loadPeriodReport, saveDailyReport, savePeriodReport, sendMagicLink, supabase, updateTask, upsertTask, type CloudTask } from './cloud';
 import { isNativeApp } from './apiBase';
 import { apiFetch, describeApiError, getLocalUser, loginLocalUser, logoutLocalUser, registerLocalUser, type LocalUser } from './localAuth';
-import { deleteFileDailyReport, deleteFilePeriodReport, deleteFileTask, listFilePeriodReports, listFileTasks, loadFileDailyReport, loadFilePeriodReport, patchFileTask, saveFileDailyReport, saveFilePeriodReport, saveFileTask, type PeriodReportMeta } from './localStore';
+import { deleteFileDailyReport, deleteFilePeriodReport, deleteFileTask, flushOfflineQueue, listFilePeriodReports, listFileTasks, loadFileDailyReport, loadFilePeriodReport, patchFileTask, saveFileDailyReport, saveFilePeriodReport, saveFileTask, type PeriodReportMeta } from './localStore';
 import GuidePage from './GuidePage';
 import { toSimplified } from './chinese';
 import { DEFAULT_AUTO_SCHEDULE, WEEKDAY_LABELS, formatDueLabel, formatPeriodLabel, formatTimeHM, isSlotDone, isoWeekKey, latestDueDailySlot, latestDueMonthlySlot, latestDueVoiceRetentionSlot, latestDueWeeklySlot, loadAutoSchedule, localDateKey, markSlotDone, monthKey, normalizeTimes, parseTimeHM, saveAutoSchedule, shiftIsoWeekKey, shiftMonthKey, suppressAutoSlotsForKind, weekRange, type AutoSchedule, type TimeHM } from './reportUtils';
 import { migrateLegacyStorageKey, readUserStorage, setUserStorageScope, writeUserStorage } from './userStorage';
+import { getOfflineStatus, isOfflineNow, readSnapshot, setOfflineUserId, subscribeOffline } from './offlineStore';
 
 type Tab = 'home' | 'tasks' | 'team' | 'mine';
 type Status = 'todo' | 'doing' | 'done';
@@ -59,6 +60,7 @@ export default function App(){
   const [localUser,setLocalUser]=useState<LocalUser|null>(null);
   const [authLoading,setAuthLoading]=useState(true);
   const [teamId,setTeamId]=useState(''); const [syncing,setSyncing]=useState(false);
+  const [offlineStatus,setOfflineStatus]=useState(()=>getOfflineStatus());
   const [clock,setClock]=useState(()=>Date.now());
   const recorder=useRef<MediaRecorder|null>(null); const stream=useRef<MediaStream|null>(null); const chunks=useRef<Blob[]>([]);
   const browserRecognition=useRef<SpeechRecognition|null>(null); const localTranscript=useRef('');
@@ -127,8 +129,17 @@ export default function App(){
   useEffect(()=>{cloudContext.current={session,teamId}},[session,teamId]);
   useEffect(()=>{
     setUserStorageScope(accountScope||'anon');
+    setOfflineUserId(accountScope||'');
     setAutoSchedule(loadAutoSchedule());
   },[accountScope]);
+  useEffect(()=>{
+    const sync=()=>setOfflineStatus(getOfflineStatus());
+    const unsub=subscribeOffline(sync);
+    window.addEventListener('online',sync);
+    window.addEventListener('offline',sync);
+    sync();
+    return()=>{unsub();window.removeEventListener('online',sync);window.removeEventListener('offline',sync)};
+  },[]);
   useEffect(()=>{
     if(!signedIn){setAiReady(null);setAvatarUrl('');return}
     refreshAiReady();
@@ -144,7 +155,10 @@ export default function App(){
           await apiFetch('/api/settings/profile',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({avatar})}).catch(()=>{});
         }
       }
-      if(active)setAvatarUrl(avatar);
+      if(active){
+        setAvatarUrl(avatar);
+        if(avatar)writeUserStorage('avatar',avatar);
+      }
       if(data.autoSchedule||data.voiceRetention){
         const next=saveAutoSchedule({
           ...(data.autoSchedule||loadAutoSchedule()),
@@ -152,7 +166,10 @@ export default function App(){
         });
         if(active)setAutoSchedule(next);
       }
-    }).catch(()=>{});
+    }).catch(()=>{
+      const cached=readUserStorage('avatar')||migrateLegacyStorageKey('flowmate.avatar','avatar');
+      if(cached&&active)setAvatarUrl(cached);
+    });
     return()=>{active=false};
   },[signedIn,accountScope]);
   useEffect(()=>{
@@ -161,7 +178,22 @@ export default function App(){
     let active=true;let first=true;
     const refresh=async()=>{
       try{
+        if(first && isNativeApp() && localUser){
+          setOfflineUserId(localUser.id);
+          const cached=readSnapshot();
+          if(cached){
+            setTasks(cached.tasks.map(normalizeTask).filter(isRealTask));
+            const cachedDaily=cached.daily[dateKey];
+            const cachedWeekly=cached.weekly[weekKey];
+            const cachedMonthly=cached.monthly[monthKeyValue];
+            if(cachedDaily)setReport(toSimplified(cachedDaily) as DailyReport);
+            if(cachedWeekly)setWeeklyReport(toSimplified(cachedWeekly) as PeriodReport);
+            if(cachedMonthly)setMonthlyReport(toSimplified(cachedMonthly) as PeriodReport);
+          }
+        }
+        if(isOfflineNow()){if(active&&first){first=false;setSyncing(false)}return}
         if(first)setSyncing(true);
+        await flushOfflineQueue();
         const [storedTasks,storedReport,storedWeekly,storedMonthly]=await Promise.all([
           listFileTasks(),
           loadFileDailyReport<DailyReport>(dateKey),
@@ -195,13 +227,16 @@ export default function App(){
         setMonthlyReport(storedMonthly?toSimplified(storedMonthly):null);
         setReportError('');
       }catch(error){
-        if(active)setReportError(error instanceof Error?`数据读取失败：${error.message}`:'数据读取失败');
+        if(active && !readSnapshot()?.tasks?.length)setReportError(error instanceof Error?`数据读取失败：${error.message}`:'数据读取失败');
       }finally{
         if(active&&first){first=false;setSyncing(false)}
       }
     };
-    void refresh();const timer=window.setInterval(refresh,5000);
-    return()=>{active=false;window.clearInterval(timer)};
+    void refresh();
+    const timer=window.setInterval(()=>{if(!isOfflineNow())void refresh()},5000);
+    const onOnline=()=>{void flushOfflineQueue().then(()=>refresh())};
+    window.addEventListener('online',onOnline);
+    return()=>{active=false;window.clearInterval(timer);window.removeEventListener('online',onOnline)};
   },[localUser,dateKey,weekKey,monthKeyValue]);
   useEffect(()=>{
     let active=true;
@@ -247,6 +282,7 @@ export default function App(){
   },[signedIn,accountScope]);
   useEffect(()=>{
     if(tab!=='home')return;
+    if(isOfflineNow())return;
     const now=new Date(clock);
     if(aiReady&&tasks.length>0){
       if(!reportLoadingRef.current&&!reportRef.current){
@@ -422,7 +458,9 @@ export default function App(){
     setSyncing(true);(session&&teamId?upsertTask(toCloud(task,teamId,session.user.id)):saveFileTask(task)).catch(error=>notify(`任务保存失败：${error.message}`)).finally(()=>setSyncing(false));
   };
   const createTasksFromText=async()=>{
-    const text=toSimplified(transcript.trim());if(!text)return;setProcessing(true);setVoiceTip('已提交，AI 将在后台整理…');
+    const text=toSimplified(transcript.trim());if(!text)return;
+    if(isNativeApp()&&isOfflineNow()){setVoiceTip('当前离线，AI 指令需要联网。请先点右下角 ＋ 手打任务');return}
+    setProcessing(true);setVoiceTip('已提交，AI 将在后台整理…');
     try{
       const response=await apiFetch('/api/voice-jobs/text',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
         transcript:text,
@@ -469,6 +507,7 @@ export default function App(){
     return `实时转写中断（${code}），结束后仍交由 AI 识别`;
   };
   const beginRecording=async()=>{
+    if(isNativeApp()&&isOfflineNow()){setVoiceTip('当前离线，语音需要联网。请先点右下角 ＋ 手打任务');return}
     if(!window.isSecureContext){setVoiceTip('当前不是安全连接。请使用 localhost 或 HTTPS，浏览器才会开放麦克风。');return}
     if(!navigator.mediaDevices?.getUserMedia||!window.MediaRecorder){setVoiceTip('当前浏览器不支持录音，请使用最新版 Chrome、Edge 或 Safari。');return}
     try{
@@ -560,6 +599,7 @@ export default function App(){
 
   const uploadPhoto=async(file?:File|null)=>{
     if(!file)return;
+    if(isNativeApp()&&isOfflineNow()){notify('当前离线，拍照识别需要联网。请先手打任务');return}
     const isImage=file.type.startsWith('image/')||/\.(jpe?g|png|webp|gif|heic|heif)$/i.test(file.name);
     if(!isImage){notify('请选择图片文件');return}
     if(file.size>10*1024*1024){notify('图片请控制在 10MB 以内');return}
@@ -628,6 +668,7 @@ export default function App(){
   }}/>;
 
   return <div className="viewport"><main className="app">
+    {isNativeApp()&&(offlineStatus.offline||offlineStatus.pending>0)&&<div className="offline-banner" role="status">{offlineStatus.offline?'离线模式 · 任务保存在本机，联网后自动同步':`有 ${offlineStatus.pending} 项改动待同步`}</div>}
     {tab==='home'&&<div className="page home-page">
       <header><div className="home-greeting"><span className="brand-chip">FLOWMATE</span><h1>{displayName==='我'?'你好':`你好，${displayName}`}</h1></div><div className="header-actions"><a className="help-button" href="/?guide=1" aria-label="打开使用指南">?</a><button className="avatar" onClick={()=>goTab('mine')} aria-label="打开我的页面">{avatarUrl?<img src={avatarUrl} alt=""/>:avatarText}<i/></button></div></header>
       <Title text="今日概览" action={new Intl.DateTimeFormat('zh-CN',{month:'long',day:'numeric',weekday:'short'}).format(new Date())}/>
@@ -646,7 +687,7 @@ export default function App(){
     </div>}
     {tab==='tasks'&&<ListPage title="我的任务" tasks={realTasks.filter(t=>t.assignee==='我')} cycle={cycle} remove={removeTask} now={clock} voiceProgress={voiceProgress} onRetryVoice={id=>void retryVoiceJob(id)} onDismissVoice={id=>void dismissVoiceJob(id)}/>} 
     {tab==='team'&&<ListPage title="团队任务" tasks={realTasks.filter(t=>t.assignee!=='我')} cycle={cycle} remove={removeTask} now={clock}/>} 
-    {tab==='mine'&&(voiceHistoryOpen?<VoiceHistoryPage onBack={()=>setVoiceHistoryOpen(false)}/>:archiveKind?<PeriodArchivePage kind={archiveKind} session={session} teamId={teamId} currentKey={archiveKind==='weekly'?weekKey:monthKeyValue} onBack={()=>setArchiveKind(null)}/>:<Profile avatarText={avatarText} avatarUrl={avatarUrl} onAvatarFile={file=>void saveAvatar(file)} displayName={displayName} accountHint={session?.user.email||localUser?.email||''} pointsBalance={localUser?.pointsBalance} tasks={realTasks} aiReady={aiReady} cloudOnline={Boolean(session)} localOnline={Boolean(localUser)} syncing={syncing} signOut={()=>void signOut()} goTeam={()=>goTab('team')} openSettings={()=>setModal('settings')} openWeeklyArchive={()=>setArchiveKind('weekly')} openMonthlyArchive={()=>setArchiveKind('monthly')} openVoiceHistory={()=>setVoiceHistoryOpen(true)}/>)}
+    {tab==='mine'&&(voiceHistoryOpen?<VoiceHistoryPage onBack={()=>setVoiceHistoryOpen(false)}/>:archiveKind?<PeriodArchivePage kind={archiveKind} session={session} teamId={teamId} currentKey={archiveKind==='weekly'?weekKey:monthKeyValue} onBack={()=>setArchiveKind(null)}/>:<Profile avatarText={avatarText} avatarUrl={avatarUrl} onAvatarFile={file=>void saveAvatar(file)} displayName={displayName} accountHint={session?.user.email||localUser?.email||''} pointsBalance={localUser?.pointsBalance} tasks={realTasks} aiReady={aiReady} cloudOnline={Boolean(session)} localOnline={Boolean(localUser)} offline={offlineStatus.offline||offlineStatus.pending>0} syncing={syncing} signOut={()=>void signOut()} goTeam={()=>goTab('team')} openSettings={()=>setModal('settings')} openWeeklyArchive={()=>setArchiveKind('weekly')} openMonthlyArchive={()=>setArchiveKind('monthly')} openVoiceHistory={()=>setVoiceHistoryOpen(true)}/>)}
     <div className="quick-create" role="group" aria-label="新建任务">
       <button className="quick-voice" type="button" onClick={()=>{setVoiceTip('可以说任务，也可以改今日复盘/周报/月报');setModal('voice')}} aria-label="语音创建任务或修改复盘"><MicIcon/><span>语音</span></button>
       <button className="quick-photo" type="button" onClick={()=>setModal('photo')} aria-label="拍照或从相册识别任务"><CameraIcon/><span>拍照</span></button>
@@ -725,7 +766,7 @@ function taskElapsed(task:Task,now:number){if(!task.startedAt)return 0;const sta
 function TrashIcon(){return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m-9 0 1 13h10l1-13M10 11v5m4-5v5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/></svg>}
 function TaskItem({task,cycle,remove,now}:{task:Task;cycle:(id:string)=>void;remove:(id:string,title:string)=>void;now:number}){const elapsed=taskElapsed(task,now);const priorityClass=task.priority==='高'?'priority-high':task.priority==='低'?'priority-low':'priority-mid';return <div className={'task-wrap '+priorityClass}><button className="task" onClick={()=>cycle(task.id)}><i className={`task-status ${task.status}`}>{task.status==='done'?'✓':''}</i><div><strong className={task.status==='done'?'done':''}>{task.title}</strong><p><b className={task.priority==='高'?'high':''}>{task.priority}优先级</b> · {formatDueLabel(task.due,task.createdAt,now)} · {task.assignee}</p><div className="task-time"><span>预计 {formatDuration(task.estimatedMinutes)}</span><span>已进行 {formatDuration(elapsed)}</span></div>{task.assignee!=='我'&&task.status!=='done'&&<span className="progress"><em style={{width:`${task.progress}%`}}/></span>}</div></button><button className="task-delete" type="button" onClick={()=>remove(task.id,task.title)} aria-label={`删除任务：${task.title}`}><TrashIcon/></button></div>}
 function ListPage({title,tasks,cycle,remove,now,voiceProgress,onRetryVoice,onDismissVoice}:{title:string;tasks:Task[];cycle:(id:string)=>void;remove:(id:string,title:string)=>void;now:number;voiceProgress?:VoiceProgress[];onRetryVoice?:(id:string)=>void;onDismissVoice?:(id:string)=>void}){const [filter,setFilter]=useState('全部');const list=tasks.filter(t=>filter==='全部'||(filter==='已完成'?t.status==='done':t.status!=='done'));return <div className="page"><h1 className="page-title">{title}</h1><p className="page-sub">轻点任务切换状态，右侧按钮可删除任务</p>{voiceProgress&&voiceProgress.length>0&&onRetryVoice&&onDismissVoice&&<VoiceProgressPanel items={voiceProgress} onRetry={onRetryVoice} onDismiss={onDismissVoice}/>}<div className="filters">{['全部','进行中','已完成'].map(f=><button key={f} className={f===filter?'active':''} onClick={()=>setFilter(f)}>{f}</button>)}</div>{list.map(t=><TaskItem key={t.id} task={t} cycle={cycle} remove={remove} now={now}/>)}{!list.length&&<div className="empty">还没有任务，点下方语音或加号开始</div>}</div>}
-function Profile({avatarText,avatarUrl,onAvatarFile,displayName,accountHint,pointsBalance,tasks,aiReady,cloudOnline,localOnline,syncing,signOut,goTeam,openSettings,openWeeklyArchive,openMonthlyArchive,openVoiceHistory}:{avatarText:string;avatarUrl:string;onAvatarFile:(file:File)=>void;displayName:string;accountHint:string;pointsBalance?:number;tasks:Task[];aiReady:boolean|null;cloudOnline:boolean;localOnline:boolean;syncing:boolean;signOut:()=>void;goTeam:()=>void;openSettings:()=>void;openWeeklyArchive:()=>void;openMonthlyArchive:()=>void;openVoiceHistory:()=>void}){
+function Profile({avatarText,avatarUrl,onAvatarFile,displayName,accountHint,pointsBalance,tasks,aiReady,cloudOnline,localOnline,offline,syncing,signOut,goTeam,openSettings,openWeeklyArchive,openMonthlyArchive,openVoiceHistory}:{avatarText:string;avatarUrl:string;onAvatarFile:(file:File)=>void;displayName:string;accountHint:string;pointsBalance?:number;tasks:Task[];aiReady:boolean|null;cloudOnline:boolean;localOnline:boolean;offline?:boolean;syncing:boolean;signOut:()=>void;goTeam:()=>void;openSettings:()=>void;openWeeklyArchive:()=>void;openMonthlyArchive:()=>void;openVoiceHistory:()=>void}){
   const fileRef=useRef<HTMLInputElement|null>(null);
   const rate=Math.round(tasks.filter(t=>t.status==='done').length/Math.max(tasks.length,1)*100);
   const menus=[
@@ -742,7 +783,7 @@ function Profile({avatarText,avatarUrl,onAvatarFile,displayName,accountHint,poin
       <div className="profile-identity"><b>{displayName}</b>{accountHint&&<span>{accountHint}</span>}{typeof pointsBalance==='number'&&<span className="points-balance">积分 {Math.round(pointsBalance)}</span>}</div>
       <span className={'ai-status '+(aiReady?'online':'')}>● {aiReady?'智能助手已连接':'智能助手待配置'}</span>
       {cloudOnline&&<span className="ai-status online">● {syncing?'云端同步中':'云端数据已同步'}</span>}
-      {localOnline&&!cloudOnline&&<span className="ai-status online">● 本机账号已登录</span>}
+      {localOnline&&!cloudOnline&&<span className="ai-status online">● {offline?'离线可用，联网后同步':'本机账号已登录'}</span>}
     </section>
     <section className="week"><h2>本周效率</h2><strong>{rate}%</strong><p>任务完成率</p><span><i style={{width:`${rate}%`}}/></span></section>
     {menus.map(item=><button className="menu" key={item.t} onClick={item.action}><i>{item.i}</i><span>{item.t}</span><b>›</b></button>)}
