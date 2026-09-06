@@ -72,6 +72,7 @@ export default function App(){
   const voicePolling=useRef(new Set<string>()); const voicePollTimers=useRef(new Map<string,number>());
   const reportEditPolling=useRef(new Set<string>()); const reportEditPollTimers=useRef(new Map<string,number>());
   const tasksRef=useRef(tasks);
+  const writesInFlight=useRef(0);
   const reportLoadingRef=useRef(false);
   const weeklyLoadingRef=useRef(false);
   const monthlyLoadingRef=useRef(false);
@@ -225,7 +226,7 @@ export default function App(){
             return [...map.values()];
           });
         }
-        setTasks(normalized.filter(isRealTask));
+        if(!writesInFlight.current && modalRef.current!=='add')setTasks(normalized.filter(isRealTask));
         setReport(storedReport?toSimplified(storedReport):null);
         setWeeklyReport(storedWeekly?toSimplified(storedWeekly):null);
         setMonthlyReport(storedMonthly?toSimplified(storedMonthly):null);
@@ -458,7 +459,8 @@ export default function App(){
   const teamActivity=useMemo(()=>buildTeamActivity(realTasks),[realTasks]);
   const resetTaskForm=()=>{setTitle('');setAssignee('我');setEstimate(60);setTaskPriority('中');setDueDate(localDateKey());setDueTime('');setEditingId(null)};
   const persistTask=(task:Task,failText='任务保存失败')=>{
-    setSyncing(true);(session&&teamId?upsertTask(toCloud(task,teamId,session.user.id)):saveFileTask(task)).catch(error=>notify(`${failText}：${error.message}`)).finally(()=>setSyncing(false));
+    writesInFlight.current++;
+    setSyncing(true);(session&&teamId?upsertTask(toCloud(task,teamId,session.user.id)):saveFileTask(task)).catch(error=>notify(`${failText}：${error.message}`)).finally(()=>{writesInFlight.current=Math.max(0,writesInFlight.current-1);setSyncing(false)});
   };
   const openAddTask=()=>{resetTaskForm();setModal('add')};
   const openEditTask=(task:Task)=>{
@@ -475,8 +477,13 @@ export default function App(){
   };
   const saveEditedTask=()=>{
     const current=tasks.find(item=>item.id===editingId);if(!current||!title.trim())return;
-    const next=toSimplified({...current,title:title.trim(),assignee:assignee.trim()||'我',due:dueFromForm(current.createdAt),priority:taskPriority,estimatedMinutes:estimate||defaultEstimate(taskPriority)});
-    setTasks(v=>v.map(item=>item.id===next.id?next:item));resetTaskForm();setModal(null);notify(isNativeApp()&&isOfflineNow()?'已改在本机，联网后同步':'任务已更新');
+    const nextAssignee=assignee.trim()||'我';
+    const next=toSimplified({...current,title:title.trim(),assignee:nextAssignee,due:dueFromForm(current.createdAt),priority:taskPriority,estimatedMinutes:estimate||defaultEstimate(taskPriority)});
+    setTasks(v=>v.map(item=>item.id===next.id?next:item));resetTaskForm();setModal(null);
+    const offline=isNativeApp()&&isOfflineNow();
+    const movedToTeam=current.assignee==='我'&&nextAssignee!=='我';
+    const movedToMine=current.assignee!=='我'&&nextAssignee==='我';
+    notify(offline?'已改在本机，联网后同步':movedToTeam?`已改给${nextAssignee}，可在团队页查看`:movedToMine?'已改回我的任务':'任务已更新');
     persistTask(next,'任务更新失败');
   };
   const createTasksFromText=async()=>{
@@ -503,14 +510,16 @@ export default function App(){
     const current=tasks.find(t=>t.id===id);if(!current)return;const next:Status=current.status==='todo'?'doing':current.status==='doing'?'done':'todo';const now=new Date().toISOString();const changes={status:next,progress:next==='doing'?50:next==='done'?100:0,startedAt:next==='doing'?(current.startedAt||now):next==='todo'?undefined:current.startedAt,completedAt:next==='done'?now:undefined};
     setTasks(v=>v.map(t=>t.id===id?{...t,...changes}:t));
     notify(next==='done'?'任务已完成':next==='doing'?'已开始处理':'已移回待办');
-    if(session&&teamId)updateTask(id,{status:changes.status,progress:changes.progress,started_at:changes.startedAt||null,completed_at:changes.completedAt||null}).catch(error=>notify(`云端更新失败：${error.message}`));else patchFileTask(id,{status:changes.status,progress:changes.progress,startedAt:changes.startedAt||null,completedAt:changes.completedAt||null}).catch(error=>notify(`数据更新失败：${error.message}`));
+    writesInFlight.current++;
+    (session&&teamId?updateTask(id,{status:changes.status,progress:changes.progress,started_at:changes.startedAt||null,completed_at:changes.completedAt||null}):patchFileTask(id,{status:changes.status,progress:changes.progress,startedAt:changes.startedAt||null,completedAt:changes.completedAt||null})).catch(error=>notify(`${session&&teamId?'云端更新失败':'数据更新失败'}：${error.message}`)).finally(()=>{writesInFlight.current=Math.max(0,writesInFlight.current-1)});
   };
   const removeTask=async(id:string,title:string)=>{
     const current=tasks.find(task=>task.id===id);if(!current)return;
     const ok=await askConfirm(`确定删除“${title}”吗？\n删除后无法撤销。`,{title:'删除任务',confirmLabel:'删除',danger:true});
     if(!ok)return;
     setTasks(items=>items.filter(task=>task.id!==id));finishVoicePolling(id);notify('任务已删除');
-    (session&&teamId?deleteTask(id):deleteFileTask(id)).catch(error=>{setTasks(items=>items.some(task=>task.id===id)?items:[current,...items]);void showAlert(`删除失败，任务已恢复：${error.message}`,{title:'删除失败'})});
+    writesInFlight.current++;
+    (session&&teamId?deleteTask(id):deleteFileTask(id)).catch(error=>{setTasks(items=>items.some(task=>task.id===id)?items:[current,...items]);void showAlert(`删除失败，任务已恢复：${error.message}`,{title:'删除失败'})}).finally(()=>{writesInFlight.current=Math.max(0,writesInFlight.current-1)});
   };
 
   const clearRecordingResources=()=>{
@@ -717,7 +726,7 @@ export default function App(){
     </div>
     <nav aria-label="主导航">{([['home','首页'],['tasks','任务'],['team','团队'],['mine','我的']] as const).map(([id,label])=><button className={tab===id?'active':''} onClick={()=>goTab(id)} key={id} aria-current={tab===id?'page':undefined}><i aria-hidden="true"><NavIcon name={id}/></i><span>{label}</span></button>)}</nav>
     {toast&&<div className="toast" role="status">✓ {toast}</div>}
-    {dialog&&<div className="dialog-overlay" role="presentation" onClick={()=>{if(dialog.mode==='alert')closeDialog(true)}}><div className={'dialog-card'+(dialog.danger?' danger':'')} role="alertdialog" aria-modal="true" aria-labelledby="app-dialog-title" onClick={e=>e.stopPropagation()}><div className="dialog-icon" aria-hidden="true">{dialog.danger?'!':'✦'}</div><h3 id="app-dialog-title">{dialog.title}</h3><p className="dialog-body">{dialog.message}</p><div className="dialog-actions">{dialog.mode==='confirm'&&<button type="button" className="dialog-cancel" onClick={()=>closeDialog(false)}>{dialog.cancelLabel}</button>}<button type="button" className="dialog-ok" onClick={()=>closeDialog(true)} autoFocus>{dialog.confirmLabel}</button></div></div></div>}
+    {dialog&&<div className="dialog-overlay" role="presentation" onClick={()=>{if(dialog.mode==='alert')closeDialog(true)}}><div className={'dialog-card'+(dialog.danger?' danger':'')} role="alertdialog" aria-modal="true" aria-labelledby="app-dialog-title" onClick={e=>e.stopPropagation()}><div className="dialog-icon" aria-hidden="true">{dialog.danger?'!':'✦'}</div><h3 id="app-dialog-title">{dialog.title}</h3><p className="dialog-body">{dialog.message}</p><div className="dialog-actions">{dialog.mode==='confirm'&&<button type="button" className="dialog-cancel" onClick={()=>closeDialog(false)} autoFocus={dialog.danger}>{dialog.cancelLabel}</button>}<button type="button" className="dialog-ok" onClick={()=>closeDialog(true)} autoFocus={!dialog.danger}>{dialog.confirmLabel}</button></div></div></div>}
     {modal&&<div className="overlay" onClick={()=>{if(recording){cancelRecording();return}if(!processing){if(modal==='add')resetTaskForm();setModal(null)}}}><section className={'sheet '+(modal==='settings'||modal==='cloud'?'settings-sheet':modal==='add'?'task-form-sheet':'')} onClick={e=>e.stopPropagation()}><div className="handle"/>{modal==='voice'?<><h2>{processing?'正在保存录音…':recording?'正在录音…':transcript?'指令待确认':'语音助手'}</h2><p className={'voice-tip '+(recording||processing?'live':'')}>{voiceTip}</p><button className={'record '+(recording?'recording':'')} disabled={processing} onClick={recording?stopRecording:beginRecording}><MicIcon/></button><p className="record-label">{processing?'保存后由 AI 后台整理':recording?'点击麦克风结束录音':'点击开始录音'}</p>{recording&&<button className="record-cancel" type="button" onClick={cancelRecording}>取消录音</button>}<textarea className="input transcript" value={transcript} placeholder="例如：新建两个任务… / 把今日复盘风险删掉… / 周报下周计划加一项演示" onChange={e=>{setTranscript(e.target.value);setParsedTask(null)}}/>{parsedTask&&<div className="ai-understanding"><b>已整理</b><span>任务：{parsedTask.title}</span><span>负责人：{parsedTask.assignee} · 截止：{parsedTask.due} · {parsedTask.priority}优先级</span><span>预计用时：{formatDuration(parsedTask.estimatedMinutes||defaultEstimate(parsedTask.priority))}</span></div>}<button className="primary" disabled={!transcript.trim()||processing||recording} onClick={createTasksFromText}>AI 理解并执行</button></>:modal==='photo'?<><h2>{processing?'正在提交照片…':'拍照登记任务'}</h2><p className="voice-tip">{processing?'照片已压缩，正在交给 AI 识别任务':'拍摄或从相册选择周报、月报、手写清单，识别后会像语音一样自动登记任务'}</p><div className="photo-pick"><button type="button" className="photo-pick-btn" disabled={processing} onClick={()=>cameraInputRef.current?.click()}><CameraIcon/><b>拍照</b><span>使用后置相机</span></button><button type="button" className="photo-pick-btn" disabled={processing} onClick={()=>albumInputRef.current?.click()}><AlbumIcon/><b>相册</b><span>从手机相册选择</span></button></div><input ref={cameraInputRef} type="file" accept="image/*" capture="environment" hidden onChange={e=>{const file=e.target.files?.[0];e.target.value='';if(file)void uploadPhoto(file)}}/><input ref={albumInputRef} type="file" accept="image/*" hidden onChange={e=>{const file=e.target.files?.[0];e.target.value='';if(file)void uploadPhoto(file)}}/></>:modal==='settings'?<AppSettings schedule={autoSchedule} onScheduleSaved={next=>{setAutoSchedule(next);notify('自动作业时间已保存')}} onClose={()=>setModal(null)} onModelSaved={()=>{refreshAiReady();notify('模型已切换')}} askConfirm={askConfirm}/>:modal==='cloud'?<CloudSettings onClose={()=>setModal(null)} askConfirm={askConfirm}/>:<TaskForm editing={Boolean(editingId)} title={title} setTitle={setTitle} assignee={assignee} setAssignee={setAssignee} dueDate={dueDate} setDueDate={setDueDate} dueTime={dueTime} setDueTime={setDueTime} priority={taskPriority} setPriority={setTaskPriority} estimate={estimate} setEstimate={setEstimate} onSubmit={editingId?saveEditedTask:()=>addTask()}/>}</section></div>}
   </main></div>;
 }
