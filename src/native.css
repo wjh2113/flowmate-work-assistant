@@ -76,6 +76,20 @@ html.native-app .task > div {
   min-width: 0;
 }
 
+html.native-app .task-edit,
+html.native-app .task-delete,
+html.native-app .task-time-clear {
+  background: #f1f5f9 !important;
+}
+
+html.native-app .task-form-sheet {
+  background: #fff !important;
+}
+
+html.native-app .task-form-sheet .input {
+  background: #f8fafc !important;
+}
+
 .offline-banner {
   margin: calc(10px + env(safe-area-inset-top)) 16px 0;
   padding: 9px 12px;

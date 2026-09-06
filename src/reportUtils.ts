@@ -286,6 +286,63 @@ function startOfLocalDay(date: Date) {
   return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
 }
 
+function relativeDueOffset(word: string) {
+  if (word === '明天' || word === '明日') return 1;
+  if (word === '后天') return 2;
+  if (word === '昨天') return -1;
+  if (word === '前天') return -2;
+  return 0;
+}
+
+function parseDateKey(value: string) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || '').trim());
+  if (!match) return null;
+  const date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+  return Number.isFinite(date.getTime()) ? date : null;
+}
+
+/** Calendar date represented by a stored due label, resolved against createdAt for 今天/明天. */
+export function dueToLocalDate(due: string, createdAt?: string, now = Date.now()) {
+  const raw = String(due || '').trim().replace(/\s+\d{1,2}:\d{2}(?::\d{2})?\s*$/, '').trim();
+  const created = createdAt ? new Date(createdAt) : new Date(now);
+  const origin = Number.isFinite(created.getTime()) ? created : new Date(now);
+  const match = RELATIVE_DUE.exec(raw);
+  if (match) {
+    const offset = relativeDueOffset(match[1]);
+    return new Date(origin.getFullYear(), origin.getMonth(), origin.getDate() + offset);
+  }
+  const iso = parseDateKey(raw);
+  if (iso) return iso;
+  const md = /^(\d{1,2})月(\d{1,2})日/.exec(raw);
+  if (md) return new Date(origin.getFullYear(), Number(md[1]) - 1, Number(md[2]));
+  return new Date(origin.getFullYear(), origin.getMonth(), origin.getDate());
+}
+
+export function dueTimePart(due: string) {
+  const match = /\s+(\d{1,2}):(\d{2})(?::\d{2})?\s*$/.exec(String(due || '').trim());
+  if (!match) return '';
+  return formatTimeHM(Number(match[1]), Number(match[2]));
+}
+
+/** Store due relative to createdAt when possible, so formatDueLabel stays correct after edits. */
+export function composeDueLabel(dateKey: string, opts?: { now?: Date; time?: string; relativeTo?: Date | string }) {
+  const now = opts?.now || new Date();
+  const originRaw = opts?.relativeTo;
+  const origin = originRaw instanceof Date ? originRaw : originRaw ? new Date(originRaw) : now;
+  const target = parseDateKey(dateKey) || new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const originDay = Number.isFinite(origin.getTime()) ? origin : now;
+  const diffDays = Math.round((startOfLocalDay(target) - startOfLocalDay(originDay)) / 86_400_000);
+  const timeRaw = String(opts?.time || '').trim();
+  const time = parseTimeHM(timeRaw) || parseTimeHM(timeRaw.slice(0, 5));
+  const suffix = time ? ` ${formatTimeHM(time.hour, time.minute)}` : '';
+  if (diffDays === 0) return `今天${suffix}`;
+  if (diffDays === 1) return `明天${suffix}`;
+  if (diffDays === 2) return `后天${suffix}`;
+  if (diffDays === -1) return `昨天${suffix}`;
+  if (diffDays === -2) return `前天${suffix}`;
+  return `${target.getMonth() + 1}月${target.getDate()}日${suffix}`;
+}
+
 /** Resolve frozen labels like "今天" against createdAt, then display relative to now. */
 export function formatDueLabel(due: string, createdAt?: string, now = Date.now()) {
   const raw = String(due || '').trim();
@@ -294,13 +351,8 @@ export function formatDueLabel(due: string, createdAt?: string, now = Date.now()
   if (!Number.isFinite(created.getTime())) return raw;
   const match = RELATIVE_DUE.exec(raw);
   if (!match) return raw;
-  const word = match[1];
   const rest = String(match[2] || '').trim();
-  const offset = word === '明天' || word === '明日' ? 1
-    : word === '后天' ? 2
-    : word === '昨天' ? -1
-    : word === '前天' ? -2
-    : 0;
+  const offset = relativeDueOffset(match[1]);
   const target = new Date(created.getFullYear(), created.getMonth(), created.getDate() + offset);
   const diffDays = Math.round((startOfLocalDay(target) - startOfLocalDay(new Date(now))) / 86_400_000);
   const suffix = rest ? ` ${rest}` : '';

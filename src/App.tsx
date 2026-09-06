@@ -6,7 +6,7 @@ import { apiFetch, describeApiError, getLocalUser, loginLocalUser, logoutLocalUs
 import { deleteFileDailyReport, deleteFilePeriodReport, deleteFileTask, flushOfflineQueue, listFilePeriodReports, listFileTasks, loadFileDailyReport, loadFilePeriodReport, patchFileTask, saveFileDailyReport, saveFilePeriodReport, saveFileTask, type PeriodReportMeta } from './localStore';
 import GuidePage from './GuidePage';
 import { toSimplified } from './chinese';
-import { DEFAULT_AUTO_SCHEDULE, WEEKDAY_LABELS, formatDueLabel, formatPeriodLabel, formatTimeHM, isSlotDone, isoWeekKey, latestDueDailySlot, latestDueMonthlySlot, latestDueVoiceRetentionSlot, latestDueWeeklySlot, loadAutoSchedule, localDateKey, markSlotDone, monthKey, normalizeTimes, parseTimeHM, saveAutoSchedule, shiftIsoWeekKey, shiftMonthKey, suppressAutoSlotsForKind, weekRange, type AutoSchedule, type TimeHM } from './reportUtils';
+import { DEFAULT_AUTO_SCHEDULE, WEEKDAY_LABELS, composeDueLabel, dueTimePart, dueToLocalDate, formatDueLabel, formatPeriodLabel, formatTimeHM, isSlotDone, isoWeekKey, latestDueDailySlot, latestDueMonthlySlot, latestDueVoiceRetentionSlot, latestDueWeeklySlot, loadAutoSchedule, localDateKey, markSlotDone, monthKey, normalizeTimes, parseTimeHM, saveAutoSchedule, shiftIsoWeekKey, shiftMonthKey, suppressAutoSlotsForKind, weekRange, type AutoSchedule, type TimeHM } from './reportUtils';
 import { migrateLegacyStorageKey, readUserStorage, setUserStorageScope, writeUserStorage } from './userStorage';
 import { getOfflineStatus, isOfflineNow, readSnapshot, setOfflineUserId, subscribeOffline } from './offlineStore';
 
@@ -46,6 +46,10 @@ export default function App(){
   const [tasks,setTasks]=useState<Task[]>([]);
   const [modal,setModal]=useState<'voice'|'photo'|'add'|'settings'|'cloud'|null>(null);
   const [title,setTitle]=useState(''); const [assignee,setAssignee]=useState('我'); const [estimate,setEstimate]=useState(60);
+  const [taskPriority,setTaskPriority]=useState<Priority>('中');
+  const [dueDate,setDueDate]=useState(()=>localDateKey());
+  const [dueTime,setDueTime]=useState('');
+  const [editingId,setEditingId]=useState<string|null>(null);
   const [transcript,setTranscript]=useState(''); const [recording,setRecording]=useState(false); const [processing,setProcessing]=useState(false);
   const [voiceTip,setVoiceTip]=useState('可以说任务，也可以改今日复盘/周报/月报'); const [parsedTask,setParsedTask]=useState<ParsedTask|null>(null);
   const [aiReady,setAiReady]=useState<boolean|null>(null);
@@ -452,10 +456,28 @@ export default function App(){
   const realTasks=useMemo(()=>tasks.filter(isRealTask),[tasks]);
   const stats=useMemo(()=>({mine:realTasks.filter(t=>t.assignee==='我').length,done:realTasks.filter(t=>t.assignee==='我'&&t.status==='done').length,follow:realTasks.filter(t=>t.assignee!=='我'&&t.status!=='done').length}),[realTasks]);
   const teamActivity=useMemo(()=>buildTeamActivity(realTasks),[realTasks]);
+  const resetTaskForm=()=>{setTitle('');setAssignee('我');setEstimate(60);setTaskPriority('中');setDueDate(localDateKey());setDueTime('');setEditingId(null)};
+  const persistTask=(task:Task,failText='任务保存失败')=>{
+    setSyncing(true);(session&&teamId?upsertTask(toCloud(task,teamId,session.user.id)):saveFileTask(task)).catch(error=>notify(`${failText}：${error.message}`)).finally(()=>setSyncing(false));
+  };
+  const openAddTask=()=>{resetTaskForm();setModal('add')};
+  const openEditTask=(task:Task)=>{
+    setEditingId(task.id);setTitle(task.title);setAssignee(task.assignee||'我');
+    setEstimate(Number(task.estimatedMinutes)>0?Number(task.estimatedMinutes):defaultEstimate(task.priority));
+    setTaskPriority(task.priority||'中');setDueDate(localDateKey(dueToLocalDate(task.due,task.createdAt)));setDueTime(dueTimePart(task.due));
+    setModal('add');
+  };
+  const dueFromForm=(createdAt?:string)=>composeDueLabel(dueDate,{time:dueTime,relativeTo:createdAt});
   const addTask=(text=title,parsed?:ParsedTask|null)=>{
-    if(!text.trim())return;const p=parsed||null;const priority=p?.priority||'中';const task:Task=toSimplified({id:crypto.randomUUID(),title:p?.title||text.trim(),assignee:p?.assignee||assignee,due:p?.due||'今天',status:'todo',priority,progress:0,estimatedMinutes:p?.estimatedMinutes||estimate||defaultEstimate(priority),createdAt:new Date().toISOString()});
-    setTasks(v=>[task,...v]);setTitle('');setEstimate(60);setTranscript('');setParsedTask(null);setModal(null);notify('任务已创建');
-    setSyncing(true);(session&&teamId?upsertTask(toCloud(task,teamId,session.user.id)):saveFileTask(task)).catch(error=>notify(`任务保存失败：${error.message}`)).finally(()=>setSyncing(false));
+    if(!text.trim())return;const p=parsed||null;const priority=p?.priority||taskPriority||'中';const createdAt=new Date().toISOString();const task:Task=toSimplified({id:crypto.randomUUID(),title:p?.title||text.trim(),assignee:p?.assignee||assignee.trim()||'我',due:p?.due||dueFromForm(createdAt),status:'todo',priority,progress:0,estimatedMinutes:p?.estimatedMinutes||estimate||defaultEstimate(priority),createdAt});
+    setTasks(v=>[task,...v]);resetTaskForm();setTranscript('');setParsedTask(null);setModal(null);notify(isNativeApp()&&isOfflineNow()?'任务已保存在本机，联网后同步':'任务已创建');
+    persistTask(task);
+  };
+  const saveEditedTask=()=>{
+    const current=tasks.find(item=>item.id===editingId);if(!current||!title.trim())return;
+    const next=toSimplified({...current,title:title.trim(),assignee:assignee.trim()||'我',due:dueFromForm(current.createdAt),priority:taskPriority,estimatedMinutes:estimate||defaultEstimate(taskPriority)});
+    setTasks(v=>v.map(item=>item.id===next.id?next:item));resetTaskForm();setModal(null);notify(isNativeApp()&&isOfflineNow()?'已改在本机，联网后同步':'任务已更新');
+    persistTask(next,'任务更新失败');
   };
   const createTasksFromText=async()=>{
     const text=toSimplified(transcript.trim());if(!text)return;
@@ -675,7 +697,7 @@ export default function App(){
       <div className="stats"><Stat n={stats.mine} label="我的任务" tone="purple" onClick={()=>goTab('tasks')}/><Stat n={stats.done} label="今日完成" tone="green" onClick={()=>goTab('tasks')}/><Stat n={stats.follow} label="待我跟进" tone="orange" onClick={()=>goTab('team')}/></div>
       {voiceProgress.length>0&&<VoiceProgressPanel items={voiceProgress} onRetry={id=>void retryVoiceJob(id)} onDismiss={id=>void dismissVoiceJob(id)}/>}
       <Title text="优先处理" action="查看全部 ›" onClick={()=>goTab('tasks')}/>
-      {realTasks.filter(t=>t.status!=='done').slice(0,3).map(t=><TaskItem key={t.id} task={t} cycle={cycle} remove={removeTask} now={clock}/>)}
+      {realTasks.filter(t=>t.status!=='done').slice(0,3).map(t=><TaskItem key={t.id} task={t} cycle={cycle} edit={openEditTask} remove={removeTask} now={clock}/>)}
       <Title text="团队动态" action="全部动态" onClick={()=>goTab('team')}/>
       {teamActivity.length?teamActivity.slice(0,4).map(item=><ActivityCard key={item.id} item={item} now={clock} onClick={()=>goTab('team')}/>):<div className="empty activity-empty">把任务分给同事后，动态会出现在这里</div>}
       <Title text="今日复盘" action={report?'更新':'生成'} onClick={()=>void generateReport()}/>
@@ -685,18 +707,18 @@ export default function App(){
       <Title text="本月月报" action={monthlyReport?'更新':'生成'} onClick={()=>void generateMonthlyReport()}/>
       <AIPeriodReport kind="monthly" report={monthlyReport} loading={monthlyLoading} error={monthlyError} aiReady={aiReady} generate={()=>void generateMonthlyReport()} openSettings={()=>setModal('settings')} rangeLabel={monthKeyValue} editPending={editPending.monthly} onRetryEdit={()=>void retryReportEditJob('monthly')}/>
     </div>}
-    {tab==='tasks'&&<ListPage title="我的任务" tasks={realTasks.filter(t=>t.assignee==='我')} cycle={cycle} remove={removeTask} now={clock} voiceProgress={voiceProgress} onRetryVoice={id=>void retryVoiceJob(id)} onDismissVoice={id=>void dismissVoiceJob(id)}/>} 
-    {tab==='team'&&<ListPage title="团队任务" tasks={realTasks.filter(t=>t.assignee!=='我')} cycle={cycle} remove={removeTask} now={clock}/>} 
+    {tab==='tasks'&&<ListPage title="我的任务" tasks={realTasks.filter(t=>t.assignee==='我')} cycle={cycle} edit={openEditTask} remove={removeTask} now={clock} voiceProgress={voiceProgress} onRetryVoice={id=>void retryVoiceJob(id)} onDismissVoice={id=>void dismissVoiceJob(id)}/>} 
+    {tab==='team'&&<ListPage title="团队任务" tasks={realTasks.filter(t=>t.assignee!=='我')} cycle={cycle} edit={openEditTask} remove={removeTask} now={clock}/>} 
     {tab==='mine'&&(voiceHistoryOpen?<VoiceHistoryPage onBack={()=>setVoiceHistoryOpen(false)}/>:archiveKind?<PeriodArchivePage kind={archiveKind} session={session} teamId={teamId} currentKey={archiveKind==='weekly'?weekKey:monthKeyValue} onBack={()=>setArchiveKind(null)}/>:<Profile avatarText={avatarText} avatarUrl={avatarUrl} onAvatarFile={file=>void saveAvatar(file)} displayName={displayName} accountHint={session?.user.email||localUser?.email||''} pointsBalance={localUser?.pointsBalance} tasks={realTasks} aiReady={aiReady} cloudOnline={Boolean(session)} localOnline={Boolean(localUser)} offline={offlineStatus.offline||offlineStatus.pending>0} syncing={syncing} signOut={()=>void signOut()} goTeam={()=>goTab('team')} openSettings={()=>setModal('settings')} openWeeklyArchive={()=>setArchiveKind('weekly')} openMonthlyArchive={()=>setArchiveKind('monthly')} openVoiceHistory={()=>setVoiceHistoryOpen(true)}/>)}
     <div className="quick-create" role="group" aria-label="新建任务">
       <button className="quick-voice" type="button" onClick={()=>{setVoiceTip('可以说任务，也可以改今日复盘/周报/月报');setModal('voice')}} aria-label="语音创建任务或修改复盘"><MicIcon/><span>语音</span></button>
       <button className="quick-photo" type="button" onClick={()=>setModal('photo')} aria-label="拍照或从相册识别任务"><CameraIcon/><span>拍照</span></button>
-      <button className="quick-add" type="button" onClick={()=>setModal('add')} aria-label="手动新建任务">＋</button>
+      <button className="quick-add" type="button" onClick={openAddTask} aria-label="手动新建任务">＋</button>
     </div>
     <nav aria-label="主导航">{([['home','首页'],['tasks','任务'],['team','团队'],['mine','我的']] as const).map(([id,label])=><button className={tab===id?'active':''} onClick={()=>goTab(id)} key={id} aria-current={tab===id?'page':undefined}><i aria-hidden="true"><NavIcon name={id}/></i><span>{label}</span></button>)}</nav>
     {toast&&<div className="toast" role="status">✓ {toast}</div>}
     {dialog&&<div className="dialog-overlay" role="presentation" onClick={()=>{if(dialog.mode==='alert')closeDialog(true)}}><div className={'dialog-card'+(dialog.danger?' danger':'')} role="alertdialog" aria-modal="true" aria-labelledby="app-dialog-title" onClick={e=>e.stopPropagation()}><div className="dialog-icon" aria-hidden="true">{dialog.danger?'!':'✦'}</div><h3 id="app-dialog-title">{dialog.title}</h3><p className="dialog-body">{dialog.message}</p><div className="dialog-actions">{dialog.mode==='confirm'&&<button type="button" className="dialog-cancel" onClick={()=>closeDialog(false)}>{dialog.cancelLabel}</button>}<button type="button" className="dialog-ok" onClick={()=>closeDialog(true)} autoFocus>{dialog.confirmLabel}</button></div></div></div>}
-    {modal&&<div className="overlay" onClick={()=>{if(recording){cancelRecording();return}if(!processing)setModal(null)}}><section className={'sheet '+(modal==='settings'||modal==='cloud'?'settings-sheet':'')} onClick={e=>e.stopPropagation()}><div className="handle"/>{modal==='voice'?<><h2>{processing?'正在保存录音…':recording?'正在录音…':transcript?'指令待确认':'语音助手'}</h2><p className={'voice-tip '+(recording||processing?'live':'')}>{voiceTip}</p><button className={'record '+(recording?'recording':'')} disabled={processing} onClick={recording?stopRecording:beginRecording}><MicIcon/></button><p className="record-label">{processing?'保存后由 AI 后台整理':recording?'点击麦克风结束录音':'点击开始录音'}</p>{recording&&<button className="record-cancel" type="button" onClick={cancelRecording}>取消录音</button>}<textarea className="input transcript" value={transcript} placeholder="例如：新建两个任务… / 把今日复盘风险删掉… / 周报下周计划加一项演示" onChange={e=>{setTranscript(e.target.value);setParsedTask(null)}}/>{parsedTask&&<div className="ai-understanding"><b>已整理</b><span>任务：{parsedTask.title}</span><span>负责人：{parsedTask.assignee} · 截止：{parsedTask.due} · {parsedTask.priority}优先级</span><span>预计用时：{formatDuration(parsedTask.estimatedMinutes||defaultEstimate(parsedTask.priority))}</span></div>}<button className="primary" disabled={!transcript.trim()||processing||recording} onClick={createTasksFromText}>AI 理解并执行</button></>:modal==='photo'?<><h2>{processing?'正在提交照片…':'拍照登记任务'}</h2><p className="voice-tip">{processing?'照片已压缩，正在交给 AI 识别任务':'拍摄或从相册选择周报、月报、手写清单，识别后会像语音一样自动登记任务'}</p><div className="photo-pick"><button type="button" className="photo-pick-btn" disabled={processing} onClick={()=>cameraInputRef.current?.click()}><CameraIcon/><b>拍照</b><span>使用后置相机</span></button><button type="button" className="photo-pick-btn" disabled={processing} onClick={()=>albumInputRef.current?.click()}><AlbumIcon/><b>相册</b><span>从手机相册选择</span></button></div><input ref={cameraInputRef} type="file" accept="image/*" capture="environment" hidden onChange={e=>{const file=e.target.files?.[0];e.target.value='';if(file)void uploadPhoto(file)}}/><input ref={albumInputRef} type="file" accept="image/*" hidden onChange={e=>{const file=e.target.files?.[0];e.target.value='';if(file)void uploadPhoto(file)}}/></>:modal==='settings'?<AppSettings schedule={autoSchedule} onScheduleSaved={next=>{setAutoSchedule(next);notify('自动作业时间已保存')}} onClose={()=>setModal(null)} onModelSaved={()=>{refreshAiReady();notify('模型已切换')}} askConfirm={askConfirm}/>:modal==='cloud'?<CloudSettings onClose={()=>setModal(null)} askConfirm={askConfirm}/>:<><h2>新建任务</h2><label>任务内容</label><input className="input" value={title} onChange={e=>setTitle(e.target.value)} placeholder="例如：完成项目周报"/><label>负责人</label><div className="people"><button className="selected" onClick={()=>setAssignee('我')}>我</button></div><label>预估时间</label><select className="input" value={estimate} onChange={e=>setEstimate(Number(e.target.value))}><option value={15}>15 分钟</option><option value={30}>30 分钟</option><option value={60}>1 小时</option><option value={120}>2 小时</option><option value={240}>4 小时</option></select><button className="primary" disabled={!title.trim()} onClick={()=>addTask()}>创建任务</button></>}</section></div>}
+    {modal&&<div className="overlay" onClick={()=>{if(recording){cancelRecording();return}if(!processing){if(modal==='add')resetTaskForm();setModal(null)}}}><section className={'sheet '+(modal==='settings'||modal==='cloud'?'settings-sheet':modal==='add'?'task-form-sheet':'')} onClick={e=>e.stopPropagation()}><div className="handle"/>{modal==='voice'?<><h2>{processing?'正在保存录音…':recording?'正在录音…':transcript?'指令待确认':'语音助手'}</h2><p className={'voice-tip '+(recording||processing?'live':'')}>{voiceTip}</p><button className={'record '+(recording?'recording':'')} disabled={processing} onClick={recording?stopRecording:beginRecording}><MicIcon/></button><p className="record-label">{processing?'保存后由 AI 后台整理':recording?'点击麦克风结束录音':'点击开始录音'}</p>{recording&&<button className="record-cancel" type="button" onClick={cancelRecording}>取消录音</button>}<textarea className="input transcript" value={transcript} placeholder="例如：新建两个任务… / 把今日复盘风险删掉… / 周报下周计划加一项演示" onChange={e=>{setTranscript(e.target.value);setParsedTask(null)}}/>{parsedTask&&<div className="ai-understanding"><b>已整理</b><span>任务：{parsedTask.title}</span><span>负责人：{parsedTask.assignee} · 截止：{parsedTask.due} · {parsedTask.priority}优先级</span><span>预计用时：{formatDuration(parsedTask.estimatedMinutes||defaultEstimate(parsedTask.priority))}</span></div>}<button className="primary" disabled={!transcript.trim()||processing||recording} onClick={createTasksFromText}>AI 理解并执行</button></>:modal==='photo'?<><h2>{processing?'正在提交照片…':'拍照登记任务'}</h2><p className="voice-tip">{processing?'照片已压缩，正在交给 AI 识别任务':'拍摄或从相册选择周报、月报、手写清单，识别后会像语音一样自动登记任务'}</p><div className="photo-pick"><button type="button" className="photo-pick-btn" disabled={processing} onClick={()=>cameraInputRef.current?.click()}><CameraIcon/><b>拍照</b><span>使用后置相机</span></button><button type="button" className="photo-pick-btn" disabled={processing} onClick={()=>albumInputRef.current?.click()}><AlbumIcon/><b>相册</b><span>从手机相册选择</span></button></div><input ref={cameraInputRef} type="file" accept="image/*" capture="environment" hidden onChange={e=>{const file=e.target.files?.[0];e.target.value='';if(file)void uploadPhoto(file)}}/><input ref={albumInputRef} type="file" accept="image/*" hidden onChange={e=>{const file=e.target.files?.[0];e.target.value='';if(file)void uploadPhoto(file)}}/></>:modal==='settings'?<AppSettings schedule={autoSchedule} onScheduleSaved={next=>{setAutoSchedule(next);notify('自动作业时间已保存')}} onClose={()=>setModal(null)} onModelSaved={()=>{refreshAiReady();notify('模型已切换')}} askConfirm={askConfirm}/>:modal==='cloud'?<CloudSettings onClose={()=>setModal(null)} askConfirm={askConfirm}/>:<TaskForm editing={Boolean(editingId)} title={title} setTitle={setTitle} assignee={assignee} setAssignee={setAssignee} dueDate={dueDate} setDueDate={setDueDate} dueTime={dueTime} setDueTime={setDueTime} priority={taskPriority} setPriority={setTaskPriority} estimate={estimate} setEstimate={setEstimate} onSubmit={editingId?saveEditedTask:()=>addTask()}/>}</section></div>}
   </main></div>;
 }
 
@@ -764,8 +786,64 @@ function VoiceProgressPanel({items,onRetry,onDismiss}:{items:VoiceProgress[];onR
 function formatDuration(minutes:number){const safe=Math.max(0,Math.round(minutes||0));if(safe<60)return `${safe}分钟`;const hours=Math.floor(safe/60);const rest=safe%60;return rest?`${hours}小时${rest}分钟`:`${hours}小时`}
 function taskElapsed(task:Task,now:number){if(!task.startedAt)return 0;const start=new Date(task.startedAt).getTime();const end=task.status==='done'&&task.completedAt?new Date(task.completedAt).getTime():now;if(!Number.isFinite(start)||!Number.isFinite(end))return 0;return Math.max(0,Math.floor((end-start)/60_000))}
 function TrashIcon(){return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m-9 0 1 13h10l1-13M10 11v5m4-5v5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/></svg>}
-function TaskItem({task,cycle,remove,now}:{task:Task;cycle:(id:string)=>void;remove:(id:string,title:string)=>void;now:number}){const elapsed=taskElapsed(task,now);const priorityClass=task.priority==='高'?'priority-high':task.priority==='低'?'priority-low':'priority-mid';return <div className={'task-wrap '+priorityClass}><button className="task" onClick={()=>cycle(task.id)}><i className={`task-status ${task.status}`}>{task.status==='done'?'✓':''}</i><div><strong className={task.status==='done'?'done':''}>{task.title}</strong><p><b className={task.priority==='高'?'high':''}>{task.priority}优先级</b> · {formatDueLabel(task.due,task.createdAt,now)} · {task.assignee}</p><div className="task-time"><span>预计 {formatDuration(task.estimatedMinutes)}</span><span>已进行 {formatDuration(elapsed)}</span></div>{task.assignee!=='我'&&task.status!=='done'&&<span className="progress"><em style={{width:`${task.progress}%`}}/></span>}</div></button><button className="task-delete" type="button" onClick={()=>remove(task.id,task.title)} aria-label={`删除任务：${task.title}`}><TrashIcon/></button></div>}
-function ListPage({title,tasks,cycle,remove,now,voiceProgress,onRetryVoice,onDismissVoice}:{title:string;tasks:Task[];cycle:(id:string)=>void;remove:(id:string,title:string)=>void;now:number;voiceProgress?:VoiceProgress[];onRetryVoice?:(id:string)=>void;onDismissVoice?:(id:string)=>void}){const [filter,setFilter]=useState('全部');const list=tasks.filter(t=>filter==='全部'||(filter==='已完成'?t.status==='done':t.status!=='done'));return <div className="page"><h1 className="page-title">{title}</h1><p className="page-sub">轻点任务切换状态，右侧按钮可删除任务</p>{voiceProgress&&voiceProgress.length>0&&onRetryVoice&&onDismissVoice&&<VoiceProgressPanel items={voiceProgress} onRetry={onRetryVoice} onDismiss={onDismissVoice}/>}<div className="filters">{['全部','进行中','已完成'].map(f=><button key={f} className={f===filter?'active':''} onClick={()=>setFilter(f)}>{f}</button>)}</div>{list.map(t=><TaskItem key={t.id} task={t} cycle={cycle} remove={remove} now={now}/>)}{!list.length&&<div className="empty">还没有任务，点下方语音或加号开始</div>}</div>}
+function PencilIcon(){return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 16.5V20h3.5L19 8.5 15.5 5 4 16.5z" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round"/><path d="m13.7 6.8 3.5 3.5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/></svg>}
+function TaskItem({task,cycle,edit,remove,now}:{task:Task;cycle:(id:string)=>void;edit:(task:Task)=>void;remove:(id:string,title:string)=>void;now:number}){
+  const elapsed=taskElapsed(task,now);
+  const priorityClass=task.priority==='高'?'priority-high':task.priority==='低'?'priority-low':'priority-mid';
+  return <div className={'task-wrap '+priorityClass}>
+    <button className="task" onClick={()=>cycle(task.id)}>
+      <i className={`task-status ${task.status}`}>{task.status==='done'?'✓':''}</i>
+      <div>
+        <strong className={task.status==='done'?'done':''}>{task.title}</strong>
+        <p><b className={task.priority==='高'?'high':''}>{task.priority}优先级</b> · {formatDueLabel(task.due,task.createdAt,now)} · {task.assignee}</p>
+        <div className="task-time"><span>预计 {formatDuration(task.estimatedMinutes)}</span><span>已进行 {formatDuration(elapsed)}</span></div>
+        {task.assignee!=='我'&&task.status!=='done'&&<span className="progress"><em style={{width:`${task.progress}%`}}/></span>}
+      </div>
+    </button>
+    <div className="task-actions">
+      <button className="task-edit" type="button" onClick={()=>edit(task)} aria-label={`修改任务：${task.title}`}><PencilIcon/></button>
+      <button className="task-delete" type="button" onClick={()=>remove(task.id,task.title)} aria-label={`删除任务：${task.title}`}><TrashIcon/></button>
+    </div>
+  </div>;
+}
+function ListPage({title,tasks,cycle,edit,remove,now,voiceProgress,onRetryVoice,onDismissVoice}:{title:string;tasks:Task[];cycle:(id:string)=>void;edit:(task:Task)=>void;remove:(id:string,title:string)=>void;now:number;voiceProgress?:VoiceProgress[];onRetryVoice?:(id:string)=>void;onDismissVoice?:(id:string)=>void}){
+  const [filter,setFilter]=useState('全部');
+  const list=tasks.filter(t=>filter==='全部'||(filter==='已完成'?t.status==='done':t.status!=='done'));
+  return <div className="page">
+    <h1 className="page-title">{title}</h1>
+    <p className="page-sub">轻点任务切换状态，铅笔可改内容，右侧可删除</p>
+    {voiceProgress&&voiceProgress.length>0&&onRetryVoice&&onDismissVoice&&<VoiceProgressPanel items={voiceProgress} onRetry={onRetryVoice} onDismiss={onDismissVoice}/>}
+    <div className="filters">{['全部','进行中','已完成'].map(f=><button key={f} className={f===filter?'active':''} onClick={()=>setFilter(f)}>{f}</button>)}</div>
+    {list.map(t=><TaskItem key={t.id} task={t} cycle={cycle} edit={edit} remove={remove} now={now}/>)}
+    {!list.length&&<div className="empty">还没有任务，点下方语音或加号开始</div>}
+  </div>;
+}
+function TaskForm({editing,title,setTitle,assignee,setAssignee,dueDate,setDueDate,dueTime,setDueTime,priority,setPriority,estimate,setEstimate,onSubmit}:{editing:boolean;title:string;setTitle:(v:string)=>void;assignee:string;setAssignee:(v:string)=>void;dueDate:string;setDueDate:(v:string)=>void;dueTime:string;setDueTime:(v:string)=>void;priority:Priority;setPriority:(v:Priority)=>void;estimate:number;setEstimate:(v:number)=>void;onSubmit:()=>void}){
+  const duePresets=[0,1,2].map(offset=>{const d=new Date();d.setDate(d.getDate()+offset);return {label:offset===0?'今天':offset===1?'明天':'后天',value:localDateKey(d)};});
+  const estimates=[15,30,60,120,240];
+  if(estimate>0&&!estimates.includes(estimate))estimates.push(estimate);
+  estimates.sort((a,b)=>a-b);
+  return <>
+    <h2>{editing?'修改任务':'新建任务'}</h2>
+    <label>任务内容</label>
+    <input className="input" value={title} onChange={e=>setTitle(e.target.value)} placeholder="例如：完成项目周报"/>
+    <label>负责人</label>
+    <input className="input" value={assignee} onChange={e=>setAssignee(e.target.value)} placeholder="我"/>
+    <label>截止日期</label>
+    <div className="people">{duePresets.map(item=><button key={item.label} type="button" className={dueDate===item.value?'selected':''} onClick={()=>setDueDate(item.value)}>{item.label}</button>)}</div>
+    <input className="input" type="date" value={dueDate} onChange={e=>setDueDate(e.target.value||localDateKey())}/>
+    <label>截止时间（可选）</label>
+    <div className="task-time-row">
+      <input className="input" type="time" value={dueTime} onChange={e=>setDueTime(e.target.value.slice(0,5))}/>
+      {dueTime?<button type="button" className="task-time-clear" onClick={()=>setDueTime('')}>清除时间</button>:null}
+    </div>
+    <label>优先级</label>
+    <div className="people">{(['高','中','低'] as const).map(item=><button key={item} type="button" className={priority===item?'selected':''} onClick={()=>setPriority(item)}>{item}</button>)}</div>
+    <label>预估时间</label>
+    <select className="input" value={estimate} onChange={e=>setEstimate(Number(e.target.value))}>{estimates.map(mins=><option key={mins} value={mins}>{mins<60?`${mins} 分钟`:mins%60?`${Math.floor(mins/60)} 小时${mins%60} 分钟`:`${mins/60} 小时`}</option>)}</select>
+    <button className="primary" disabled={!title.trim()} onClick={onSubmit}>{editing?'保存修改':'创建任务'}</button>
+  </>;
+}
 function Profile({avatarText,avatarUrl,onAvatarFile,displayName,accountHint,pointsBalance,tasks,aiReady,cloudOnline,localOnline,offline,syncing,signOut,goTeam,openSettings,openWeeklyArchive,openMonthlyArchive,openVoiceHistory}:{avatarText:string;avatarUrl:string;onAvatarFile:(file:File)=>void;displayName:string;accountHint:string;pointsBalance?:number;tasks:Task[];aiReady:boolean|null;cloudOnline:boolean;localOnline:boolean;offline?:boolean;syncing:boolean;signOut:()=>void;goTeam:()=>void;openSettings:()=>void;openWeeklyArchive:()=>void;openMonthlyArchive:()=>void;openVoiceHistory:()=>void}){
   const fileRef=useRef<HTMLInputElement|null>(null);
   const rate=Math.round(tasks.filter(t=>t.status==='done').length/Math.max(tasks.length,1)*100);
